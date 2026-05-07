@@ -1,0 +1,19 @@
+.env
+.env.*
+.envrc
+.ca-bundle.pem
+logs.log
+.claude/
+
+# Node / TypeScript
+node_modules/
+*.tsbuildinfo
+dist/
+.turbo/
+.eslintcache
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,71 @@
+{
+  "name": "@getlago/agent-sdk",
+  "version": "0.1.0",
+  "description": "Instrument LLM clients and emit usage events to Lago.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://www.getlago.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getlago/lago-agent-sdk-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/getlago/lago-agent-sdk-js/issues"
+  },
+  "keywords": [
+    "lago",
+    "billing",
+    "llm",
+    "metering",
+    "bedrock",
+    "mistral",
+    "anthropic",
+    "openai"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix",
+    "format": "prettier --write src tests",
+    "format:check": "prettier --check src tests"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.700.0",
+    "@eslint/js": "^10.0.1",
+    "@mistralai/mistralai": "^2.2.1",
+    "@types/node": "^20.0.0",
+    "eslint": "^10.3.0",
+    "fast-check": "^4.7.0",
+    "prettier": "^3.8.3",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.59.2",
+    "vitest": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-bedrock-runtime": ">=3.500.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-bedrock-runtime": {
+      "optional": true
+    }
+  }
+}
