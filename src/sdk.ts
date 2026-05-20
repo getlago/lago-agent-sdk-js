@@ -8,6 +8,7 @@ import { detectClientKind } from "./detector.js";
 import { UnknownClientError } from "./exceptions.js";
 import { LagoClient, LagoEvent } from "./lago_client.js";
 import { EventQueue } from "./queue.js";
+import { wrapAnthropicClient } from "./wrappers/anthropic.js";
 import { wrapBedrockClient } from "./wrappers/bedrock.js";
 import { wrapMistralClient } from "./wrappers/mistral.js";
 
@@ -70,13 +71,16 @@ export class LagoSDK {
     if (kind === "mistral") {
       return wrapMistralClient(this as never, client as never, opts) as T;
     }
+    if (kind === "anthropic") {
+      return wrapAnthropicClient(this as never, client as never, opts) as T;
+    }
     if (kind === "unknown") {
       throw new UnknownClientError(
-        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral.`,
+        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral, @anthropic-ai/sdk Anthropic.`,
       );
     }
     throw new UnknownClientError(
-      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral'.`,
+      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral', 'anthropic'.`,
     );
   }
 

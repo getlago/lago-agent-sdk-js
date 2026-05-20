@@ -1,3 +1,4 @@
+export { extractAnthropicNative } from "./anthropic_native.js";
 export { extractBedrockConverse } from "./bedrock_converse.js";
 export { extractBedrockInvoke, pickInvokeAdapter } from "./bedrock_invoke.js";
 export type { InvokeFamily } from "./bedrock_invoke.js";

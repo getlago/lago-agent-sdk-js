@@ -28,6 +28,7 @@ your code ──────► │ wrapped client│ ──► provider (Bedroc
 npm install @getlago/agent-sdk
 # plus the provider SDK(s) you use:
 npm install @aws-sdk/client-bedrock-runtime
+npm install @anthropic-ai/sdk
 npm install @mistralai/mistralai
 ```
 
@@ -51,6 +52,25 @@ await sdk.flush();
 ```
 
 The wrapped client behaves identically to the original — same arguments, same return shape, same exceptions. The SDK adds an in-memory queue that batches events to Lago in the background.
+
+## Quickstart — Anthropic
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! }));
+
+await client.messages.create({
+  model: "claude-sonnet-4-6",
+  max_tokens: 200,
+  messages: [{ role: "user", content: "Hello" }],
+});
+await sdk.flush();
+```
+
+Both `messages.create({ ..., stream: true })` and the `messages.stream(...)` helper (with `.finalMessage()`) are instrumented automatically.
 
 ## Quickstart — Mistral
 
@@ -97,9 +117,9 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 |---|---|---|
 | AWS Bedrock | `ConverseCommand` (sync + stream) | ✓ |
 | AWS Bedrock | `InvokeModelCommand` (sync + stream), 7 model families | ✓ |
+| Anthropic | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`) | ✓ |
 | Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
 | OpenAI | native SDK | Phase 2 |
-| Anthropic | native SDK | Phase 2 |
 | Google Gemini | native SDK | Phase 2 |
 | Vercel AI SDK | `wrapLanguageModel` middleware | Phase 3 |
 
