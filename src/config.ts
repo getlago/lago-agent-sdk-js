@@ -11,6 +11,7 @@ export const DEFAULT_METRIC_CODES: Record<string, string> = {
   tool_calls: "llm_tool_calls",
   image_input: "llm_image_input_tokens",
   audio_input: "llm_audio_input_tokens",
+  audio_output: "llm_audio_output_tokens",
 };
 
 export interface LagoConfig {

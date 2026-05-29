@@ -30,6 +30,7 @@ npm install @getlago/agent-sdk
 npm install @aws-sdk/client-bedrock-runtime
 npm install @anthropic-ai/sdk
 npm install @mistralai/mistralai
+npm install openai
 ```
 
 ## Quickstart — Bedrock
@@ -88,6 +89,27 @@ await client.chat.complete({
 await sdk.flush();
 ```
 
+## Quickstart — OpenAI
+
+```typescript
+import OpenAI from "openai";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }));
+
+await client.chat.completions.create({
+  model: "gpt-4o-mini",
+  messages: [{ role: "user", content: "Hello" }],
+  max_completion_tokens: 200,
+});
+await sdk.flush();
+```
+
+Covers both **Chat Completions** (`client.chat.completions.create`) and the newer **Responses API** (`client.responses.create`), sync + streaming. For Chat Completions streaming, the wrapper auto-injects `stream_options: { include_usage: true }` so the final chunk carries usage data — without it OpenAI emits no usage on streamed responses.
+
+**Reasoning tokens** (`llm_reasoning_tokens`) populate automatically when you call an o-series model (`o4-mini`, `o1`, etc.) — OpenAI is the first provider to expose this metric separately.
+
 ## Multi-tenant — pick a subscription per call
 
 Three ways to set the `external_subscription_id`, in priority order:
@@ -119,24 +141,26 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 | AWS Bedrock | `InvokeModelCommand` (sync + stream), 7 model families | ✓ |
 | Anthropic | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`) | ✓ |
 | Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
-| OpenAI | native SDK | Phase 2 |
-| Google Gemini | native SDK | Phase 2 |
-| Vercel AI SDK | `wrapLanguageModel` middleware | Phase 3 |
+| OpenAI | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream) | ✓ |
+| Google Gemini | native SDK | Phase 3 |
+| Vercel AI SDK | `wrapLanguageModel` middleware | Phase 4 |
 
 ## Token dimensions captured
 
-`CanonicalUsage` carries 10 numeric fields. Which ones populate depends on the provider:
+`CanonicalUsage` carries 11 numeric fields. Which ones populate depends on the provider:
 
-| Field | Lago metric code | Bedrock | Mistral native |
-|---|---|---|---|
-| input | `llm_input_tokens` | ✓ | ✓ |
-| output | `llm_output_tokens` | ✓ | ✓ |
-| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ (when cache hits) |
-| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✗ |
-| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✗ |
-| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) |
-| tool_calls | `llm_tool_calls` | ✓ | ✓ |
-| image_input / audio_input | `llm_image/audio_input_tokens` | ✗ | ✗ |
+| Field | Lago metric code | Bedrock | Anthropic | Mistral | OpenAI |
+|---|---|---|---|---|---|
+| input | `llm_input_tokens` | ✓ | ✓ | ✓ | ✓ |
+| output | `llm_output_tokens` | ✓ | ✓ | ✓ | ✓ |
+| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ | ✓ (when cache hits) | ✓ (auto-cache) |
+| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✓ | ✗ | ✗ (OpenAI auto-caches; no creation counts) |
+| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓ | ✗ | ✗ |
+| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series models)** |
+| tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ |
+| audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio input) |
+| audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio output) |
+| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ (Phase 3 — multimodal adapter) |
 
 ## Error policy
 

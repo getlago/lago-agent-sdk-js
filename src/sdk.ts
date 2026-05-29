@@ -11,6 +11,7 @@ import { EventQueue } from "./queue.js";
 import { wrapAnthropicClient } from "./wrappers/anthropic.js";
 import { wrapBedrockClient } from "./wrappers/bedrock.js";
 import { wrapMistralClient } from "./wrappers/mistral.js";
+import { wrapOpenAIClient } from "./wrappers/openai.js";
 
 const subscriptionStore = new AsyncLocalStorage<string>();
 
@@ -74,13 +75,16 @@ export class LagoSDK {
     if (kind === "anthropic") {
       return wrapAnthropicClient(this as never, client as never, opts) as T;
     }
+    if (kind === "openai") {
+      return wrapOpenAIClient(this as never, client as never, opts) as T;
+    }
     if (kind === "unknown") {
       throw new UnknownClientError(
-        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral, @anthropic-ai/sdk Anthropic.`,
+        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral, @anthropic-ai/sdk Anthropic, openai OpenAI.`,
       );
     }
     throw new UnknownClientError(
-      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral', 'anthropic'.`,
+      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral', 'anthropic', 'openai'.`,
     );
   }
 

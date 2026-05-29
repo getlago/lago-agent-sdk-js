@@ -16,6 +16,7 @@ export const NUMERIC_FIELDS = [
   "tool_calls",
   "image_input",
   "audio_input",
+  "audio_output",
 ] as const;
 
 export type NumericField = (typeof NUMERIC_FIELDS)[number];
@@ -31,6 +32,7 @@ export interface CanonicalUsage {
   tool_calls: number;
   image_input: number;
   audio_input: number;
+  audio_output: number;
   model: string;
   provider: string;
   api: string;
@@ -49,6 +51,7 @@ export function makeCanonicalUsage(partial: Partial<CanonicalUsage> = {}): Canon
     tool_calls: 0,
     image_input: 0,
     audio_input: 0,
+    audio_output: 0,
     model: "",
     provider: "",
     api: "",
