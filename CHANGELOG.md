@@ -5,6 +5,14 @@ All notable changes to this project will be documented here. Format follows [Kee
 ## [Unreleased]
 
 ### Added
+- Native `@google/genai` SDK wrapper covering `client.models.generateContent` + `generateContentStream`, sync + streaming. Handles both camelCase (SDK pydantic-like objects) and snake_case (serialized JSON) shapes of `usageMetadata` / `usage_metadata`.
+- `extractGeminiNative` adapter: `promptTokenCount → input`, `candidatesTokenCount → output`, `cachedContentTokenCount → cache_read`, `thoughtsTokenCount → reasoning`, modality-tagged details → audio_input/audio_output/image_input, count of `candidates[0].content.parts[].functionCall → tool_calls`.
+- **Gemini 2.5 surfaces reasoning tokens by default** — fires `llm_reasoning_tokens` automatically. Semantic note vs OpenAI: Gemini's reasoning is ADDITIVE to output (`candidates + thoughts = total billable output`); OpenAI's reasoning is a SUBSET of `completion_tokens`. Documented in adapter docstring + README.
+- 20 new unit tests (14 adapter + 6 wrapper) and 4 live integration tests (gated on `GEMINI_API_KEY`). Total: 291 unit tests.
+- 5 captured response fixtures from the real Gemini API.
+- Detector now returns `gemini` (was `google`) for `@google/genai` clients.
+
+### Added (OpenAI — earlier in this branch)
 - Native `openai` SDK wrapper covering both APIs: `chat.completions.create` and `responses.create`, each sync + streaming. Wraps the APIPromise via Proxy with `.bind(target)` to preserve `.withResponse()` / `.asResponse()` calls.
 - `extractOpenAINative` adapter auto-detects which API (Chat Completions vs Responses) and extracts the appropriate fields:
   - Chat Completions: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.{cached_tokens, audio_tokens}`, `completion_tokens_details.{reasoning_tokens, audio_tokens}`, count of `choices[0].message.tool_calls`.

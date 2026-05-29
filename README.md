@@ -31,6 +31,7 @@ npm install @aws-sdk/client-bedrock-runtime
 npm install @anthropic-ai/sdk
 npm install @mistralai/mistralai
 npm install openai
+npm install @google/genai
 ```
 
 ## Quickstart — Bedrock
@@ -110,6 +111,28 @@ Covers both **Chat Completions** (`client.chat.completions.create`) and the newe
 
 **Reasoning tokens** (`llm_reasoning_tokens`) populate automatically when you call an o-series model (`o4-mini`, `o1`, etc.) — OpenAI is the first provider to expose this metric separately.
 
+## Quickstart — Gemini
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! }));
+
+await client.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: "Hello",
+});
+await sdk.flush();
+```
+
+Wraps the modern `@google/genai` SDK. Covers `client.models.generateContent` + `generateContentStream`, sync + streaming. Reads usage from `response.usageMetadata` (both camelCase and snake_case forms supported).
+
+**Reasoning tokens** populate automatically on Gemini 2.5 — the model reasons internally by default and surfaces `thoughtsTokenCount`. Note the semantic difference vs OpenAI:
+- **OpenAI:** `reasoning_tokens` is a *subset* of `completion_tokens` (already counted in output)
+- **Gemini:** `thoughtsTokenCount` is *additive* to `candidatesTokenCount` (total Google bill = output + reasoning)
+
 ## Multi-tenant — pick a subscription per call
 
 Three ways to set the `external_subscription_id`, in priority order:
@@ -142,25 +165,29 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 | Anthropic | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`) | ✓ |
 | Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
 | OpenAI | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream) | ✓ |
-| Google Gemini | native SDK | Phase 3 |
+| Google Gemini | `@google/genai` (`models.generateContent` + `generateContentStream`, sync + stream) | ✓ |
 | Vercel AI SDK | `wrapLanguageModel` middleware | Phase 4 |
 
 ## Token dimensions captured
 
 `CanonicalUsage` carries 11 numeric fields. Which ones populate depends on the provider:
 
-| Field | Lago metric code | Bedrock | Anthropic | Mistral | OpenAI |
-|---|---|---|---|---|---|
-| input | `llm_input_tokens` | ✓ | ✓ | ✓ | ✓ |
-| output | `llm_output_tokens` | ✓ | ✓ | ✓ | ✓ |
-| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ | ✓ (when cache hits) | ✓ (auto-cache) |
-| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✓ | ✗ | ✗ (OpenAI auto-caches; no creation counts) |
-| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓ | ✗ | ✗ |
-| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series models)** |
-| tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ |
-| audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio input) |
-| audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio output) |
-| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ (Phase 3 — multimodal adapter) |
+| Field | Lago metric code | Bedrock | Anthropic | Mistral | OpenAI | Gemini |
+|---|---|---|---|---|---|---|
+| input | `llm_input_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| output | `llm_output_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ | ✓ (when cache hits) | ✓ (auto-cache) | ✓ (CachedContent API) |
+| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✓ | ✗ | ✗ | ✗ |
+| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓ | ✗ | ✗ | ✗ |
+| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series, subset)** | **✓ (Gemini 2.5, additive)** |
+| tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
+| audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
+| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ (Phase 3) | ✓ (multimodal IMAGE) |
+
+**Semantic note on `reasoning`:**
+- **OpenAI's `reasoning_tokens` is a SUBSET of `output`** — already counted in `completion_tokens`.
+- **Gemini's `thoughtsTokenCount` is ADDITIVE to `output`** — `candidates + thoughts = total billable output`.
 
 ## Error policy
 

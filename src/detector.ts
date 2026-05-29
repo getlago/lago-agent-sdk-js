@@ -1,6 +1,6 @@
 /** Detect which client kind was passed to wrap(). */
 
-export type ClientKind = "bedrock" | "anthropic" | "openai" | "mistral" | "google" | "unknown";
+export type ClientKind = "bedrock" | "anthropic" | "openai" | "mistral" | "gemini" | "unknown";
 
 export function detectClientKind(client: unknown): ClientKind {
   if (!client || typeof client !== "object") return "unknown";
@@ -23,7 +23,7 @@ export function detectClientKind(client: unknown): ClientKind {
   // OpenAI / Anthropic / Google heuristics for future Phase 2
   if (ctorName.includes("anthropic")) return "anthropic";
   if (ctorName === "openai" || ctorName.startsWith("openai")) return "openai";
-  if (ctorName.includes("googlegenai") || ctorName.includes("googlegenerativeai")) return "google";
+  if (ctorName.includes("googlegenai") || ctorName.includes("googlegenerativeai")) return "gemini";
 
   return "unknown";
 }

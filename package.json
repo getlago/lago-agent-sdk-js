@@ -54,6 +54,7 @@
     "@anthropic-ai/sdk": "^0.97.1",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0",
     "@eslint/js": "^10.0.1",
+    "@google/genai": "^1.0.0",
     "@mistralai/mistralai": "^2.2.1",
     "@types/node": "^20.0.0",
     "eslint": "^10.3.0",
