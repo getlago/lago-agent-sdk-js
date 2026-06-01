@@ -12,6 +12,9 @@ dist/
 .turbo/
 .eslintcache
 
+# npm pack artifacts (created locally when verifying a tarball before publish)
+*.tgz
+
 # Editor / OS
 .DS_Store
 .idea/

@@ -1,0 +1,127 @@
+name: publish
+
+# Triggered when a v*.*.* tag is pushed. The tag's version must match the
+# version in package.json — the workflow fails otherwise so you can't
+# accidentally publish a mismatched build.
+#
+# One-time setup on npm:
+#   https://docs.npmjs.com/trusted-publishers
+#   Package:         @getlago/agent-sdk
+#   GitHub Owner:    getlago
+#   Repository:      lago-agent-sdk-js
+#   Workflow file:   .github/workflows/publish.yml
+#   Environment:     npm
+#
+# After setup, releasing is one command from your laptop:
+#   git tag v0.1.0 && git push --tags
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  # ----------------------------------------------------------------------
+  # 1. Run the full CI gate first. If anything is red, abort before build.
+  # ----------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test -- tests/unit
+      - run: npm run build
+
+  # ----------------------------------------------------------------------
+  # 2. Build the package, assert tag matches package.json version, pack as
+  #    tarball artifact so the publish step uses a verified, frozen bundle.
+  # ----------------------------------------------------------------------
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$TAG) != package.json version $PKG"
+            exit 1
+          fi
+          echo "Tag $TAG matches package.json version $PKG"
+      - name: Pack tarball
+        run: npm pack
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: "*.tgz"
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------
+  # 3. Publish to npm with provenance (supply-chain attestation).
+  #    Uses OIDC — no NPM_TOKEN needed if trusted-publisher is configured.
+  # ----------------------------------------------------------------------
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC for trusted publishing
+      contents: read
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@getlago/agent-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # `--access public` is required for scoped packages on the first publish.
+      # `--provenance` attaches a sigstore attestation tying the published
+      # artifact to this workflow run — visible on the npm package page.
+      - run: npm publish --provenance --access public
+
+  # ----------------------------------------------------------------------
+  # 4. Create a GitHub Release tied to the tag, attaching the tarball.
+  # ----------------------------------------------------------------------
+  release:
+    name: github release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: package/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            package/*.tgz
