@@ -201,6 +201,27 @@ export function wrapOpenAIClient<T extends OpenAILike>(
   return client;
 }
 
+/**
+ * Pull usage out of a stream event, handling both API shapes.
+ *
+ * Chat Completions: usage sits at the top of the final chunk
+ *   `{ usage: {...} }`
+ * Responses API:    usage sits under `event.response.usage` on the terminal
+ *   `response.completed` event:
+ *   `{ type: "response.completed", response: { usage: {...} } }`
+ */
+function extractStreamUsage(payload: unknown): Record<string, unknown> | null {
+  if (!isObject(payload)) return null;
+  if (isObject(payload.usage)) {
+    return { usage: payload.usage };
+  }
+  const response = payload.response;
+  if (isObject(response) && isObject(response.usage)) {
+    return { usage: response.usage };
+  }
+  return null;
+}
+
 async function* wrapAsyncIterableStream(
   src: AsyncIterable<unknown>,
   sdk: SDKLike,
@@ -211,15 +232,16 @@ async function* wrapAsyncIterableStream(
   let lastUsage: Record<string, unknown> | null = null;
   try {
     for await (const event of src) {
-      // Each chunk is a ChatCompletionChunk (or Response event for the Responses API).
-      // The final chunk (when include_usage:true) carries `usage` at the top level.
+      // Each chunk is a ChatCompletionChunk (Chat Completions API) or a
+      // typed event (Responses API). Usage location differs per API.
       const payload = (
         isObject(event) && typeof (event as { model_dump?: unknown }).model_dump === "function"
           ? (event as { model_dump: () => unknown }).model_dump()
           : event
       ) as Record<string, unknown>;
-      if (isObject(payload) && isObject(payload.usage)) {
-        lastUsage = { usage: payload.usage };
+      const extracted = extractStreamUsage(payload);
+      if (extracted !== null) {
+        lastUsage = extracted;
       }
       yield event;
     }

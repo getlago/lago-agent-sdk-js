@@ -165,4 +165,48 @@ describe("Anthropic wrapper", () => {
     expect(resp).toBeDefined();
     await sdk.shutdown(500);
   });
+
+  it("regression: messages.stream's finalMessage() must await origFinal before emitting", async () => {
+    /* If the wrapper's monkey-patched finalMessage doesn't await the underlying
+       async function, emitFrom receives an un-awaited Promise object — the
+       adapter sees no .usage attribute, nothing gets billed, and the customer
+       silently under-bills. Track invocation explicitly via a counter so the
+       test fails if a refactor accidentally drops the `await`. */
+    const { sdk, received } = newSdk();
+    let asyncCallsAwaited = 0;
+    class CountingAsyncMessages {
+      async create() {
+        return null;
+      }
+      stream(_args: any) {
+        return {
+          finalMessage: async () => {
+            asyncCallsAwaited++;
+            return {
+              model: "claude-sonnet-4-6",
+              content: [{ type: "text", text: "hi" }],
+              usage: { input_tokens: 5, output_tokens: 11 },
+            };
+          },
+        };
+      }
+    }
+    class CountingAnthropic {
+      messages = new CountingAsyncMessages();
+    }
+    Object.defineProperty(CountingAnthropic, "name", { value: "Anthropic" });
+
+    const client = sdk.wrap(new CountingAnthropic());
+    const stream = (client as any).messages.stream({
+      model: "claude-sonnet-4-6",
+      messages: [],
+    });
+    await stream.finalMessage();
+    expect(asyncCallsAwaited).toBe(1);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(5);
+    expect(map.llm_output_tokens).toBe(11);
+  });
 });

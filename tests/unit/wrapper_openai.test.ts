@@ -60,10 +60,37 @@ class FakeChat {
 
 class FakeResponses {
   createCalls = 0;
+  lastKwargs: Record<string, unknown> | null = null;
 
   async create(args: any) {
     this.createCalls++;
     expect("lago" in (args || {})).toBe(false);
+    this.lastKwargs = { ...args };
+
+    if (args?.stream === true) {
+      // Responses API stream — yields response.* events; the final
+      // `response.completed` event carries usage on the response payload.
+      const chunks = [
+        { type: "response.created", response: { id: "resp_x" } },
+        { type: "response.output_text.delta", delta: "hi" },
+        {
+          type: "response.completed",
+          response: {
+            id: "resp_x",
+            usage: {
+              input_tokens: 53,
+              output_tokens: 6,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens_details: { reasoning_tokens: 0 },
+            },
+          },
+        },
+      ];
+      return (async function* () {
+        for (const c of chunks) yield c;
+      })();
+    }
+
     return {
       model: args?.model ?? "gpt-4o-mini",
       output: [{ type: "function_call", name: "get_weather" }],
@@ -224,6 +251,48 @@ describe("OpenAI wrapper — Responses API", () => {
     expect(map.llm_input_tokens).toBe(53);
     expect(map.llm_output_tokens).toBe(6);
     expect(map.llm_tool_calls).toBe(1);
+  });
+
+  it("responses.create with stream:true does NOT inject stream_options", async () => {
+    /* Regression test: the Responses API does not accept the `stream_options`
+       parameter — injecting it would cause TypeError / HTTP 400 and break the
+       customer's call. The wrapper must only inject on chat.completions. */
+    const { sdk } = newSdk();
+    const fake = new FakeOpenAI();
+    const client = sdk.wrap(fake);
+    const stream = (await client.responses.create({
+      model: "gpt-4o-mini",
+      input: "hi",
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    await sdk.shutdown(1000);
+    expect(fake.responses.lastKwargs).toBeDefined();
+    expect("stream_options" in (fake.responses.lastKwargs ?? {})).toBe(false);
+  });
+
+  it("responses.create with stream:true emits usage from final response.completed event", async () => {
+    /* The Responses API emits a terminal `response.completed` event whose
+       `response.usage` carries the totals. Wrapper must capture from that
+       event. */
+    const { sdk, received } = newSdk();
+    const fake = new FakeOpenAI();
+    const client = sdk.wrap(fake);
+    const stream = (await client.responses.create({
+      model: "gpt-4o-mini",
+      input: "hi",
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    const events: unknown[] = [];
+    for await (const e of stream) events.push(e);
+    expect(events).toHaveLength(3);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(53);
+    expect(map.llm_output_tokens).toBe(6);
   });
 });
 
