@@ -84,16 +84,23 @@ export function wrapMistralClient<T extends MistralLike>(
   }
 
   // ---------- chat.stream ----------
+  //
+  // Real `@mistralai/mistralai` `chat.stream` is an AsyncFunction:
+  //   async stream(...) -> Promise<AsyncIterable>
+  // The wrapper preserves that shape (async function returning Promise),
+  // so `result instanceof Promise === true` and `.then(...)` works just
+  // like with the unwrapped client. Returning the async generator
+  // synchronously would "work" via await's no-op pass-through but would
+  // silently break customer code that uses .then() or instanceof Promise.
   if (originalStream) {
-    const wrappedStream = (...args: unknown[]) => {
+    const wrappedStream = async (...args: unknown[]) => {
       const firstArg = args[0] as Record<string, unknown> | undefined;
       const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const original = originalStream(...args) as AsyncIterable<unknown> | Promise<AsyncIterable<unknown>>;
+      const source = (await originalStream(...args)) as AsyncIterable<unknown>;
 
       async function* iterate() {
-        const source = (await original) as AsyncIterable<unknown>;
         let lastUsage: Record<string, unknown> | null = null;
         try {
           for await (const event of source) {

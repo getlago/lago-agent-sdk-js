@@ -135,6 +135,25 @@ describe("Mistral wrapper", () => {
     await sdk.shutdown(500);
   });
 
+  it("regression: chat.stream preserves the SDK's API shape (returns Promise, not async generator)", async () => {
+    /* The real `@mistralai/mistralai` `chat.stream` is an AsyncFunction —
+       customer code can `.then(...)` it or check `instanceof Promise`. The
+       wrapper must preserve this shape. A sync return of an async generator
+       would silently break those usage patterns even though `for await`
+       would still happen to work via JS's no-op await semantics. */
+    const { sdk } = newSdk();
+    const fake = new FakeMistral();
+    const client = sdk.wrap(fake);
+    const result = client.chat.stream({ model: "mistral-small-latest", messages: [] } as any);
+    expect(result).toBeInstanceOf(Promise);
+    // Drain so the test cleans up properly.
+    const stream = (await result) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    await sdk.shutdown(500);
+  });
+
   it("regression: chat.stream returning Promise<AsyncIterable> must be awaited before iterating", async () => {
     /* The real @mistralai/mistralai SDK's chat.stream is an async function that
        returns a Promise<AsyncIterable>. If the wrapper iterates without first
