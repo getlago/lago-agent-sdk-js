@@ -8,8 +8,11 @@ import { detectClientKind } from "./detector.js";
 import { UnknownClientError } from "./exceptions.js";
 import { LagoClient, LagoEvent } from "./lago_client.js";
 import { EventQueue } from "./queue.js";
+import { wrapAnthropicClient } from "./wrappers/anthropic.js";
 import { wrapBedrockClient } from "./wrappers/bedrock.js";
+import { wrapGeminiClient } from "./wrappers/gemini.js";
 import { wrapMistralClient } from "./wrappers/mistral.js";
+import { wrapOpenAIClient } from "./wrappers/openai.js";
 
 const subscriptionStore = new AsyncLocalStorage<string>();
 
@@ -70,13 +73,31 @@ export class LagoSDK {
     if (kind === "mistral") {
       return wrapMistralClient(this as never, client as never, opts) as T;
     }
+    if (kind === "anthropic") {
+      return wrapAnthropicClient(this as never, client as never, opts) as T;
+    }
+    if (kind === "openai") {
+      return wrapOpenAIClient(this as never, client as never, opts) as T;
+    }
+    if (kind === "gemini") {
+      return wrapGeminiClient(this as never, client as never, opts) as T;
+    }
+    if (kind === "gemini_legacy") {
+      throw new UnknownClientError(
+        "The legacy @google/generative-ai SDK (GoogleGenerativeAI) is not supported — " +
+          "its surface differs from the unified SDK and cannot be instrumented. " +
+          "Migrate to @google/genai: `npm install @google/genai`, then " +
+          "`new GoogleGenAI({ apiKey })` and wrap that client. " +
+          "See https://ai.google.dev/gemini-api/docs/migrate.",
+      );
+    }
     if (kind === "unknown") {
       throw new UnknownClientError(
-        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral.`,
+        `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral, @anthropic-ai/sdk Anthropic, openai OpenAI, @google/genai GoogleGenAI.`,
       );
     }
     throw new UnknownClientError(
-      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral'.`,
+      `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral', 'anthropic', 'openai', 'gemini'.`,
     );
   }
 

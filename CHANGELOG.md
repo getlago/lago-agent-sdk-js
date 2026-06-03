@@ -4,6 +4,47 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- **Anthropic `messages.create({ stream: true })` under-billed input tokens.** The stream wrapper read only top-level `usage`, which on a basic stream appears only on `message_delta` as `{ output_tokens: N }` — the authoritative `input_tokens` / `cache_*` counts arrive nested under `message.usage` on the `message_start` event and were ignored, so input billed 0. The wrapper now merges usage from `message_start` (input/cache) and `message_delta` (cumulative output). Regression test uses the realistic wire shape (delta carries no input echo).
+- **Legacy `@google/generative-ai` SDK silently emitted no events.** The detector matched both the new `@google/genai` (`GoogleGenAI`) and the deprecated `@google/generative-ai` (`GoogleGenerativeAI`) SDKs, but the wrapper only instruments the unified `models` / `aio` surface — a legacy client routed through and wrapped nothing. `wrap()` now rejects legacy clients with a clear pointer to migrate to `@google/genai`.
+
+### Security
+- Hardened the publish workflow: least-privilege `permissions: contents: read` default (only `publish` gets `id-token: write`, only `release` gets `contents: write`), and every third-party action pinned to a full commit SHA so a re-pointed tag can't inject code into the OIDC-token-minting job.
+- **The `publish` job now publishes the exact tarball packed and version-checked in the `build` job** instead of re-running `npm ci` / `npm run build`. This guarantees the bytes on npm are byte-identical to the tested bundle and the GitHub Release asset (closes a build-then-rebuild / TOCTOU gap), and keeps all project/dependency code out of the job that holds `id-token: write`.
+- The `publish` job runs on **Node 24** (bundles npm ≥ 11.13). OIDC trusted publishing requires npm CLI ≥ 11.5.1, which Node 20/22 (npm 10.x) do not ship — the previous Node 20 publish job would have failed the OIDC handshake at release time.
+- Added `if: startsWith(github.ref, 'refs/tags/v')` to the `publish` job as defense-in-depth — it refuses to run on a non-tag ref even if the environment's protected-tag rule is misconfigured.
+- Added `.github/dependabot.yml` (github-actions ecosystem) so the SHA pins stay fresh — Dependabot bumps the SHA and version comment together rather than letting actions silently age.
+- RELEASING.md now documents `npm` environment protection (required reviewers + protected-tag restriction) as a **required** setup step, not optional, since trusted publishing is only as strong as that environment's rules.
+
+### Documentation
+- README: clarified that `cache_read`, `audio_input`, and `image_input` are **subsets** of `input` for OpenAI and Gemini (not additive) — summing them with `llm_input_tokens` double-counts.
+
+### Added
+- Native `@google/genai` SDK wrapper covering `client.models.generateContent` + `generateContentStream`, sync + streaming. Handles both camelCase (SDK pydantic-like objects) and snake_case (serialized JSON) shapes of `usageMetadata` / `usage_metadata`.
+- `extractGeminiNative` adapter: `promptTokenCount → input`, `candidatesTokenCount → output`, `cachedContentTokenCount → cache_read`, `thoughtsTokenCount → reasoning`, modality-tagged details → audio_input/audio_output/image_input, count of `candidates[0].content.parts[].functionCall → tool_calls`.
+- **Gemini 2.5 surfaces reasoning tokens by default** — fires `llm_reasoning_tokens` automatically. Semantic note vs OpenAI: Gemini's reasoning is ADDITIVE to output (`candidates + thoughts = total billable output`); OpenAI's reasoning is a SUBSET of `completion_tokens`. Documented in adapter docstring + README.
+- 20 new unit tests (14 adapter + 6 wrapper) and 4 live integration tests (gated on `GEMINI_API_KEY`). Total: 291 unit tests.
+- 5 captured response fixtures from the real Gemini API.
+- Detector now returns `gemini` (was `google`) for `@google/genai` clients.
+
+### Added (OpenAI — earlier in this branch)
+- Native `openai` SDK wrapper covering both APIs: `chat.completions.create` and `responses.create`, each sync + streaming. Wraps the APIPromise via Proxy with `.bind(target)` to preserve `.withResponse()` / `.asResponse()` calls.
+- `extractOpenAINative` adapter auto-detects which API (Chat Completions vs Responses) and extracts the appropriate fields:
+  - Chat Completions: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.{cached_tokens, audio_tokens}`, `completion_tokens_details.{reasoning_tokens, audio_tokens}`, count of `choices[0].message.tool_calls`.
+  - Responses API: `input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, count of `output[].type === "function_call"`.
+- **First provider to populate `llm_reasoning_tokens`** — OpenAI's o-series models (`o4-mini`, `o1`, etc.) surface reasoning tokens separately from completion tokens.
+- Auto-injection of `stream_options: { include_usage: true }` when `stream: true` is set without it, so Chat Completions streaming emits usage on the final chunk.
+- `audio_output` field added to `CanonicalUsage` (maps to `llm_audio_output_tokens`) — populated by GPT-4o-audio responses.
+- Per-call override via `lago: { subscription, dimensions }` on the OpenAI options.
+- 19 adapter tests + 9 wrapper tests + 5 live integration tests.
+- 10 captured response fixtures from the real OpenAI API.
+
+### Previously in unreleased (Anthropic)
+- Native `@anthropic-ai/sdk` wrapper covering `messages.create` (sync + streaming) and `messages.stream` (`.finalMessage()` + `finalMessage` event).
+- `extractAnthropicNative` adapter — verified against captured fixtures (plain, tool use, cache create). Maps `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`, and counts `content[].type === "tool_use"` for `tool_calls`.
+- Per-call override via `lago: { subscription, dimensions }` in the create/stream options — stripped before forwarding so the Anthropic validator doesn't reject it.
+- 6 wrapper tests + 7 adapter tests + 3 live integration tests.
+
 ## [0.1.0] — initial release
 
 ### Added

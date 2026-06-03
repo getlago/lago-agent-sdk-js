@@ -11,6 +11,7 @@ export { DEFAULT_METRIC_CODES, makeConfig } from "./config.js";
 export { LagoApiError, LagoConfigError, LagoSDKError, UnknownClientError } from "./exceptions.js";
 
 export {
+  extractAnthropicNative,
   extractBedrockConverse,
   extractBedrockInvoke,
   pickInvokeAdapter,

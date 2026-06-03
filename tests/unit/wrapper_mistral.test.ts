@@ -134,4 +134,69 @@ describe("Mistral wrapper", () => {
     expect(resp).toBeDefined();
     await sdk.shutdown(500);
   });
+
+  it("regression: chat.stream preserves the SDK's API shape (returns Promise, not async generator)", async () => {
+    /* The real `@mistralai/mistralai` `chat.stream` is an AsyncFunction —
+       customer code can `.then(...)` it or check `instanceof Promise`. The
+       wrapper must preserve this shape. A sync return of an async generator
+       would silently break those usage patterns even though `for await`
+       would still happen to work via JS's no-op await semantics. */
+    const { sdk } = newSdk();
+    const fake = new FakeMistral();
+    const client = sdk.wrap(fake);
+    const result = client.chat.stream({ model: "mistral-small-latest", messages: [] } as any);
+    expect(result).toBeInstanceOf(Promise);
+    // Drain so the test cleans up properly.
+    const stream = (await result) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    await sdk.shutdown(500);
+  });
+
+  it("regression: chat.stream returning Promise<AsyncIterable> must be awaited before iterating", async () => {
+    /* The real @mistralai/mistralai SDK's chat.stream is an async function that
+       returns a Promise<AsyncIterable>. If the wrapper iterates without first
+       awaiting the Promise, `for await (...)` would throw TypeError. Use a
+       fake that explicitly returns a Promise<AsyncIterable> (not the iterable
+       itself) so this code path is exercised. */
+    const { sdk, received } = newSdk();
+    class PromiseStreamChat {
+      async complete(_args: any) {
+        return null;
+      }
+      async stream(_args: any): Promise<AsyncIterable<unknown>> {
+        const chunks = [
+          { data: { choices: [{ delta: { content: "hi" }, finish_reason: null }] } },
+          {
+            data: {
+              choices: [{ delta: { content: "." }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+            },
+          },
+        ];
+        return (async function* () {
+          for (const c of chunks) yield c;
+        })();
+      }
+    }
+    class PromiseStreamMistral {
+      chat = new PromiseStreamChat();
+    }
+    Object.defineProperty(PromiseStreamMistral, "name", { value: "Mistral" });
+
+    const client = sdk.wrap(new PromiseStreamMistral() as any);
+    const stream = (await client.chat.stream({
+      model: "mistral-small-latest",
+      messages: [],
+    } as any)) as AsyncIterable<unknown>;
+    const chunks: unknown[] = [];
+    for await (const c of stream) chunks.push(c);
+    expect(chunks).toHaveLength(2);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(9);
+    expect(map.llm_output_tokens).toBe(4);
+  });
 });

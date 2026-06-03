@@ -28,7 +28,10 @@ your code ──────► │ wrapped client│ ──► provider (Bedroc
 npm install @getlago/agent-sdk
 # plus the provider SDK(s) you use:
 npm install @aws-sdk/client-bedrock-runtime
+npm install @anthropic-ai/sdk
 npm install @mistralai/mistralai
+npm install openai
+npm install @google/genai
 ```
 
 ## Quickstart — Bedrock
@@ -52,6 +55,25 @@ await sdk.flush();
 
 The wrapped client behaves identically to the original — same arguments, same return shape, same exceptions. The SDK adds an in-memory queue that batches events to Lago in the background.
 
+## Quickstart — Anthropic
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! }));
+
+await client.messages.create({
+  model: "claude-sonnet-4-6",
+  max_tokens: 200,
+  messages: [{ role: "user", content: "Hello" }],
+});
+await sdk.flush();
+```
+
+Both `messages.create({ ..., stream: true })` and the `messages.stream(...)` helper (with `.finalMessage()`) are instrumented automatically.
+
 ## Quickstart — Mistral
 
 ```typescript
@@ -67,6 +89,49 @@ await client.chat.complete({
 });
 await sdk.flush();
 ```
+
+## Quickstart — OpenAI
+
+```typescript
+import OpenAI from "openai";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }));
+
+await client.chat.completions.create({
+  model: "gpt-4o-mini",
+  messages: [{ role: "user", content: "Hello" }],
+  max_completion_tokens: 200,
+});
+await sdk.flush();
+```
+
+Covers both **Chat Completions** (`client.chat.completions.create`) and the newer **Responses API** (`client.responses.create`), sync + streaming. For Chat Completions streaming, the wrapper auto-injects `stream_options: { include_usage: true }` so the final chunk carries usage data — without it OpenAI emits no usage on streamed responses.
+
+**Reasoning tokens** (`llm_reasoning_tokens`) populate automatically when you call an o-series model (`o4-mini`, `o1`, etc.) — OpenAI is the first provider to expose this metric separately.
+
+## Quickstart — Gemini
+
+```typescript
+import { GoogleGenAI } from "@google/genai";
+import { LagoSDK } from "@getlago/agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! }));
+
+await client.models.generateContent({
+  model: "gemini-2.5-flash",
+  contents: "Hello",
+});
+await sdk.flush();
+```
+
+Wraps the modern `@google/genai` SDK. Covers `client.models.generateContent` + `generateContentStream`, sync + streaming. Reads usage from `response.usageMetadata` (both camelCase and snake_case forms supported).
+
+**Reasoning tokens** populate automatically on Gemini 2.5 — the model reasons internally by default and surfaces `thoughtsTokenCount`. Note the semantic difference vs OpenAI:
+- **OpenAI:** `reasoning_tokens` is a *subset* of `completion_tokens` (already counted in output)
+- **Gemini:** `thoughtsTokenCount` is *additive* to `candidatesTokenCount` (total Google bill = output + reasoning)
 
 ## Multi-tenant — pick a subscription per call
 
@@ -97,26 +162,35 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 |---|---|---|
 | AWS Bedrock | `ConverseCommand` (sync + stream) | ✓ |
 | AWS Bedrock | `InvokeModelCommand` (sync + stream), 7 model families | ✓ |
+| Anthropic | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`) | ✓ |
 | Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
-| OpenAI | native SDK | Phase 2 |
-| Anthropic | native SDK | Phase 2 |
-| Google Gemini | native SDK | Phase 2 |
-| Vercel AI SDK | `wrapLanguageModel` middleware | Phase 3 |
+| OpenAI | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream) | ✓ |
+| Google Gemini | `@google/genai` (`models.generateContent` + `generateContentStream`, sync + stream) | ✓ |
+| Vercel AI SDK | `wrapLanguageModel` middleware | Phase 4 |
 
 ## Token dimensions captured
 
-`CanonicalUsage` carries 10 numeric fields. Which ones populate depends on the provider:
+`CanonicalUsage` carries 11 numeric fields. Which ones populate depends on the provider:
 
-| Field | Lago metric code | Bedrock | Mistral native |
-|---|---|---|---|
-| input | `llm_input_tokens` | ✓ | ✓ |
-| output | `llm_output_tokens` | ✓ | ✓ |
-| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ (when cache hits) |
-| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✗ |
-| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✗ |
-| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) |
-| tool_calls | `llm_tool_calls` | ✓ | ✓ |
-| image_input / audio_input | `llm_image/audio_input_tokens` | ✗ | ✗ |
+| Field | Lago metric code | Bedrock | Anthropic | Mistral | OpenAI | Gemini |
+|---|---|---|---|---|---|---|
+| input | `llm_input_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| output | `llm_output_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ | ✓ (when cache hits) | ✓ (auto-cache) | ✓ (CachedContent API) |
+| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✓ | ✗ | ✗ | ✗ |
+| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓ | ✗ | ✗ | ✗ |
+| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series, subset)** | **✓ (Gemini 2.5, additive)** |
+| tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
+| audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
+| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ (Phase 3) | ✓ (multimodal IMAGE) |
+
+**Semantic note on `reasoning`:**
+- **OpenAI's `reasoning_tokens` is a SUBSET of `output`** — already counted in `completion_tokens`.
+- **Gemini's `thoughtsTokenCount` is ADDITIVE to `output`** — `candidates + thoughts = total billable output`.
+
+**Semantic note on input breakdowns (avoid double-counting):**
+For both OpenAI and Gemini, `cache_read`, `audio_input`, and `image_input` are **subsets of `input`**, not additive to it — they are a breakdown of tokens already counted in `llm_input_tokens`. For example, OpenAI reports `cached_tokens` under `prompt_tokens_details` *within* `prompt_tokens`, and Gemini's docs state `promptTokenCount` "includes the number of tokens in the cached content". A billable metric that sums `llm_input_tokens + llm_cached_input_tokens` (or `+ llm_audio_input_tokens`, `+ llm_image_input_tokens`) will **double-count**. Bill on `llm_input_tokens` as the total; use the breakdown fields only for cost attribution or discounted-rate tiers (e.g. cached input billed at a lower rate), subtracting them from `input` rather than adding.
 
 ## Error policy
 

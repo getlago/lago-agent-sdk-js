@@ -15,11 +15,13 @@
   "files": [
     "dist",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"
   },
+  "license": "MIT",
   "homepage": "https://www.getlago.com",
   "repository": {
     "type": "git",
@@ -49,13 +51,17 @@
     "format:check": "prettier --check src tests"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.97.1",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0",
     "@eslint/js": "^10.0.1",
+    "@google/genai": "^1.0.0",
     "@mistralai/mistralai": "^2.2.1",
     "@types/node": "^20.0.0",
     "eslint": "^10.3.0",
     "fast-check": "^4.7.0",
+    "openai": "^4.70.0",
     "prettier": "^3.8.3",
+    "tsx": "^4.22.3",
     "typescript": "^5.5.0",
     "typescript-eslint": "^8.59.2",
     "vitest": "^2.0.0"
