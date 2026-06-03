@@ -1,5 +1,5 @@
 {
-  "name": "@getlago/agent-sdk",
+  "name": "lago-agent-sdk",
   "version": "0.1.0",
   "description": "Instrument LLM clients and emit usage events to Lago.",
   "type": "module",

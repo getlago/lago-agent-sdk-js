@@ -6,7 +6,7 @@ name: publish
 #
 # One-time setup on npm:
 #   https://docs.npmjs.com/trusted-publishers
-#   Package:         @getlago/agent-sdk
+#   Package:         lago-agent-sdk
 #   GitHub Owner:    getlago
 #   Repository:      lago-agent-sdk-js
 #   Workflow file:   .github/workflows/publish.yml
@@ -106,7 +106,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: npm
-      url: https://www.npmjs.com/package/@getlago/agent-sdk
+      url: https://www.npmjs.com/package/lago-agent-sdk
     steps:
       # npm provenance has no supported path for publishing a pre-packed tarball
       # — the attestation is bound to the build, so we must build from source in
@@ -122,9 +122,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      # Build from source so provenance can be generated. `--access public` is
-      # required for a scoped package's first publish. `--provenance` attaches a
-      # sigstore attestation tying the published artifact to this exact workflow
+      # Build from source so provenance can be generated. `--access public`
+      # keeps the (unscoped) package public. `--provenance` attaches a sigstore
+      # attestation tying the published artifact to this exact workflow
       # run/commit — the "Built and signed on GitHub Actions" badge on npm.
       # The tag/version match was already enforced in the build job; this job
       # runs only on a v*.*.* tag (see the `if:` guard above), and reinstalls
