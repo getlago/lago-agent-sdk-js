@@ -82,6 +82,15 @@ export class LagoSDK {
     if (kind === "gemini") {
       return wrapGeminiClient(this as never, client as never, opts) as T;
     }
+    if (kind === "gemini_legacy") {
+      throw new UnknownClientError(
+        "The legacy @google/generative-ai SDK (GoogleGenerativeAI) is not supported — " +
+          "its surface differs from the unified SDK and cannot be instrumented. " +
+          "Migrate to @google/genai: `npm install @google/genai`, then " +
+          "`new GoogleGenAI({ apiKey })` and wrap that client. " +
+          "See https://ai.google.dev/gemini-api/docs/migrate.",
+      );
+    }
     if (kind === "unknown") {
       throw new UnknownClientError(
         `Unknown client passed to wrap(): ${client.constructor?.name}. Supported: AWS SDK v3 BedrockRuntimeClient, @mistralai/mistralai Mistral, @anthropic-ai/sdk Anthropic, openai OpenAI, @google/genai GoogleGenAI.`,

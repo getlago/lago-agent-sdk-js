@@ -107,6 +107,22 @@ describe("Gemini wrapper", () => {
     expect(fake.models.generateCalls).toBe(1);
   });
 
+  it("rejects the legacy @google/generative-ai SDK with a migration hint", async () => {
+    // The legacy GoogleGenerativeAI surface has no .models/.aio, so the wrapper
+    // would silently wrap nothing and bill zero. wrap() must throw and point to
+    // the unified @google/genai SDK instead.
+    const { sdk } = newSdk();
+    class LegacyGoogleGenerativeAI {
+      getGenerativeModel() {
+        throw new Error("legacy client should be rejected before any call");
+      }
+    }
+    Object.defineProperty(LegacyGoogleGenerativeAI, "name", { value: "GoogleGenerativeAI" });
+    expect(() => sdk.wrap(new LegacyGoogleGenerativeAI())).toThrow(/@google\/genai/i);
+    expect(() => sdk.wrap(new LegacyGoogleGenerativeAI())).toThrow(/migrate/i);
+    await sdk.shutdown(500);
+  });
+
   it("generateContentStream captures usage from final chunk", async () => {
     const { sdk, received } = newSdk();
     const fake = new FakeGoogleGenAI();

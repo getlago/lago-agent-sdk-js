@@ -12,12 +12,27 @@ class FakeMessages {
     this.createCalls++;
     expect("lago" in (args || {})).toBe(false);
     if (args?.stream === true) {
+      // Mirrors the real wire shape: message_start carries authoritative
+      // input/cache (output only primed to 1) nested under message.usage;
+      // message_delta carries ONLY cumulative output at the top level — it does
+      // NOT echo input_tokens. A wrapper reading only top-level usage bills
+      // input_tokens=0.
       const events = [
-        { type: "message_start", message: { usage: { input_tokens: 12 } } },
+        {
+          type: "message_start",
+          message: {
+            usage: {
+              input_tokens: 12,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+              output_tokens: 1,
+            },
+          },
+        },
         {
           type: "message_delta",
           delta: { stop_reason: "end_turn" },
-          usage: { input_tokens: 12, output_tokens: 22 },
+          usage: { output_tokens: 22 },
         },
         { type: "message_stop" },
       ];
@@ -111,7 +126,11 @@ describe("Anthropic wrapper", () => {
     expect(fake.messages.createCalls).toBe(1);
   });
 
-  it("messages.create with stream=true emits from message_delta event", async () => {
+  it("messages.create with stream=true merges message_start + message_delta usage", async () => {
+    // Regression: input/cache come from message_start, output from message_delta.
+    // message_delta does not echo input_tokens, so the stream wrapper must merge
+    // message_start's nested message.usage with the delta — reading only
+    // top-level usage would bill input_tokens=0.
     const { sdk, received } = newSdk();
     const fake = new FakeAnthropic();
     const client = sdk.wrap(fake);

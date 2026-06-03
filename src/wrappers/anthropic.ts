@@ -196,6 +196,38 @@ function isAsyncIterable(v: unknown): v is AsyncIterable<unknown> {
   return typeof slot === "function";
 }
 
+/**
+ * Fold one streaming event's usage into the running accumulator.
+ *
+ * Anthropic splits authoritative usage across two events:
+ *   - `message_start` carries the input/cache counts nested under
+ *     `message.usage` (with `output_tokens` only primed to 1).
+ *   - `message_delta` carries the *cumulative* `output_tokens` at the top level
+ *     (and, in some API shapes, echoes input/cache there too).
+ *
+ * Reading only the top-level usage misses `message_start`'s input/cache, so a
+ * basic stream — whose `message_delta` is just `{ output_tokens: N }` — would
+ * bill `input_tokens = 0`. Merge both locations; Object.assign lets the more
+ * complete / more recent values win while preserving the input counts from
+ * `message_start` when a delta omits them.
+ */
+function mergeStreamUsage(accumulated: Record<string, unknown>, payload: unknown): boolean {
+  if (!isObject(payload)) return false;
+  let merged = false;
+  // message_start: input/cache live under message.usage
+  const message = payload.message;
+  if (isObject(message) && isObject(message.usage)) {
+    Object.assign(accumulated, message.usage);
+    merged = true;
+  }
+  // message_delta (and others): cumulative usage at the top level
+  if (isObject(payload.usage)) {
+    Object.assign(accumulated, payload.usage);
+    merged = true;
+  }
+  return merged;
+}
+
 async function* wrapAsyncIterableStream(
   src: AsyncIterable<unknown>,
   sdk: SDKLike,
@@ -203,24 +235,22 @@ async function* wrapAsyncIterableStream(
   sub: string | undefined,
   dims: Record<string, unknown>,
 ): AsyncIterable<unknown> {
-  let lastUsage: Record<string, unknown> | null = null;
+  const accumulated: Record<string, unknown> = {};
+  let sawUsage = false;
   try {
     for await (const event of src) {
       // Each event is a RawMessageStreamEvent — most carry a payload with snake_case fields.
-      const payload = (
+      const payload =
         isObject(event) && "model_dump" in (event as object)
           ? (event as { model_dump: () => unknown }).model_dump()
-          : event
-      ) as Record<string, unknown>;
-      if (isObject(payload) && isObject(payload.usage)) {
-        lastUsage = { usage: payload.usage };
-      }
+          : event;
+      if (mergeStreamUsage(accumulated, payload)) sawUsage = true;
       yield event;
     }
   } finally {
-    if (lastUsage) {
+    if (sawUsage) {
       try {
-        const usage = extractAnthropicNative(lastUsage, modelId);
+        const usage = extractAnthropicNative({ usage: accumulated }, modelId);
         sdk.emit(usage, { subscription: sub, dimensions: dims });
       } catch {
         /* swallow */

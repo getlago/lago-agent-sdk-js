@@ -189,6 +189,9 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 - **OpenAI's `reasoning_tokens` is a SUBSET of `output`** — already counted in `completion_tokens`.
 - **Gemini's `thoughtsTokenCount` is ADDITIVE to `output`** — `candidates + thoughts = total billable output`.
 
+**Semantic note on input breakdowns (avoid double-counting):**
+For both OpenAI and Gemini, `cache_read`, `audio_input`, and `image_input` are **subsets of `input`**, not additive to it — they are a breakdown of tokens already counted in `llm_input_tokens`. For example, OpenAI reports `cached_tokens` under `prompt_tokens_details` *within* `prompt_tokens`, and Gemini's docs state `promptTokenCount` "includes the number of tokens in the cached content". A billable metric that sums `llm_input_tokens + llm_cached_input_tokens` (or `+ llm_audio_input_tokens`, `+ llm_image_input_tokens`) will **double-count**. Bill on `llm_input_tokens` as the total; use the breakdown fields only for cost attribution or discounted-rate tiers (e.g. cached input billed at a lower rate), subtracting them from `input` rather than adding.
+
 ## Error policy
 
 The SDK never breaks your LLM call. If anything in instrumentation fails (adapter bug, Lago down, network error), the SDK swallows it, logs a warning, and your call returns normally.
