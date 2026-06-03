@@ -1,4 +1,4 @@
-# @getlago/agent-sdk
+# lago-agent-sdk
 
 Instrument LLM clients and emit usage events to [Lago](https://www.getlago.com) for billing.
 Authored in TypeScript, ships compiled JavaScript with `.d.ts` — works for both JS and TS consumers.
@@ -25,7 +25,7 @@ your code ──────► │ wrapped client│ ──► provider (Bedroc
 ## Install
 
 ```bash
-npm install @getlago/agent-sdk
+npm install lago-agent-sdk
 # plus the provider SDK(s) you use:
 npm install @aws-sdk/client-bedrock-runtime
 npm install @anthropic-ai/sdk
@@ -38,7 +38,7 @@ npm install @google/genai
 
 ```typescript
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { LagoSDK } from "@getlago/agent-sdk";
+import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({
   apiKey: process.env.LAGO_API_KEY!,
@@ -59,7 +59,7 @@ The wrapped client behaves identically to the original — same arguments, same 
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
-import { LagoSDK } from "@getlago/agent-sdk";
+import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
 const client = sdk.wrap(new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! }));
@@ -78,7 +78,7 @@ Both `messages.create({ ..., stream: true })` and the `messages.stream(...)` hel
 
 ```typescript
 import { Mistral } from "@mistralai/mistralai";
-import { LagoSDK } from "@getlago/agent-sdk";
+import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
 const client = sdk.wrap(new Mistral({ apiKey: process.env.MISTRAL_API_KEY! }));
@@ -94,7 +94,7 @@ await sdk.flush();
 
 ```typescript
 import OpenAI from "openai";
-import { LagoSDK } from "@getlago/agent-sdk";
+import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
 const client = sdk.wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }));
@@ -115,7 +115,7 @@ Covers both **Chat Completions** (`client.chat.completions.create`) and the newe
 
 ```typescript
 import { GoogleGenAI } from "@google/genai";
-import { LagoSDK } from "@getlago/agent-sdk";
+import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY!, defaultSubscriptionId: "sub_acme" });
 const client = sdk.wrap(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! }));

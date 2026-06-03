@@ -1,6 +1,6 @@
 # Releasing
 
-This SDK is published to **npm** as [`@getlago/agent-sdk`](https://www.npmjs.com/package/@getlago/agent-sdk).
+This SDK is published to **npm** as [`lago-agent-sdk`](https://www.npmjs.com/package/lago-agent-sdk) — an unscoped package, matching Lago's other public SDKs (`lago-javascript-client`, `lago-nodejs-client`) and the Python package name.
 
 Releases are triggered by pushing a `v*.*.*` git tag. The publish workflow:
 
@@ -45,35 +45,37 @@ The `--provenance` flag attaches a signed sigstore attestation that ties the pub
 
 ## Cutting a release
 
+Replace `X.Y.Z` below with the version you're releasing.
+
 ```bash
 # 1. Update the version
-$EDITOR package.json                # bump version, e.g. 0.1.0 -> 0.2.0
-# (or: npm version 0.2.0 --no-git-tag-version)
+$EDITOR package.json                # bump the "version" field to X.Y.Z
+# (or: npm version X.Y.Z --no-git-tag-version)
 $EDITOR CHANGELOG.md                # add release notes under a new heading
 
 # 2. Commit + push
-git commit -am "Release 0.2.0"
+git commit -am "Release X.Y.Z"
 git push
 
 # 3. Tag and push the tag — this triggers the publish workflow
-git tag v0.2.0
+git tag vX.Y.Z
 git push --tags
 ```
 
 Within ~5 minutes the workflow lands the package on npm and opens a GitHub Release. Customers can then:
 
 ```bash
-npm install @getlago/agent-sdk@0.2.0
+npm install lago-agent-sdk@X.Y.Z
 ```
 
 ## If something goes wrong mid-release
 
 - **CI fails before build:** fix the failure, delete the tag, retag, push.
   ```bash
-  git tag -d v0.2.0
-  git push --delete origin v0.2.0
+  git tag -d vX.Y.Z
+  git push --delete origin vX.Y.Z
   # fix the issue, recommit
-  git tag v0.2.0
+  git tag vX.Y.Z
   git push --tags
   ```
 - **Build succeeds but npm publish fails:** re-running the workflow from the GitHub Actions UI is safe.
