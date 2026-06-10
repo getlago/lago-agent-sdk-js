@@ -27,6 +27,9 @@ export class EventQueue {
     private maxBufferSize: number = 10_000,
     private maxRetryMs: number = 60_000,
     private onError?: (err: unknown, where: string) => void,
+    // Optional PricingProvider — its (async) HTTP refresh runs on this loop so
+    // the customer's call is never blocked on pricing.
+    private pricing?: { maybeRefresh(): Promise<void> },
   ) {
     this.loopPromise = this.run();
     this.installShutdownHook();
@@ -98,6 +101,15 @@ export class EventQueue {
   private async run(): Promise<void> {
     while (!this.stopping) {
       await this.waitWake(this.flushIntervalMs);
+
+      // Refresh pricing tables on this background loop (off the hot path).
+      if (this.pricing) {
+        try {
+          await this.pricing.maybeRefresh();
+        } catch {
+          /* pricing must never break the queue */
+        }
+      }
 
       while (true) {
         const batch = this.takeBatch();

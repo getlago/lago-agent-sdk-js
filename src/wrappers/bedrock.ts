@@ -20,13 +20,19 @@ const LAGO_KEY = "__lago";
 interface LagoOpts {
   subscription?: string;
   dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
+}
+
+interface EmitOpts {
+  subscription?: string;
+  dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
 }
 
 interface SDKLike {
-  emit: (
-    usage: CanonicalUsage,
-    opts?: { subscription?: string; dimensions?: Record<string, unknown> },
-  ) => void;
+  emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
 }
 
 interface CommandLike {
@@ -66,8 +72,12 @@ export function wrapBedrockClient(
 
     const cmdName = command.constructor.name;
     const modelId = String(command.input?.modelId ?? "");
-    const sub = lagoOpts.subscription || baseSub;
-    const dims = { ...baseDims, ...(lagoOpts.dimensions || {}) };
+    const emitOpts: EmitOpts = {
+      subscription: lagoOpts.subscription || baseSub,
+      dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
+      mode: lagoOpts.mode,
+      markup: lagoOpts.markup,
+    };
 
     const response = (await originalSend(command, ...rest)) as Record<string, unknown>;
 
@@ -75,13 +85,13 @@ export function wrapBedrockClient(
       switch (cmdName) {
         case "ConverseCommand": {
           const usage = extractBedrockConverse(response, modelId);
-          sdk.emit(usage, { subscription: sub, dimensions: dims });
+          sdk.emit(usage, emitOpts);
           return response;
         }
         case "ConverseStreamCommand": {
           const stream = response.stream as AsyncIterable<unknown> | undefined;
           if (stream) {
-            response.stream = wrapConverseStream(stream, sdk, modelId, sub, dims);
+            response.stream = wrapConverseStream(stream, sdk, modelId, emitOpts);
           }
           return response;
         }
@@ -90,7 +100,7 @@ export function wrapBedrockClient(
           if (body instanceof Uint8Array) {
             const parsed = decodeJSON(body);
             const usage = extractBedrockInvoke(parsed, modelId);
-            sdk.emit(usage, { subscription: sub, dimensions: dims });
+            sdk.emit(usage, emitOpts);
             // Body is bytes already — no re-streaming needed for non-streaming InvokeModel.
           }
           return response;
@@ -98,7 +108,7 @@ export function wrapBedrockClient(
         case "InvokeModelWithResponseStreamCommand": {
           const body = response.body as AsyncIterable<unknown> | undefined;
           if (body) {
-            response.body = wrapInvokeStream(body, sdk, modelId, sub, dims);
+            response.body = wrapInvokeStream(body, sdk, modelId, emitOpts);
           }
           return response;
         }
@@ -125,8 +135,7 @@ async function* wrapConverseStream(
   source: AsyncIterable<unknown>,
   sdk: SDKLike,
   modelId: string,
-  sub: string | undefined,
-  dims: Record<string, unknown>,
+  emitOpts: EmitOpts,
 ): AsyncIterable<unknown> {
   let captured: { usage: Record<string, unknown> } | null = null;
   try {
@@ -144,7 +153,7 @@ async function* wrapConverseStream(
     if (captured) {
       try {
         const usage = extractBedrockConverse(captured, modelId);
-        sdk.emit(usage, { subscription: sub, dimensions: dims });
+        sdk.emit(usage, emitOpts);
       } catch {
         /* swallow */
       }
@@ -157,8 +166,7 @@ async function* wrapInvokeStream(
   source: AsyncIterable<unknown>,
   sdk: SDKLike,
   modelId: string,
-  sub: string | undefined,
-  dims: Record<string, unknown>,
+  emitOpts: EmitOpts,
 ): AsyncIterable<unknown> {
   let usagePayload: Record<string, unknown> = {};
   let bedrockMetrics: Record<string, unknown> = {};
@@ -200,7 +208,7 @@ async function* wrapInvokeStream(
       }
       if (synthetic) {
         const usage = extractBedrockInvoke(synthetic, modelId);
-        sdk.emit(usage, { subscription: sub, dimensions: dims });
+        sdk.emit(usage, emitOpts);
       }
     } catch {
       /* swallow */

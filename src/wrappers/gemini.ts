@@ -23,13 +23,19 @@ const INSTRUMENTED = Symbol.for("lago_instrumented_gemini");
 interface LagoOpts {
   subscription?: string;
   dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
+}
+
+interface EmitOpts {
+  subscription?: string;
+  dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
 }
 
 interface SDKLike {
-  emit: (
-    usage: CanonicalUsage,
-    opts?: { subscription?: string; dimensions?: Record<string, unknown> },
-  ) => void;
+  emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
 }
 
 interface ModelsLike {
@@ -72,20 +78,17 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
   const originalGenerate = models.generateContent?.bind(models);
   const originalStream = models.generateContentStream?.bind(models);
 
-  const resolveOpts = (lagoOpts: LagoOpts) => ({
+  const resolveOpts = (lagoOpts: LagoOpts): EmitOpts => ({
     subscription: lagoOpts.subscription || baseSub,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
+    mode: lagoOpts.mode,
+    markup: lagoOpts.markup,
   });
 
-  const emitFrom = (
-    payload: unknown,
-    modelId: string,
-    sub: string | undefined,
-    dims: Record<string, unknown>,
-  ) => {
+  const emitFrom = (payload: unknown, modelId: string, emitOpts: EmitOpts) => {
     try {
       const usage = extractGeminiNative(payload, modelId);
-      sdk.emit(usage, { subscription: sub, dimensions: dims });
+      sdk.emit(usage, emitOpts);
     } catch (err) {
       if (typeof console !== "undefined") {
         console.warn("[lago] gemini emit failed:", (err as Error).message);
@@ -100,10 +103,10 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
       const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const { subscription, dimensions } = resolveOpts(lagoOpts);
+      const emitOpts = resolveOpts(lagoOpts);
 
       const response = await originalGenerate(...args);
-      emitFrom(response, modelId, subscription, dimensions);
+      emitFrom(response, modelId, emitOpts);
       return response;
     };
     models.generateContent = wrappedGenerate as ModelsLike["generateContent"];
@@ -116,7 +119,7 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
       const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const { subscription, dimensions } = resolveOpts(lagoOpts);
+      const emitOpts = resolveOpts(lagoOpts);
 
       const src = (await originalStream(...args)) as AsyncIterable<unknown>;
 
@@ -132,7 +135,7 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
           }
         } finally {
           if (lastWithUsage) {
-            emitFrom(lastWithUsage, modelId, subscription, dimensions);
+            emitFrom(lastWithUsage, modelId, emitOpts);
           }
         }
       }

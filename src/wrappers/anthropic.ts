@@ -16,13 +16,19 @@ const INSTRUMENTED = Symbol.for("lago_instrumented_anthropic");
 interface LagoOpts {
   subscription?: string;
   dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
+}
+
+interface EmitOpts {
+  subscription?: string;
+  dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
 }
 
 interface SDKLike {
-  emit: (
-    usage: CanonicalUsage,
-    opts?: { subscription?: string; dimensions?: Record<string, unknown> },
-  ) => void;
+  emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
 }
 
 interface MessagesLike {
@@ -70,20 +76,17 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
   const originalCreate = messages.create?.bind(messages);
   const originalStream = messages.stream?.bind(messages);
 
-  const resolveOpts = (lagoOpts: LagoOpts) => ({
+  const resolveOpts = (lagoOpts: LagoOpts): EmitOpts => ({
     subscription: lagoOpts.subscription || baseSub,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
+    mode: lagoOpts.mode,
+    markup: lagoOpts.markup,
   });
 
-  const emitFrom = (
-    payload: unknown,
-    modelId: string,
-    sub: string | undefined,
-    dims: Record<string, unknown>,
-  ) => {
+  const emitFrom = (payload: unknown, modelId: string, opts: EmitOpts) => {
     try {
       const usage = extractAnthropicNative(payload, modelId);
-      sdk.emit(usage, { subscription: sub, dimensions: dims });
+      sdk.emit(usage, opts);
     } catch (err) {
       if (typeof console !== "undefined") {
         console.warn("[lago] anthropic emit failed:", (err as Error).message);
@@ -105,7 +108,7 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
       const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const { subscription, dimensions } = resolveOpts(lagoOpts);
+      const emitOpts = resolveOpts(lagoOpts);
 
       const apiPromise = originalCreate(...args) as object;
 
@@ -125,9 +128,9 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
                 let next: unknown = value;
                 try {
                   if (looksLikeMessage(value)) {
-                    emitFrom(value, modelId, subscription, dimensions);
+                    emitFrom(value, modelId, emitOpts);
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, subscription, dimensions);
+                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
                   }
                 } catch {
                   /* never break the call */
@@ -154,7 +157,7 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
       const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const { subscription, dimensions } = resolveOpts(lagoOpts);
+      const emitOpts = resolveOpts(lagoOpts);
 
       const inner = originalStream(...args) as unknown as {
         finalMessage?: () => Promise<unknown>;
@@ -168,14 +171,14 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
         if (origFinal) {
           inner.finalMessage = async () => {
             const final = await origFinal();
-            emitFrom(final, modelId, subscription, dimensions);
+            emitFrom(final, modelId, emitOpts);
             return final;
           };
         }
         // Fallback: 'finalMessage' event fires when the stream completes.
         try {
           inner.on?.("finalMessage", (final: unknown) => {
-            emitFrom(final, modelId, subscription, dimensions);
+            emitFrom(final, modelId, emitOpts);
           });
         } catch {
           /* SDK version may not expose .on — ignore */
@@ -232,8 +235,7 @@ async function* wrapAsyncIterableStream(
   src: AsyncIterable<unknown>,
   sdk: SDKLike,
   modelId: string,
-  sub: string | undefined,
-  dims: Record<string, unknown>,
+  opts: EmitOpts,
 ): AsyncIterable<unknown> {
   const accumulated: Record<string, unknown> = {};
   let sawUsage = false;
@@ -251,7 +253,7 @@ async function* wrapAsyncIterableStream(
     if (sawUsage) {
       try {
         const usage = extractAnthropicNative({ usage: accumulated }, modelId);
-        sdk.emit(usage, { subscription: sub, dimensions: dims });
+        sdk.emit(usage, opts);
       } catch {
         /* swallow */
       }

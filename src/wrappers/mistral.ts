@@ -16,12 +16,19 @@ const INSTRUMENTED = Symbol.for("lago_instrumented_mistral");
 interface LagoOpts {
   subscription?: string;
   dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
 }
 
 interface SDKLike {
   emit: (
     usage: CanonicalUsage,
-    opts?: { subscription?: string; dimensions?: Record<string, unknown> },
+    opts?: {
+      subscription?: string;
+      dimensions?: Record<string, unknown>;
+      mode?: "tokens" | "price";
+      markup?: number;
+    },
   ) => void;
 }
 
@@ -60,6 +67,8 @@ export function wrapMistralClient<T extends MistralLike>(
   const resolveOpts = (lagoOpts: LagoOpts) => ({
     subscription: lagoOpts.subscription || baseSub,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
+    mode: lagoOpts.mode,
+    markup: lagoOpts.markup,
   });
 
   // ---------- chat.complete ----------

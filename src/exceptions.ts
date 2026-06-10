@@ -31,3 +31,20 @@ export class UnknownClientError extends LagoConfigError {
     this.name = "UnknownClientError";
   }
 }
+
+/**
+ * Price mode could not resolve a price (table not warm yet, or model not
+ * matched). Surfaced via onError; the SDK falls back to emitting token events.
+ */
+export class PricingUnavailableError extends LagoSDKError {
+  provider: string;
+  model: string;
+  api: string;
+  constructor(provider: string, model: string, api: string) {
+    super(`no price for provider=${provider} model=${model} api=${api}`);
+    this.name = "PricingUnavailableError";
+    this.provider = provider;
+    this.model = model;
+    this.api = api;
+  }
+}
