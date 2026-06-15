@@ -4,6 +4,8 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-15
+
 ### Added
 - **Price mode — emit computed dollar cost instead of token counts.** New `pricingMode` config (`"tokens"` default | `"price"`), plus `markup`, `costMetricCode` (default `llm_cost`), `pricingTtlMs`, and `bedrockDefaultRegion`. In price mode the SDK emits one `llm_cost` event per call carrying a top-level `precise_total_amount_cents` (cost in cents, after markup) for Lago's **dynamic charge model**, with a full per-field breakdown in `properties` (value in USD, base, markup, source, per-field tokens/unit_price/cost). Live unit prices come from public, no-auth sources: OpenRouter (`/api/v1/models`) for native anthropic/openai/mistral/gemini, and the AWS Bedrock Price List **Bulk** API for Bedrock. Prices are fetched + cached on the background queue loop (never blocking the customer's call); a missing price falls back to token events and calls `onError` (never silently under-bills). Mode and markup are overridable per-call via `lago: { mode: "price", markup: 1.5 }` (Bedrock: command `__lago`). Money uses fixed-point BigInt floored to 12 dp, identical to the Python `Decimal` implementation (cross-repo golden fixture). New `pricing.ts` module + `PricingProvider`; default `pricingMode: "tokens"` keeps existing behavior unchanged.
 
