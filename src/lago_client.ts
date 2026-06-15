@@ -6,6 +6,8 @@ export interface LagoEvent {
   external_subscription_id: string;
   code: string;
   timestamp: number;
+  /** Amount in cents for Lago's dynamic charge model (price mode only). */
+  precise_total_amount_cents?: string;
   properties: Record<string, unknown>;
 }
 

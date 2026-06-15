@@ -5,10 +5,19 @@ export type { LagoSDKOptions, WrapOptions } from "./sdk.js";
 export type { CanonicalUsage } from "./canonical.js";
 export { makeCanonicalUsage, NUMERIC_FIELDS, nonzeroNumeric } from "./canonical.js";
 
-export type { LagoConfig } from "./config.js";
-export { DEFAULT_METRIC_CODES, makeConfig } from "./config.js";
+export type { LagoConfig, PricingMode } from "./config.js";
+export { DEFAULT_COST_METRIC_CODE, DEFAULT_METRIC_CODES, makeConfig } from "./config.js";
 
-export { LagoApiError, LagoConfigError, LagoSDKError, UnknownClientError } from "./exceptions.js";
+export {
+  LagoApiError,
+  LagoConfigError,
+  LagoSDKError,
+  PricingUnavailableError,
+  UnknownClientError,
+} from "./exceptions.js";
+
+export { HttpPricingFetcher, PricingProvider, computeCost } from "./pricing.js";
+export type { CostBreakdown, ModelPrice, PricingFetcher } from "./pricing.js";
 
 export {
   extractAnthropicNative,

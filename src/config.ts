@@ -14,6 +14,15 @@ export const DEFAULT_METRIC_CODES: Record<string, string> = {
   audio_output: "llm_audio_output_tokens",
 };
 
+/** Metric code for the single per-call dollar-cost event emitted in price mode. */
+export const DEFAULT_COST_METRIC_CODE = "llm_cost";
+
+/**
+ * Pricing mode: emit raw token counts (default, backward-compatible) or a single
+ * computed dollar-cost event per call.
+ */
+export type PricingMode = "tokens" | "price";
+
 export interface LagoConfig {
   apiKey: string;
   apiUrl: string;
@@ -25,6 +34,19 @@ export interface LagoConfig {
   requestTimeoutMs: number;
   maxRetryMs: number;
   onError?: (err: unknown, where: string) => void;
+  // --- pricing (price mode) ---
+  /** Global default mode. "tokens" preserves the existing behavior exactly. */
+  pricingMode: PricingMode;
+  /** Multiplier applied to the computed cost (1.0 = no markup, 1.2 = +20%). */
+  markup: number;
+  /** Metric code for the single dollar-cost event emitted in price mode. */
+  costMetricCode: string;
+  /** How long a fetched pricing table stays fresh before a background refresh. */
+  pricingTtlMs: number;
+  /** Region used for Bedrock pricing when the model id carries no region prefix. */
+  bedrockDefaultRegion: string;
+  /** Optional injected PricingProvider (or stub) — primarily for tests/overrides. Typed unknown to avoid a config→pricing import cycle. */
+  pricingProvider?: unknown;
 }
 
 export function makeConfig(partial: Partial<LagoConfig> & { apiKey: string }): LagoConfig {
@@ -37,6 +59,11 @@ export function makeConfig(partial: Partial<LagoConfig> & { apiKey: string }): L
     maxBufferSize: 10_000,
     requestTimeoutMs: 10_000,
     maxRetryMs: 60_000,
+    pricingMode: "tokens",
+    markup: 1.0,
+    costMetricCode: DEFAULT_COST_METRIC_CODE,
+    pricingTtlMs: 3_600_000,
+    bedrockDefaultRegion: "us-east-1",
   };
   // Spread partial WITHOUT letting undefined values clobber defaults
   const filtered: Partial<LagoConfig> = {};

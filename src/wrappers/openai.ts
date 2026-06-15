@@ -30,13 +30,19 @@ const INSTRUMENTED = Symbol.for("lago_instrumented_openai");
 interface LagoOpts {
   subscription?: string;
   dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
+}
+
+interface EmitOpts {
+  subscription?: string;
+  dimensions?: Record<string, unknown>;
+  mode?: "tokens" | "price";
+  markup?: number;
 }
 
 interface SDKLike {
-  emit: (
-    usage: CanonicalUsage,
-    opts?: { subscription?: string; dimensions?: Record<string, unknown> },
-  ) => void;
+  emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
 }
 
 interface CompletionsLike {
@@ -111,20 +117,17 @@ export function wrapOpenAIClient<T extends OpenAILike>(
   const baseDims = { ...(opts.dimensions || {}) };
   const baseSub = opts.subscription;
 
-  const resolveOpts = (lagoOpts: LagoOpts) => ({
+  const resolveOpts = (lagoOpts: LagoOpts): EmitOpts => ({
     subscription: lagoOpts.subscription || baseSub,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
+    mode: lagoOpts.mode,
+    markup: lagoOpts.markup,
   });
 
-  const emitFrom = (
-    payload: unknown,
-    modelId: string,
-    sub: string | undefined,
-    dims: Record<string, unknown>,
-  ) => {
+  const emitFrom = (payload: unknown, modelId: string, emitOpts: EmitOpts) => {
     try {
       const usage = extractOpenAINative(payload, modelId);
-      sdk.emit(usage, { subscription: sub, dimensions: dims });
+      sdk.emit(usage, emitOpts);
     } catch (err) {
       if (typeof console !== "undefined") {
         console.warn("[lago] openai emit failed:", (err as Error).message);
@@ -144,7 +147,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       if (autoIncludeUsage) ensureStreamOptionsIncludeUsage(firstArg);
       const modelId = String(firstArg?.model ?? "");
-      const { subscription, dimensions } = resolveOpts(lagoOpts);
+      const emitOpts = resolveOpts(lagoOpts);
 
       const apiPromise = original(...args) as object;
 
@@ -163,9 +166,9 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                 let next: unknown = value;
                 try {
                   if (looksLikeResponse(value)) {
-                    emitFrom(value, modelId, subscription, dimensions);
+                    emitFrom(value, modelId, emitOpts);
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, subscription, dimensions);
+                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
                   }
                 } catch {
                   /* never break the call */
@@ -226,8 +229,7 @@ async function* wrapAsyncIterableStream(
   src: AsyncIterable<unknown>,
   sdk: SDKLike,
   modelId: string,
-  sub: string | undefined,
-  dims: Record<string, unknown>,
+  opts: EmitOpts,
 ): AsyncIterable<unknown> {
   let lastUsage: Record<string, unknown> | null = null;
   try {
@@ -249,7 +251,7 @@ async function* wrapAsyncIterableStream(
     if (lastUsage) {
       try {
         const usage = extractOpenAINative(lastUsage, modelId);
-        sdk.emit(usage, { subscription: sub, dimensions: dims });
+        sdk.emit(usage, opts);
       } catch {
         /* swallow */
       }
