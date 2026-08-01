@@ -136,7 +136,11 @@ describe("log redaction (A11)", () => {
     const r2 = await fetch(`${gw.url}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: "anthropic/claude-sonnet-4", stream: true, messages: [{ role: "user", content: secretPrompt }] }),
+      body: JSON.stringify({
+        model: "anthropic/claude-sonnet-4",
+        stream: true,
+        messages: [{ role: "user", content: secretPrompt }],
+      }),
     });
     await r2.text();
     await gw.outbox.flush(5000);
