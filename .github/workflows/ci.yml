@@ -33,11 +33,37 @@ jobs:
       - name: Format check (prettier)
         run: npm run format:check
 
+      # Build before typecheck: the gateway workspace's types resolve against
+      # packages/agent-sdk/dist, which only exists after a build.
+      - name: Build
+        run: npm run build
+
       - name: Type-check (tsc)
         run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+  gateway:
+    name: gateway · node24
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
 
       - name: Build
         run: npm run build
 
-      - name: Unit tests
-        run: npm run test:unit
+      - name: Typecheck gateway
+        run: npm run -w @getlago/ai-gateway typecheck
+
+      - name: Gateway tests (incl. kill -9 crash recovery)
+        run: npm run -w @getlago/ai-gateway test

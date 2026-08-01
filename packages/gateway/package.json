@@ -1,0 +1,22 @@
+{
+  "name": "@getlago/ai-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Gateway for Billing (beta). OpenAI-compatible billing edge in front of a transport proxy, emitting priced usage events to Lago with durable delivery.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@getlago/agent-sdk": "^0.3.0"
+  }
+}

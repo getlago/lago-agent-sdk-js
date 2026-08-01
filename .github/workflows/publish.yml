@@ -48,11 +48,13 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # Build first: the gateway workspace's types resolve against
+      # packages/agent-sdk/dist.
+      - run: npm run build
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run format:check
       - run: npm run test:unit
-      - run: npm run build
 
   # ----------------------------------------------------------------------
   # 2. Build the package, assert tag matches package.json version, pack as
