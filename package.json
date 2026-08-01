@@ -1,7 +1,10 @@
 {
-  "name": "lago-agent-sdk",
+  "name": "@getlago/agent-sdk",
   "version": "0.2.0",
   "description": "Instrument LLM clients and emit usage events to Lago.",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",

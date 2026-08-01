@@ -6,7 +6,7 @@ name: publish
 #
 # One-time setup on npm:
 #   https://docs.npmjs.com/trusted-publishers
-#   Package:         lago-agent-sdk
+#   Package:         @getlago/agent-sdk
 #   GitHub Owner:    getlago
 #   Repository:      lago-agent-sdk-js
 #   Workflow file:   .github/workflows/publish.yml
@@ -106,7 +106,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: npm
-      url: https://www.npmjs.com/package/lago-agent-sdk
+      url: https://www.npmjs.com/package/@getlago/agent-sdk
     steps:
       # npm provenance has no supported path for publishing a pre-packed tarball
       # — the attestation is bound to the build, so we must build from source in
