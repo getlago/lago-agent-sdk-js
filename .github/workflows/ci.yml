@@ -65,3 +65,21 @@ jobs:
 
       - name: Gateway tests (incl. kill -9 crash recovery)
         run: npm run -w @getlago/ai-gateway test
+
+  verify-gateway:
+    name: verify:gateway (full stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: verify:gateway (build + tests + compose + integration + load smoke)
+        run: npm run verify:gateway

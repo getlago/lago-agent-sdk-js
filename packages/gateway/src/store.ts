@@ -26,6 +26,9 @@ export interface VirtualKeyRecord {
   allowed_models: string[] | null;
   budget: BudgetPolicy | null;
   provider_key_ref: string | null;
+  /** Optional Bifrost governance virtual key (sk-bf-*) forwarded as x-bf-vk
+   * so the proxy's per-key rate limits apply to this Lago key. */
+  bifrost_vk: string | null;
   created_at: number;
 }
 
@@ -35,6 +38,7 @@ export interface CreateKeyInput {
   allowed_models?: string[];
   budget?: BudgetPolicy;
   provider_key_ref?: string;
+  bifrost_vk?: string;
 }
 
 export class KeyStore {
@@ -56,6 +60,7 @@ export class KeyStore {
         allowed_models TEXT,
         budget TEXT,
         provider_key_ref TEXT,
+        bifrost_vk TEXT,
         created_at INTEGER NOT NULL
       )
     `);
@@ -81,13 +86,14 @@ export class KeyStore {
       allowed_models: input.allowed_models ?? null,
       budget: input.budget ?? null,
       provider_key_ref: input.provider_key_ref ?? null,
+      bifrost_vk: input.bifrost_vk ?? null,
       created_at: Date.now(),
     };
     this.db
       .prepare(
         `INSERT INTO virtual_keys
-         (id, key_hash, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, key_hash, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, bifrost_vk, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -97,6 +103,7 @@ export class KeyStore {
         record.allowed_models ? JSON.stringify(record.allowed_models) : null,
         record.budget ? JSON.stringify(record.budget) : null,
         record.provider_key_ref,
+        record.bifrost_vk,
         record.created_at,
       );
     return { key, record };
@@ -107,7 +114,7 @@ export class KeyStore {
     if (!plaintextKey.startsWith("lago_vk_")) return null;
     const row = this.db
       .prepare(
-        `SELECT id, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, created_at
+        `SELECT id, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, bifrost_vk, created_at
          FROM virtual_keys WHERE key_hash = ?`,
       )
       .get(sha256(plaintextKey)) as Record<string, unknown> | undefined;
@@ -120,6 +127,7 @@ export class KeyStore {
         row.allowed_models == null ? null : (JSON.parse(String(row.allowed_models)) as string[]),
       budget: row.budget == null ? null : (JSON.parse(String(row.budget)) as BudgetPolicy),
       provider_key_ref: row.provider_key_ref == null ? null : String(row.provider_key_ref),
+      bifrost_vk: row.bifrost_vk == null ? null : String(row.bifrost_vk),
       created_at: Number(row.created_at),
     };
   }
@@ -133,7 +141,7 @@ export class KeyStore {
   listVirtualKeys(): VirtualKeyRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT id, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, created_at
+        `SELECT id, external_subscription_id, external_customer_id, allowed_models, budget, provider_key_ref, bifrost_vk, created_at
          FROM virtual_keys ORDER BY created_at`,
       )
       .all() as Array<Record<string, unknown>>;
@@ -145,6 +153,7 @@ export class KeyStore {
         row.allowed_models == null ? null : (JSON.parse(String(row.allowed_models)) as string[]),
       budget: row.budget == null ? null : (JSON.parse(String(row.budget)) as BudgetPolicy),
       provider_key_ref: row.provider_key_ref == null ? null : String(row.provider_key_ref),
+      bifrost_vk: row.bifrost_vk == null ? null : String(row.bifrost_vk),
       created_at: Number(row.created_at),
     }));
   }

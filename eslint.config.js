@@ -24,8 +24,8 @@ export default tseslint.config(
     },
   },
   {
-    // Node CLI entrypoints (plain .mjs, no TS parser services)
-    files: ["**/bin/**/*.mjs"],
+    // Node entrypoints and mock services (plain .mjs, no TS parser services)
+    files: ["**/bin/**/*.mjs", "**/mocks/**/*.mjs", "scripts/**/*.mjs"],
     languageOptions: {
       globals: { console: "readonly", process: "readonly" },
     },

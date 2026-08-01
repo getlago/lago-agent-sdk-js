@@ -1,0 +1,88 @@
+# AI Gateway for Billing — full local stack.
+#
+#   docker compose up --build
+#   npm run demo
+#
+# Everything here is mock/dev material: the "API keys" are placeholders the
+# mock providers never validate, and GW_MASTER_KEY/GW_ADMIN_TOKEN are
+# published dev values for the harness. Point nothing at production.
+services:
+  mock-providers:
+    image: node:24-alpine
+    command: ["node", "/mocks/providers.mjs"]
+    volumes:
+      - ./packages/gateway/mocks:/mocks:ro
+    environment:
+      PORT: "8081"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  mock-lago:
+    image: node:24-alpine
+    command: ["node", "/mocks/lago.mjs"]
+    volumes:
+      - ./packages/gateway/mocks:/mocks:ro
+    environment:
+      PORT: "3001"
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  bifrost:
+    # ADR-001: stock image, pinned by digest.
+    image: maximhq/bifrost@sha256:bf2208978308477a9f667dfc04cef3153197aeaca8618befefbecde3ed3378b7
+    volumes:
+      - bifrost-data:/app/data
+      - ./ops/bifrost/config.json:/app/data/config.json:ro
+    environment:
+      OPENAI_API_KEY: mock-openai-key-not-real
+      ANTHROPIC_API_KEY: mock-anthropic-key-not-real
+    ports:
+      - "8080:8080"
+    depends_on:
+      mock-providers:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: .
+      dockerfile: packages/gateway/Dockerfile
+    environment:
+      GW_PORT: "8090"
+      GW_BIFROST_URL: http://bifrost:8080
+      LAGO_API_URL: http://mock-lago:3001/api/v1
+      LAGO_API_KEY: mock-lago-api-key-not-real
+      GW_ADMIN_TOKEN: dev-admin-token-for-harness-only
+      # 32 zero bytes, base64. Dev-only master key for the mock stack.
+      GW_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      GW_PRICING_MODE: price
+      GW_OPENROUTER_URL: http://mock-providers:8081/pricing/openrouter
+      GW_DATA_DIR: /data
+      GW_BUDGET_TTL_MS: "300"
+    volumes:
+      - gateway-data:/data
+    ports:
+      - "8090:8090"
+    depends_on:
+      bifrost:
+        condition: service_started
+      mock-lago:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  bifrost-data:
+  gateway-data:

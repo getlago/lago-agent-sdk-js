@@ -51,6 +51,28 @@ interface NormalizedUsage {
   };
 }
 
+/** Detect the provider from the raw payload's shape. Bifrost's
+ * `extra_fields.provider` reports the provider of the ORIGINAL request even
+ * when a fallback route served it, so attribution must come from the bytes
+ * that actually arrived (A6: bill against the provider that served). */
+export function detectRawProvider(raw: unknown): string | null {
+  if (!isObj(raw)) return null;
+  if (raw.type === "message" || (isObj(raw.usage) && "input_tokens" in raw.usage)) return "anthropic";
+  if (isObj(raw.usageMetadata) || isObj(raw.usage_metadata)) return "gemini";
+  if (typeof raw.object === "string" && raw.object.startsWith("chat.completion")) return "openai";
+  if (isObj(raw.usage) && "prompt_tokens" in raw.usage) return "openai";
+  return null;
+}
+
+function detectStreamProvider(events: Array<Record<string, unknown>>): string | null {
+  for (const ev of events) {
+    if (typeof ev.type === "string" && ev.type.startsWith("message_")) return "anthropic";
+    if (isObj(ev.usageMetadata) || isObj(ev.usage_metadata)) return "gemini";
+    if (typeof ev.object === "string" && ev.object.startsWith("chat.completion")) return "openai";
+  }
+  return null;
+}
+
 function extractRaw(provider: string, raw: unknown, model: string): CanonicalUsage | null {
   try {
     switch (provider) {
@@ -92,12 +114,14 @@ export function fromNormalizedUsage(
   const input = usage.prompt_tokens ?? 0;
   const output = usage.completion_tokens ?? 0;
   if (input === 0 && output === 0) return null;
+  // Recover each provider's NATIVE reporting convention, because the pricing
+  // de-overlap keys on it: openai/gemini adapters report input inclusive of
+  // cache_read (pricing carves it out), while anthropic reports input
+  // exclusive of all cache traffic. Bifrost folds everything into
+  // prompt_tokens, so subtract what the native shape would not include.
+  const inputIncludesCacheRead = provider === "openai" || provider === "gemini";
   return makeCanonicalUsage({
-    // Bifrost folds cache reads and writes into prompt_tokens; CanonicalUsage
-    // treats input as the non-cache portion (the pricing de-overlap carves
-    // cache_read out of input for openai/gemini, and Anthropic reports them
-    // separately at the source).
-    input: Math.max(0, input - cacheRead - cacheWrite),
+    input: Math.max(0, input - cacheWrite - (inputIncludesCacheRead ? 0 : cacheRead)),
     output,
     cache_read: cacheRead,
     cache_write: cacheWrite,
@@ -114,9 +138,13 @@ export function fromNormalizedUsage(
 /** Non-streaming Bifrost response body → CanonicalUsage. */
 export function usageFromResponse(body: Record<string, unknown>): CanonicalUsage | null {
   const extra = (body.extra_fields ?? {}) as Record<string, unknown>;
-  const provider = String(extra.provider ?? "");
-  const model = String(body.model ?? extra.resolved_model_used ?? "");
-  const fromRaw = extractRaw(provider, extra.raw_response, model);
+  const raw = extra.raw_response;
+  // Shape wins over the header: on a fallback route, extra_fields.provider
+  // still names the original provider, not the one that served.
+  const provider = detectRawProvider(raw) ?? String(extra.provider ?? "");
+  const rawModel = isObj(raw) && typeof raw.model === "string" ? raw.model : "";
+  const model = rawModel || String(body.model ?? extra.resolved_model_used ?? "");
+  const fromRaw = extractRaw(provider, raw, model);
   if (hasUsage(fromRaw)) return withProvider(fromRaw, provider);
   const fallback = fromNormalizedUsage(body.usage as NormalizedUsage | undefined, model, provider);
   return fallback;
@@ -137,9 +165,10 @@ export function usageFromStream(
       /* skip unparseable frames; fallback covers us */
     }
   }
-  const fromRaw = mergeStreamUsage(provider, model, parsed);
-  if (hasUsage(fromRaw)) return withProvider(fromRaw, provider);
-  return fromNormalizedUsage(finalNormalizedUsage, model, provider);
+  const servedBy = detectStreamProvider(parsed) ?? provider;
+  const fromRaw = mergeStreamUsage(servedBy, model, parsed);
+  if (hasUsage(fromRaw)) return withProvider(fromRaw, servedBy);
+  return fromNormalizedUsage(finalNormalizedUsage, model, servedBy);
 }
 
 function mergeStreamUsage(
