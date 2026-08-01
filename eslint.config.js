@@ -23,4 +23,11 @@ export default tseslint.config(
       "@typescript-eslint/no-non-null-assertion": "off",
     },
   },
+  {
+    // Node CLI entrypoints (plain .mjs, no TS parser services)
+    files: ["**/bin/**/*.mjs"],
+    languageOptions: {
+      globals: { console: "readonly", process: "readonly" },
+    },
+  },
 );

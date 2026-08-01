@@ -27,8 +27,14 @@ export { detectClientKind } from "./detector.js";
 export type { ClientKind } from "./detector.js";
 
 // Pricing
-export { HttpPricingFetcher, PricingProvider, computeCost, coerceMarkup } from "./pricing.js";
-export type { CostBreakdown, ModelPrice, PricingFetcher } from "./pricing.js";
+export {
+  HttpPricingFetcher,
+  PricingProvider,
+  computeCost,
+  coerceMarkup,
+  parseOpenRouter,
+} from "./pricing.js";
+export type { CostBreakdown, ModelPrice, OpenRouterTable, PricingFetcher } from "./pricing.js";
 
 // Event building
 export { buildCostEvent, buildTokenEvents } from "./events.js";
