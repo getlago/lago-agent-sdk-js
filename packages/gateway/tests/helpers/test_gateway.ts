@@ -19,7 +19,7 @@ import {
 import type { GatewayConfig } from "../../src/config.js";
 import { KeyStore } from "../../src/store.js";
 import { DurableEventQueue } from "../../src/outbox.js";
-import { AllowAllBudgetChecker, type BudgetChecker } from "../../src/budget.js";
+import { AllowAllBudgetChecker, LagoBudgetChecker, type BudgetChecker } from "../../src/budget.js";
 import { createMetrics, type Metrics } from "../../src/metrics.js";
 import { createLogger, type Logger } from "../../src/logger.js";
 import { createGatewayServer } from "../../src/server.js";
@@ -63,6 +63,8 @@ export async function startTestGateway(
     markup?: number;
     backpressureDepth?: number;
     budget?: BudgetChecker;
+    /** Wire the real LagoBudgetChecker against the mock Lago. */
+    budgetFromLago?: boolean;
   } = {},
 ): Promise<TestGateway> {
   const dir = mkdtempSync(join(tmpdir(), "gw-"));
@@ -119,6 +121,18 @@ export async function startTestGateway(
   await pricing.maybeRefresh();
 
   const metrics = createMetrics(() => outbox.depth());
+  const budget: BudgetChecker =
+    opts.budget ??
+    (opts.budgetFromLago
+      ? new LagoBudgetChecker({
+          lagoApiUrl: config.lagoApiUrl,
+          lagoApiKey: config.lagoApiKey,
+          ttlMs: 60_000,
+          timeoutMs: 500,
+          onError,
+          onCheckFailure: () => metrics.budgetCheckFailures.inc(),
+        })
+      : new AllowAllBudgetChecker());
   const server: http.Server = createGatewayServer({
     config,
     store,
@@ -132,7 +146,7 @@ export async function startTestGateway(
       costMetricCode: DEFAULT_COST_METRIC_CODE,
       onError,
     },
-    budget: opts.budget ?? new AllowAllBudgetChecker(),
+    budget,
     metrics,
     logger,
   });

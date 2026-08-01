@@ -15,7 +15,7 @@ import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { KeyStore } from "./store.js";
 import { DurableEventQueue } from "./outbox.js";
-import { AllowAllBudgetChecker } from "./budget.js";
+import { LagoBudgetChecker } from "./budget.js";
 import { createMetrics } from "./metrics.js";
 import { createGatewayServer } from "./server.js";
 
@@ -57,6 +57,13 @@ export async function start(): Promise<void> {
   }
 
   const metrics = createMetrics(() => outbox.depth());
+  const budget = new LagoBudgetChecker({
+    lagoApiUrl: config.lagoApiUrl,
+    lagoApiKey: config.lagoApiKey,
+    ttlMs: config.budgetTtlMs,
+    onError,
+    onCheckFailure: () => metrics.budgetCheckFailures.inc(),
+  });
   const server = createGatewayServer({
     config,
     store,
@@ -70,7 +77,7 @@ export async function start(): Promise<void> {
       costMetricCode: DEFAULT_COST_METRIC_CODE,
       onError,
     },
-    budget: new AllowAllBudgetChecker(),
+    budget,
     metrics,
     logger,
   });
