@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.13.3",
     "eslint": "^10.3.0",
     "prettier": "^3.8.3",
     "tsx": "^4.22.3",
