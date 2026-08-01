@@ -200,7 +200,7 @@ async function handleCompletion(
   }
 
   // 4. Budget.
-  const decision = await deps.budget.check(vk.external_subscription_id, vk.budget);
+  const decision = await deps.budget.check(vk);
   if (!decision.allow) {
     metrics.budgetDenials.inc();
     metrics.requestsTotal.inc({ provider: providerOf(model), model, status: "402" });

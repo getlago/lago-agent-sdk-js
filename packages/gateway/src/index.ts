@@ -8,8 +8,8 @@ export type { BudgetPolicy, CreateKeyInput, VirtualKeyRecord } from "./store.js"
 export { encryptSecret, decryptSecret, safeEqual } from "./crypto.js";
 export { billUsage, usageFromResponse, usageFromStream, fromNormalizedUsage } from "./billing.js";
 export type { BillingContext, BillOutcome } from "./billing.js";
-export { AllowAllBudgetChecker } from "./budget.js";
-export type { BudgetChecker, BudgetDecision } from "./budget.js";
+export { AllowAllBudgetChecker, LagoBudgetChecker } from "./budget.js";
+export type { BudgetChecker, BudgetDecision, LagoBudgetCheckerOptions } from "./budget.js";
 export { createMetrics, renderMetrics } from "./metrics.js";
 export type { Metrics } from "./metrics.js";
 export { createLogger } from "./logger.js";

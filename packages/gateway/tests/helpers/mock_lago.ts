@@ -19,12 +19,18 @@ export interface MockLago {
   setHanging: (hanging: boolean) => void;
   /** artificial per-request latency in ms. */
   setLatencyMs: (ms: number) => void;
+  /** current-usage spend served to budget checks, in cents per customer. */
+  setSpendCents: (customerId: string, cents: number) => void;
+  /** number of current_usage GETs received (TTL-cache assertions). */
+  usageCalls: () => number;
   close: () => Promise<void>;
 }
 
 export async function startMockLago(): Promise<MockLago> {
   const store = new Map<string, unknown>();
   const receipts = new Map<string, number>();
+  const spendCents = new Map<string, number>();
+  let usageCallCount = 0;
   let failRemaining = 0;
   let hanging = false;
   let latencyMs = 0;
@@ -33,11 +39,19 @@ export async function startMockLago(): Promise<MockLago> {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
+      if (hanging) return; // never respond
+      const usageMatch = req.url?.match(/\/customers\/([^/]+)\/current_usage/);
+      if (req.method === "GET" && usageMatch) {
+        usageCallCount++;
+        const customerId = decodeURIComponent(usageMatch[1]);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ customer_usage: { total_amount_cents: spendCents.get(customerId) ?? 0 } }));
+        return;
+      }
       if (!req.url?.endsWith("/events/batch")) {
         res.writeHead(404).end();
         return;
       }
-      if (hanging) return; // never respond
       if (latencyMs > 0) await new Promise((r) => setTimeout(r, latencyMs));
       if (failRemaining > 0) {
         failRemaining--;
@@ -64,6 +78,8 @@ export async function startMockLago(): Promise<MockLago> {
     failNext: (n) => (failRemaining = n),
     setHanging: (h) => (hanging = h),
     setLatencyMs: (ms) => (latencyMs = ms),
+    setSpendCents: (customerId, cents) => void spendCents.set(customerId, cents),
+    usageCalls: () => usageCallCount,
     close: () =>
       new Promise((resolve) => {
         server.closeAllConnections?.();

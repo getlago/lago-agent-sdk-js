@@ -118,6 +118,10 @@ export function createMetrics(readOutboxDepth: () => number) {
       "Billing events accepted then lost. Must be 0 in gateway mode",
     ),
     budgetDenials: new Counter("gw_budget_denials_total", "Requests rejected by budget enforcement"),
+    budgetCheckFailures: new Counter(
+      "gw_budget_check_failures_total",
+      "Budget checks that could not reach Lago (fail-open unless the key is strict)",
+    ),
     providerErrors: new Counter("gw_provider_errors_total", "Upstream provider/proxy errors"),
     backpressureRejections: new Counter(
       "gw_backpressure_rejections_total",
@@ -143,6 +147,7 @@ export function renderMetrics(m: Metrics): string {
       m.eventsEmitted.render(),
       m.eventsDropped.render(),
       m.budgetDenials.render(),
+      m.budgetCheckFailures.render(),
       m.providerErrors.render(),
       m.backpressureRejections.render(),
       m.outboxDepth.render(),
