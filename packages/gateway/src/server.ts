@@ -109,6 +109,7 @@ async function handleAdmin(
       allowed_models: Array.isArray(body.allowed_models) ? body.allowed_models.map(String) : undefined,
       budget: isObj(body.budget) ? body.budget : undefined,
       provider_key_ref: strOrUndef(body.provider_key_ref),
+      bifrost_vk: strOrUndef(body.bifrost_vk),
     });
     deps.logger.info("virtual key created", {
       key_id: record.id,
@@ -244,6 +245,11 @@ async function handleCompletion(
       headers["authorization"] = `Bearer ${pk.key}`;
     }
   }
+  // Per-tenant rate limits ride on Bifrost governance: forward its VK so the
+  // proxy enforces the limits configured there (no limiter built here).
+  if (vk.bifrost_vk) {
+    headers["x-bf-vk"] = vk.bifrost_vk;
+  }
   if (stream && isObj(body) && body.stream_options === undefined) {
     // Ask for the final usage frame on OpenAI-style streams; translated
     // providers report usage regardless.
@@ -346,12 +352,15 @@ async function relayStream(
   const rawEvents: string[] = [];
   let finalUsage: Record<string, unknown> | null = null;
   let provider = providerOf(model);
+  // Bill against the model the provider reports (chunks carry it bare);
+  // fall back to the request model with the routing prefix stripped.
+  let billModel = bareModel(model);
   let billed = false;
 
   const finalize = (): void => {
     if (billed) return;
     billed = true;
-    const usage = usageFromStream(provider, model, rawEvents, finalUsage);
+    const usage = usageFromStream(provider, billModel, rawEvents, finalUsage);
     if (usage) {
       const outcome = billUsage(deps.billing, usage, vk.external_subscription_id, requestId, {
         aborted_by_client: clientGone || undefined,
@@ -424,6 +433,7 @@ async function relayStream(
         if (typeof extra.raw_response === "string") rawEvents.push(extra.raw_response);
         delete chunk.extra_fields;
       }
+      if (typeof chunk.model === "string" && chunk.model) billModel = chunk.model;
       if (isObj(chunk.usage)) finalUsage = chunk.usage as Record<string, unknown>;
       return `data: ${JSON.stringify(chunk)}\n\n`;
     } catch {
@@ -461,6 +471,11 @@ function bearer(req: http.IncomingMessage): string | null {
 function providerOf(model: string): string {
   const i = model.indexOf("/");
   return i === -1 ? "unknown" : model.slice(0, i);
+}
+
+function bareModel(model: string): string {
+  const i = model.indexOf("/");
+  return i === -1 ? model : model.slice(i + 1);
 }
 
 function modelAllowed(model: string, allowed: string[]): boolean {

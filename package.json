@@ -13,6 +13,7 @@
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces --if-present",
     "test:unit": "npm run -w @getlago/agent-sdk test -- tests/unit",
+    "verify:gateway": "node scripts/verify_gateway.mjs",
     "typecheck": "npm run typecheck --workspaces",
     "lint": "eslint packages",
     "lint:fix": "eslint packages --fix",

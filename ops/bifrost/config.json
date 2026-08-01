@@ -1,0 +1,41 @@
+{
+  "client": {
+    "drop_excess_requests": false,
+    "allow_direct_keys": true
+  },
+  "logging": {
+    "allow_per_request_raw_override": true
+  },
+  "providers": {
+    "openai": {
+      "keys": [
+        {
+          "name": "harness-openai",
+          "value": "env.OPENAI_API_KEY",
+          "models": ["*"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://mock-providers:8081/openai/v1",
+        "allow_private_network": true
+      },
+      "send_back_raw_response": true
+    },
+    "anthropic": {
+      "keys": [
+        {
+          "name": "harness-anthropic",
+          "value": "env.ANTHROPIC_API_KEY",
+          "models": ["*"],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://mock-providers:8081/anthropic",
+        "allow_private_network": true
+      },
+      "send_back_raw_response": true
+    }
+  }
+}
