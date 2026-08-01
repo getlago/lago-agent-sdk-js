@@ -33,11 +33,13 @@ jobs:
       - name: Format check (prettier)
         run: npm run format:check
 
-      - name: Type-check (tsc)
-        run: npm run typecheck
-
+      # Build before typecheck: the gateway workspace's types resolve against
+      # packages/agent-sdk/dist, which only exists after a build.
       - name: Build
         run: npm run build
+
+      - name: Type-check (tsc)
+        run: npm run typecheck
 
       - name: Unit tests
         run: npm run test:unit
