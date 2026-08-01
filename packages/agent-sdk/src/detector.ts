@@ -1,13 +1,7 @@
 /** Detect which client kind was passed to wrap(). */
 
 export type ClientKind =
-  | "bedrock"
-  | "anthropic"
-  | "openai"
-  | "mistral"
-  | "gemini"
-  | "gemini_legacy"
-  | "unknown";
+  "bedrock" | "anthropic" | "openai" | "mistral" | "gemini" | "gemini_legacy" | "unknown";
 
 export function detectClientKind(client: unknown): ClientKind {
   if (!client || typeof client !== "object") return "unknown";

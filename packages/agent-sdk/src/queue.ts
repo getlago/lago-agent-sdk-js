@@ -7,16 +7,18 @@
  */
 
 import type { LagoEvent } from "./lago_client.js";
+import type { EventTransport, PushResult } from "./transport.js";
 
 type Sender = (batch: LagoEvent[]) => Promise<void>;
 
-export class EventQueue {
+export class EventQueue implements EventTransport {
   private buffer: LagoEvent[] = [];
   private wakeResolvers: Array<() => void> = [];
   private stopping = false;
   private backoffMs = 0;
   private timer: NodeJS.Timeout | null = null;
   private loopPromise: Promise<void>;
+  private inflight = 0;
   /** for tests */
   public httpCalls = 0;
 
@@ -35,7 +37,7 @@ export class EventQueue {
     this.installShutdownHook();
   }
 
-  push(event: LagoEvent): void {
+  push(event: LagoEvent): PushResult {
     if (this.buffer.length >= this.maxBufferSize) {
       this.buffer.shift();
       if (this.onError) {
@@ -48,6 +50,21 @@ export class EventQueue {
     }
     this.buffer.push(event);
     if (this.buffer.length >= this.maxBatchSize) this.wake();
+    // Fail-open by design: overflow evicts the oldest, the new event is
+    // always taken (see EventTransport for the gateway-mode contrast).
+    return "accepted";
+  }
+
+  /** Events accepted but not yet delivered (buffered + in flight). */
+  depth(): number {
+    return this.buffer.length + this.inflight;
+  }
+
+  /** Age in ms of the oldest buffered event (event timestamps are unix seconds). */
+  lagMs(): number {
+    const oldest = this.buffer[0];
+    if (!oldest) return 0;
+    return Math.max(0, Date.now() - oldest.timestamp * 1000);
   }
 
   async flush(timeoutMs: number = 5000): Promise<boolean> {
@@ -123,9 +140,12 @@ export class EventQueue {
         }
         try {
           this.httpCalls++;
+          this.inflight = batch.length;
           await this.sender(batch);
+          this.inflight = 0;
           this.backoffMs = 0;
         } catch (exc) {
+          this.inflight = 0;
           this.replayFailed(batch);
           this.backoffMs = this.backoffMs === 0 ? 1000 : Math.min(this.backoffMs * 2, this.maxRetryMs);
           if (this.onError) {

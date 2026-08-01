@@ -51,7 +51,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run format:check
-      - run: npm test -- tests/unit
+      - run: npm run test:unit
       - run: npm run build
 
   # ----------------------------------------------------------------------
@@ -75,19 +75,20 @@ jobs:
       - name: Verify tag matches package.json version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(node -p "require('./package.json').version")
+          PKG=$(node -p "require('./packages/agent-sdk/package.json').version")
           if [ "$TAG" != "$PKG" ]; then
-            echo "::error::tag $GITHUB_REF_NAME (=$TAG) != package.json version $PKG"
+            echo "::error::tag $GITHUB_REF_NAME (=$TAG) != @getlago/agent-sdk version $PKG"
             exit 1
           fi
-          echo "Tag $TAG matches package.json version $PKG"
+          echo "Tag $TAG matches @getlago/agent-sdk version $PKG"
       - name: Pack tarball
         run: npm pack
+        working-directory: packages/agent-sdk
       - name: Upload tarball artifact
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: package
-          path: "*.tgz"
+          path: "packages/agent-sdk/*.tgz"
           if-no-files-found: error
 
   # ----------------------------------------------------------------------
@@ -130,6 +131,7 @@ jobs:
       # runs only on a v*.*.* tag (see the `if:` guard above), and reinstalls
       # from the committed lockfile so the build is reproducible.
       - run: npm publish --provenance --access public
+        working-directory: packages/agent-sdk
 
   # ----------------------------------------------------------------------
   # 4. Create a GitHub Release tied to the tag, attaching the tarball.
