@@ -34,7 +34,7 @@ The WP1–WP7 build (PRs #20–#26) survives largely intact because the durabili
 - **`packages/gateway/src/server.ts`**: the hardcoded Bifrost upstream (`GW_BIFROST_URL`) becomes an `UpstreamTransport` chosen per request from the provider profile. Add the `/v1/messages` ingress next to `/v1/chat/completions`.
 - **Pricing**: the OpenRouter-sourced price table is replaced by the per-profile versioned cost catalog (model, region, effective date) plus customer-specific selling prices; the never-under-bill fallback keeps its semantics.
 - **Rate limits**: v1 delegated per-key rate limits to Bifrost governance. On certified paths this moves into the edge or is descoped for launch; it is not a launch requirement.
-- **New work**: direct-dial transport, `/v1/messages` ingress, provider profiles for Groq/Mistral/`bedrock-mantle`, the financial record, and per-profile contract tests published as the compatibility matrix. See PLAN.md WP8–WP12.
+- **New work**: direct-dial transport, `/v1/messages` ingress, provider profiles for Groq/Mistral/`bedrock-mantle`, the financial record, the commercial decision engine (ADR-004), and per-profile contract tests published as the compatibility matrix. See PLAN.md WP8–WP13.
 
 ## Proxy evaluation (v1, 2026-07-31 — retained for the adapter decision)
 
@@ -67,7 +67,7 @@ This evaluation stands for what it now decides: which proxies are worth an optio
 
 ## Out of launch scope
 
-Intelligent routing and model selection. Fallbacks. Generic governance. Prompt observability. Universal provider coverage. Partnership and startup-program workflows.
+Intelligent routing and model selection beyond ADR-004's commercial decision outputs. Fallbacks. Generic governance. Prompt observability. Universal provider coverage. Partnership and startup-program workflows.
 
 ## NEEDS-HUMAN-CONFIRMATION
 
