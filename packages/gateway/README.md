@@ -1,6 +1,6 @@
-# Lago AI Gateway (beta)
+# Lago AI Billing Gateway (beta)
 
-An OpenAI-compatible gateway that turns LLM traffic into billing-grade Lago usage events. Point any OpenAI SDK at it, authenticate with a Lago-issued virtual key, call any supported model, and correctly priced, correctly attributed usage events land in Lago. Zero events lost, zero double-billed, across a gateway crash.
+An OpenAI-compatible billing gateway that turns LLM traffic into billing-grade Lago usage events. Point any OpenAI SDK at it, authenticate with a Lago-issued virtual key, call a model from the [tested compatibility](#tested-compatibility) table, and correctly priced, correctly attributed usage events land in Lago. Zero events lost, zero double-billed, across a gateway crash.
 
 ## Architecture
 
@@ -17,7 +17,16 @@ An OpenAI-compatible gateway that turns LLM traffic into billing-grade Lago usag
                         └─────────────────────────────────────────────┘       by transaction_id)
 ```
 
-Bifrost (ADR-001) does transport, request translation, routing, fallbacks, and rate limits. This service owns the client socket and the billing core: usage is extracted from the **raw provider payload** (`extra_fields.raw_response`), so dimension fidelity survives, including the Anthropic cache 5m/1h TTL split. Bifrost's own usage and cost numbers are never trusted for billing.
+Bifrost does transport, request translation, routing, fallbacks, and rate limits in this build. This service owns the client socket and the billing core: usage is extracted from the **raw provider payload** (`extra_fields.raw_response`), so dimension fidelity survives, including the Anthropic cache 5m/1h TTL split. Bifrost's own usage and cost numbers are never trusted for billing. ADR-001 (revised 2026-08-02) makes the upstream boundary pluggable — the certified launch paths dial providers directly and Bifrost becomes an optional adapter; that migration is WP8–WP9 in [PLAN.md](../../PLAN.md).
+
+## Tested compatibility
+
+Exactly what the current test suite proves, nothing broader. Both paths are verified against mock providers in CI (`verify:gateway`); real-provider certification, native Anthropic ingress (`/v1/messages`), and the Groq/Mistral/Bedrock profiles are launch gates tracked in [DEFINITION_OF_DONE.md](../../DEFINITION_OF_DONE.md).
+
+| Ingress | Upstream path | Modes | Usage dimensions proven |
+| --- | --- | --- | --- |
+| `POST /v1/chat/completions` (OpenAI-compatible) | OpenAI, via Bifrost passthrough | stream + non-stream | input, output, cached read, reasoning |
+| `POST /v1/chat/completions` (OpenAI-compatible) | Anthropic, via Bifrost translation | stream + non-stream | input, output, cache read, cache write incl. the 5m/1h TTL split |
 
 ## Quickstart
 
@@ -50,7 +59,7 @@ await client.chat.completions.create({
 
 | Route | Purpose |
 | --- | --- |
-| `POST /v1/chat/completions` | OpenAI-compatible, stream + non-stream, any provider Bifrost routes |
+| `POST /v1/chat/completions` | OpenAI-compatible, stream + non-stream, providers per the [tested compatibility](#tested-compatibility) table |
 | `GET /healthz` | liveness + outbox depth/lag |
 | `GET /metrics` | Prometheus text exposition |
 | `POST /admin/keys` | create virtual key (plaintext returned once) |

@@ -1,4 +1,4 @@
-# AI Gateway for Billing — full local stack.
+# Lago AI Billing Gateway — full local stack.
 #
 #   docker compose up --build
 #   npm run demo
