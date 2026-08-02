@@ -1,12 +1,44 @@
-# ADR-001: Proxy selection for the AI Gateway
+# ADR-001: Transport architecture for the AI Billing Gateway
 
-Status: Accepted. 2026-07-31.
+Status: Accepted. Revised 2026-08-02. (v1, accepted 2026-07-31, made Bifrost the required transport; revised after the launch architecture review on PR #19. The v1 proxy evaluation is retained below because it still decides the optional-adapter question.)
 
 ## Context
 
-Lago wants to ship an AI Gateway for Billing beta in 3 to 6 weeks. The strategy: adopt an open-source proxy for transport, translation, and routing. Reuse this repo's usage, pricing, and event logic as the billing engine. The billing hook must see the raw provider payload. Dimension fidelity (cache 5m/1h TTL split, reasoning tokens, tool calls) is the differentiation. All licenses and capabilities below were verified against current sources on 2026-07-31, not from memory.
+The product is the **Lago AI Billing Gateway**: the financial layer between model consumption and customer revenue. The launch claim is "build with any leading model provider; monetize with Lago" — not a routing gateway, not an AI-governance gateway, and not a Bifrost distribution. v1 of this ADR made Bifrost a required runtime that owned transport, translation, routing, fallbacks, virtual keys, and rate limits. That created dependency and positioning risk (Bifrost is expanding into budgets, cost controls, and enterprise AI governance) and put a third party between Lago and the raw usage record. The launch review set constraints v1 does not meet:
 
-## Options
+- Lago owns the customer identity, the raw usage record, the pricing context, and the billable ledger. No third-party runtime sits between the billing edge and the provider bytes.
+- The transport boundary is explicit and pluggable. The certified paths must not require Bifrost or LiteLLM.
+- OpenAI and Anthropic are supported natively, covering streaming, tool calls, provider-specific errors, and full usage dimensions — including Anthropic prompt-cache reads and the 5-minute/1-hour cache-write split.
+- A customer migrates by changing the base URL in the stock `openai` or `@anthropic-ai/sdk` package.
+
+Dimension fidelity (cache TTL split, reasoning tokens, tool calls) remains the differentiation. The SDK's native adapters already extract it from raw provider payloads, sync and stream, with fixtures — that asset is transport-independent.
+
+## Decision
+
+**The gateway speaks two protocol transports natively and dials certified providers directly. Proxies are optional upstream adapters behind the same interface, never required.**
+
+1. **Protocol transports.** Two ingress surfaces, each relayed to upstreams that speak the same protocol, with no translation layer in the certified paths:
+   - **OpenAI-compatible**: `POST /v1/chat/completions` first; the Responses API where a certified model requires it.
+   - **Anthropic-compatible**: native `POST /v1/messages`.
+2. **Certified provider profiles.** Launch certifies five profiles on those transports: OpenAI direct; Anthropic direct; Groq via OpenAI compatibility; Mistral via OpenAI compatibility; Amazon Bedrock via `bedrock-mantle`, using its OpenAI or Anthropic compatibility surface. A profile is data plus tests, and must define: endpoint and authentication; model identifiers; usage extraction, including cached-token dimensions; streaming and tool-call behavior; error behavior; a versioned cost catalog by model, region, and effective date; and explicit compatibility limitations. "Certified" means the profile's contract tests pass; there is no "any supported model" claim, only the published matrix.
+3. **Upstream boundary.** The billing edge selects an upstream per request through one `UpstreamTransport` interface: a direct-dial HTTPS transport parameterized by provider profile (the certified default), or an optional proxy adapter. Bifrost stays available as such an adapter (LiteLLM can be another); adapters get the same contract tests as direct profiles and are never required for the certified paths. Generic routing, fallback, and gateway governance are not launch requirements and live only behind adapters.
+4. **Lago-owned financial record.** For every accepted request the gateway persists, in its own store before the client response completes: Lago customer and subscription; provider, model, and region; input, output, and cached usage; provider cost from the profile's cost catalog; the customer-specific selling price; gross margin; credits or commitment consumed; and Lago event/invoice lineage. Lago is the system of record; no proxy's usage or cost numbers are ever trusted for billing.
+5. **AWS boundary.** Launch supports only `bedrock-mantle` with Bedrock API-key authentication, on selected on-demand models and regions. AWS-native Converse/InvokeModel, SigV4, provisioned throughput, batch inference, and custom deployments are excluded.
+
+## Migration from the current implementation (smallest path)
+
+The WP1–WP7 build (PRs #20–#26) survives largely intact because the durability point and the extraction already live in our process:
+
+- **Unchanged**: workspaces (ADR-002); SQLite WAL outbox, crash semantics, fail-closed backpressure (ADR-003); virtual keys and BYOK at rest; budget enforcement; SSE relay including abort-still-bills; metrics; redaction proofs. None of these know what the upstream is.
+- **`packages/gateway/src/billing.ts`**: already extracts from raw provider payloads via the SDK's native adapters. On a direct transport the response body *is* the raw payload, so the certified paths feed the adapters directly; the `extra_fields.raw_response` unwrap and the normalized-usage fallback move into the Bifrost adapter, the only place they apply.
+- **`packages/gateway/src/server.ts`**: the hardcoded Bifrost upstream (`GW_BIFROST_URL`) becomes an `UpstreamTransport` chosen per request from the provider profile. Add the `/v1/messages` ingress next to `/v1/chat/completions`.
+- **Pricing**: the OpenRouter-sourced price table is replaced by the per-profile versioned cost catalog (model, region, effective date) plus customer-specific selling prices; the never-under-bill fallback keeps its semantics.
+- **Rate limits**: v1 delegated per-key rate limits to Bifrost governance. On certified paths this moves into the edge or is descoped for launch; it is not a launch requirement.
+- **New work**: direct-dial transport, `/v1/messages` ingress, provider profiles for Groq/Mistral/`bedrock-mantle`, the financial record, and per-profile contract tests published as the compatibility matrix. See PLAN.md WP8–WP12.
+
+## Proxy evaluation (v1, 2026-07-31 — retained for the adapter decision)
+
+All licenses and capabilities were verified against current sources on 2026-07-31, not from memory.
 
 | Criterion (priority order)                                         | LiteLLM                                                                         | Portkey                                                    | Bifrost                                                                                       | Helicone GW                                            | Envoy AI GW                      | Kong                        |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------- | --------------------------- |
@@ -18,13 +50,7 @@ Lago wants to ship an AI Gateway for Billing beta in 3 to 6 weeks. The strategy:
 | 6. License                                                         | MIT + commercial `enterprise/` dir                                              | MIT                                                        | **Apache-2.0**                                                                                | GPLv3, maintenance mode since the Mintlify acquisition | Apache-2.0                       | OSS core, AI features gated |
 | 7. Runtime                                                         | Python sidecar + Postgres                                                       | TS, embeddable                                             | Go binary/image                                                                               | Rust                                                   | Go + Envoy                       | Lua                         |
 
-Helicone is eliminated on license alone. Portkey fails criterion 4 and its hooks fail criterion 1. LiteLLM is the runner-up but demonstrably loses the cache TTL split, and forces a Python sidecar plus Postgres.
-
-## Decision
-
-**Bifrost (maximhq/bifrost, Apache-2.0), consumed as a stock pinned Docker image. No fork.** A thin TypeScript "billing edge" service (`packages/gateway`) sits in front of it, owns the client socket, and runs `@getlago/agent-sdk/core` in-process: auth, budget check, backpressure, SSE relay, raw usage extraction, pricing, durable outbox. Bifrost stays transport-only. Its usage and cost fields are never trusted for billing; we price from raw payloads.
-
-Criterion 7 is resolved by this split, not by picking a weaker TS proxy: the durability point (SQLite WAL write) lives in our process, so a proxy crash loses no billing data and a shim crash recovers from WAL.
+This evaluation stands for what it now decides: which proxies are worth an optional adapter. Bifrost remains the first adapter because it is the only one whose hooks preserve the raw payload (criterion 1). LiteLLM is the recorded second adapter candidate despite losing the cache TTL split, because translation-only routes through it never carry that split anyway.
 
 ### Spike evidence (2026-07-31, bifrost:latest, mock providers)
 
@@ -34,12 +60,17 @@ Criterion 7 is resolved by this split, not by picking a weaker TS proxy: the dur
 
 ## Consequences
 
-- No Go code in the beta path. A custom Go binary registering Bifrost's `PostLLMHook` is the recorded contingency if a future Bifrost version drops per-chunk raw access.
-- The shim adds one local hop. Measured by `gw_ttfb_seconds` in the load smoke; compose runs both on one network.
-- Image is pinned by digest. Contract tests run our fixtures against the pinned image in CI.
+- The certified paths have no third-party runtime: fewer moving parts, no dependency or positioning risk, and the latency of one process instead of two. The durability point (SQLite WAL write) stays in our process either way.
+- Two ingress protocols to maintain instead of one; translation is nobody's job on certified paths, so an Anthropic model is reached through the Anthropic transport, not through Chat Completions.
+- Each certified profile carries a contract-test bill: non-streaming, streaming, tool calls, provider errors, usage extraction (cached dimensions where applicable), cost calculation, and Lago customer attribution. The published compatibility matrix is generated from these tests.
+- The Bifrost image, when used as an adapter, stays pinned by digest with its contract tests in CI. A custom Go binary registering Bifrost's `PostLLMHook` remains the contingency if a future version drops per-chunk raw access.
+
+## Out of launch scope
+
+Intelligent routing and model selection. Fallbacks. Generic governance. Prompt observability. Universal provider coverage. Partnership and startup-program workflows.
 
 ## NEEDS-HUMAN-CONFIRMATION
 
-1. Apache-2.0 dependency consumed as an unmodified image from an MIT repo. Clean by our reading, but legal should confirm. If we ever vendor or patch Bifrost code, that code stays Apache-2.0 with NOTICE preserved.
+1. Apache-2.0 dependency (Bifrost) consumed as an unmodified image from an MIT repo, now optional. Clean by our reading, but legal should confirm before we distribute or document the adapter. If we ever vendor or patch Bifrost code, that code stays Apache-2.0 with NOTICE preserved.
 2. Gateway package license defaults to MIT to match the repo.
-3. Single-vendor OSS risk: Portkey and Helicone were both acquired in 2026. We accept the risk for beta with the image pinned and the `PostLLMHook` contingency recorded.
+3. `bedrock-mantle` scope: confirm the exact on-demand models and regions to certify at launch, and that Bedrock API-key auth is acceptable for the target design partners (SigV4 is explicitly excluded).
