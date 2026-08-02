@@ -1,6 +1,6 @@
 # Definition of Done — Lago AI Billing Gateway (beta)
 
-Two sections. The first records the shipped WP0–WP7 evidence: reliable gateway-to-event delivery, verified against mock providers and mock Lago. The second is the launch gate from the 2026-08-02 acceptance review (PR #26): the launch promise is `model request → Lago customer → usage → provider cost → customer-specific price → margin → credits → real invoice line`, and the infrastructure evidence below does not satisfy it on its own. Nothing launches until the second section is checked.
+Two sections. The first records the shipped WP0–WP7 evidence: reliable gateway-to-event delivery, verified against mock providers and mock Lago. The second is the launch gate from the 2026-08-02 acceptance reviews (PR #26): the launch promise is `intent → commercial decision → reservation → provider execution → settlement → real Lago invoice line` — commercial intent drives execution, and the infrastructure evidence below does not satisfy it on its own. Nothing launches until the second section is checked.
 
 ## Shipped infrastructure evidence (WP0–WP7)
 
@@ -52,13 +52,13 @@ Every box below is checked with a pointer to its evidence: a test file that runs
   Evidence: [docker-compose.yml](docker-compose.yml), [demo.mjs](scripts/demo.mjs). The demo creates a virtual key, runs streaming + non-streaming with the plain `openai` package across 2 providers, SIGKILLs and restarts the gateway mid-run, reconciles counts and exact amounts in mock Lago. Transcript in PR #26.
 
 - [x] **Gateway README + failure-semantics table written; PLAN.md reflects reality.**
-  Evidence: [packages/gateway/README.md](packages/gateway/README.md) (quickstart, architecture diagram, config reference, failure semantics); [PLAN.md](PLAN.md) updated with the shipped PR ladder and the WP8–WP12 migration.
+  Evidence: [packages/gateway/README.md](packages/gateway/README.md) (quickstart, architecture diagram, config reference, failure semantics); [PLAN.md](PLAN.md) updated with the shipped PR ladder and the WP8–WP13 migration.
 
 ## Launch acceptance criteria (2026-08-02 review — open)
 
-The evidence above proves reliable delivery against mocks. It does not prove the launch promise: the demo reconciles priced events against a mock Lago sink, the only tested paths are OpenAI plus Bifrost-translated Anthropic against mock providers, and a single global `GW_MARKUP` does not demonstrate monetization. These gates close that gap; the implementing work packages are WP8–WP12 in [PLAN.md](PLAN.md).
+The evidence above proves reliable delivery against mocks. It does not prove the launch promise: the demo reconciles priced events against a mock Lago sink, the only tested paths are OpenAI plus Bifrost-translated Anthropic against mock providers, a single global `GW_MARKUP` does not demonstrate monetization, and execution is not yet driven by commercial intent. These gates close that gap; the implementing work packages are WP8–WP13 in [PLAN.md](PLAN.md).
 
-### Request-to-revenue demo (WP12)
+### Intent-to-invoice demo (WP13)
 
 - [ ] Demo runs against a real Lago OSS or test Cloud instance, not only the mock event sink.
 - [ ] Two customers with different pricing; comparable traffic produces the correct, different customer-specific charges.
@@ -68,6 +68,16 @@ The evidence above proves reliable delivery against mocks. It does not prove the
 - [ ] Exact provider cost, revenue, and gross-margin reconciliation shown, using customer-specific selling prices.
 - [ ] Prepaid credits or a commitment consumed, and the resulting real invoice line shown.
 - [ ] The run survives a gateway restart with zero lost and zero duplicated billable requests.
+
+### Commercial-intent scenarios (WP12 engine, proven by the WP13 demo)
+
+Policies express business intent — latency priority, quality floor, budget, allowed providers, minimum margin — and provider and model are decision outputs (ADR-004, PR #19). A static `premium = Anthropic` mapping does not pass this gate.
+
+- [ ] **Premium / latency priority**: a premium customer's policy prioritizes latency; using the demo's Lago-tested performance profile, the decision selects an Anthropic route despite its higher expected cost, because the expected margin remains acceptable.
+- [ ] **Standard / most economical**: a standard customer receives the most economical route that still satisfies its quality requirement.
+- [ ] **Margin-floor downgrade**: a request is downgraded when the initially preferred route would violate the configured margin floor.
+- [ ] **Pre-execution denial**: a request is denied before any provider execution when its budget or credits are exhausted.
+- [ ] For every scenario, the demo exposes: the decision and its reason, the reserved amount, the selected execution instruction, provider cost, customer price, expected and realized margin, the settlement, and the resulting Lago invoice line.
 
 ### Certified provider contract tests (WP11)
 
