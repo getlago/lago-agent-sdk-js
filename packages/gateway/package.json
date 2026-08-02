@@ -2,7 +2,7 @@
   "name": "@getlago/ai-gateway",
   "version": "0.1.0",
   "private": true,
-  "description": "AI Gateway for Billing (beta). OpenAI-compatible billing edge in front of a transport proxy, emitting priced usage events to Lago with durable delivery.",
+  "description": "Lago AI Billing Gateway (beta). OpenAI-compatible billing edge in front of a transport proxy, emitting priced usage events to Lago with durable delivery.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
