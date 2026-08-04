@@ -4,6 +4,16 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-31
+
+### Added
+- **`@getlago/agent-sdk/core` subpath export**: the billing engine as a consumable surface for gateway-mode consumers. Exposes the provider usage extractors (including `extractOpenAINative` and `extractGeminiNative`, previously unreachable from the package root), `CanonicalUsage` helpers, the pricing provider (markup + never-under-bill fallback), the pure event builders, `LagoClient`, `EventQueue`, and the new `EventTransport` interface. The root export is unchanged.
+- `EventTransport` interface (`push`/`flush`/`shutdown` + `depth()`/`lagMs()` introspection). `EventQueue` implements it; `push` now returns `"accepted"` (it always accepts, evicting the oldest on overflow, fail-open by design). A durable, fail-closed gateway transport ships separately.
+- Pure event builders `buildTokenEvents` / `buildCostEvent` extracted from `LagoSDK` (identical output, including `transaction_id` assignment at build time). `LagoSDK.emit` now delegates to them.
+
+### Changed
+- Repo converted to npm workspaces: the SDK moved to `packages/agent-sdk` (history preserved). No public API change; published artifact contents are unchanged.
+
 ## [0.2.0] - 2026-06-15
 
 ### Added

@@ -1,0 +1,72 @@
+{
+  "name": "@getlago/agent-sdk",
+  "version": "0.3.0",
+  "description": "Instrument LLM clients and emit usage events to Lago.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "import": "./dist/core.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "homepage": "https://www.getlago.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getlago/lago-agent-sdk-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/getlago/lago-agent-sdk-js/issues"
+  },
+  "keywords": [
+    "lago",
+    "billing",
+    "llm",
+    "metering",
+    "bedrock",
+    "mistral",
+    "anthropic",
+    "openai"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.97.1",
+    "@aws-sdk/client-bedrock-runtime": "^3.700.0",
+    "@google/genai": "^1.0.0",
+    "@mistralai/mistralai": "^2.2.1",
+    "fast-check": "^4.7.0",
+    "openai": "^4.70.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-bedrock-runtime": ">=3.500.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-bedrock-runtime": {
+      "optional": true
+    }
+  }
+}
