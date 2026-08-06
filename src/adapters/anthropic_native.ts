@@ -16,6 +16,7 @@
  * Unknown usage fields (service_tier, inference_geo, server_tool_use, …) land in extras.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { resolveModel } from "./_common.js";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   "input_tokens",
@@ -54,8 +55,6 @@ export function extractAnthropicNative(response: unknown, modelId: string = ""):
     if (!KNOWN_USAGE_FIELDS.has(k)) extras[k] = v;
   }
 
-  const model = typeof resp.model === "string" ? resp.model : "";
-
   return makeCanonicalUsage({
     input: safeInt(usage.input_tokens),
     output: safeInt(usage.output_tokens),
@@ -64,7 +63,7 @@ export function extractAnthropicNative(response: unknown, modelId: string = ""):
     cache_write_5m: safeInt(cacheCreation.ephemeral_5m_input_tokens),
     cache_write_1h: safeInt(cacheCreation.ephemeral_1h_input_tokens),
     tool_calls: toolCalls,
-    model: modelId || model,
+    model: resolveModel(resp.model, modelId),
     provider: "anthropic",
     api: "native",
     extras,

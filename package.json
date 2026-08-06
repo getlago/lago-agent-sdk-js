@@ -10,6 +10,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./gateway/adapters": {
+      "import": "./dist/gateway/adapters/index.js",
+      "types": "./dist/gateway/adapters/index.d.ts"
     }
   },
   "files": [
@@ -19,7 +23,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
   "license": "MIT",
   "homepage": "https://www.getlago.com",
@@ -73,5 +77,8 @@
     "@aws-sdk/client-bedrock-runtime": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "undici": "^6.28.0"
   }
 }

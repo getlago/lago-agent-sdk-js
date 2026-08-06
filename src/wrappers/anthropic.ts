@@ -4,6 +4,18 @@
  * Wraps `client.messages.create` (sync + streaming) and `client.messages.stream`
  * in place. Instrumentation never breaks the customer's call.
  *
+ * Gateway cache-hit detection (non-streaming `create` only): before emitting,
+ * peek at the raw response via `.asResponse()` (an APIPromise method
+ * Anthropic's SDK already exposes for exactly this — safe to call alongside
+ * `.then()`/await on the same promise, no extra network round-trip). If a
+ * gateway in front of the provider (e.g. Cloudflare AI Gateway) marks the
+ * response `cf-aig-cache-status: HIT`, the provider served it from cache at
+ * zero cost to the customer — we skip billing it. No-op with no gateway in
+ * the path (the header is simply absent) or with a simplified/custom client
+ * that doesn't expose `.asResponse()` (degrades to the pre-existing
+ * behavior: always emit). `messages.stream()` is NOT covered — its usage
+ * comes from `finalMessage()`/the `finalMessage` event, not this path.
+ *
  * Per-call override: pass `lago: { subscription, dimensions }` in the create()
  * options. The wrapper strips it before forwarding so Anthropic's strict
  * validator doesn't reject it.
@@ -55,6 +67,28 @@ function looksLikeMessage(obj: unknown): boolean {
   try {
     if (isObject(obj)) return "usage" in obj;
     return obj !== null && typeof obj === "object" && "usage" in (obj as object);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True if a gateway in front of the provider served this from cache.
+ *
+ * A cache hit (Cloudflare AI Gateway: `cf-aig-cache-status: HIT`) costs the
+ * provider — and the customer — nothing. Billing it would overcharge for a
+ * call that never actually happened. `target` is the real APIPromise (not
+ * our Proxy) — `.asResponse()` is one of Anthropic's own documented ways to
+ * consume it, safe to call alongside the normal resolution path. Defensive:
+ * a simplified/custom client without `.asResponse()` (e.g. a hand-rolled
+ * fake) simply never reports a hit — never breaks the customer's call.
+ */
+async function isCacheHit(target: unknown): Promise<boolean> {
+  try {
+    const asResponse = (target as { asResponse?: () => Promise<Response> }).asResponse;
+    if (typeof asResponse !== "function") return false;
+    const raw = await asResponse.call(target);
+    return raw?.headers?.get?.("cf-aig-cache-status") === "HIT";
   } catch {
     return false;
   }
@@ -124,11 +158,16 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
               onfulfilled?: ((value: unknown) => unknown) | null,
               onrejected?: ((reason: unknown) => unknown) | null,
             ) =>
-              origThen((value: unknown) => {
+              origThen(async (value: unknown) => {
                 let next: unknown = value;
                 try {
                   if (looksLikeMessage(value)) {
-                    emitFrom(value, modelId, emitOpts);
+                    // Peek at the raw response's headers via the SAME
+                    // underlying promise before emitting — see
+                    // isCacheHit()'s docstring for why this is safe.
+                    if (!(await isCacheHit(target))) {
+                      emitFrom(value, modelId, emitOpts);
+                    }
                   } else if (isAsyncIterable(value)) {
                     next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
                   }

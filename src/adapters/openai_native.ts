@@ -34,6 +34,7 @@
  *     the feature can access via the openai response object directly.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { resolveModel } from "./_common.js";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   // chat completions
@@ -77,6 +78,22 @@ function countResponsesToolCalls(resp: Record<string, unknown>): number {
     if (isObject(item) && item.type === "function_call") n++;
   }
   return n;
+}
+
+/**
+ * The SDK shape only ever tells you "this looks like an OpenAI response" —
+ * it can't tell you who actually served it. Going through a gateway's
+ * OpenAI-compatible endpoint (e.g. Cloudflare's `.../compat`), the resolved
+ * model string is the only real signal: "@cf/..." is Cloudflare Workers
+ * AI's own naming convention, never a real OpenAI model. This isn't
+ * cosmetic — `provider` is what price-mode keys pricing off of, and
+ * Workers AI has a genuinely different price table (Cloudflare's own
+ * catalog) than real OpenAI models (OpenRouter); stamping "openai" on a
+ * Workers AI call would make it permanently unpriceable, quietly, at the
+ * extraction layer.
+ */
+function inferProvider(resolvedModel: string): string {
+  return resolvedModel.startsWith("@cf/") ? "workers-ai" : "openai";
 }
 
 /**
@@ -140,7 +157,7 @@ export function extractOpenAINative(response: unknown, modelId: string = ""): Ca
     if (!KNOWN_USAGE_FIELDS.has(k)) extras[k] = v;
   }
 
-  const model = typeof resp.model === "string" ? resp.model : "";
+  const resolvedModel = resolveModel(resp.model, modelId);
 
   return makeCanonicalUsage({
     input: extracted.inputTokens,
@@ -150,8 +167,8 @@ export function extractOpenAINative(response: unknown, modelId: string = ""): Ca
     audio_input: extracted.audioInput,
     audio_output: extracted.audioOutput,
     tool_calls: extracted.toolCalls,
-    model: modelId || model,
-    provider: "openai",
+    model: resolvedModel,
+    provider: inferProvider(resolvedModel),
     api: extracted.api,
     extras,
   });

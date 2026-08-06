@@ -229,3 +229,101 @@ describe("Anthropic wrapper", () => {
     expect(map.llm_output_tokens).toBe(11);
   });
 });
+
+// ---------------------------------------------------------------------
+// Gateway cache-hit detection. The real APIPromise exposes `.asResponse()`
+// alongside normal `.then()`/await — this fake mimics exactly that dual
+// surface (a thenable that ALSO has `.asResponse()`), the shape our
+// wrapper's cache-hit check actually depends on.
+// ---------------------------------------------------------------------
+function fakeApiPromise(resolvedValue: unknown, cacheStatus?: string) {
+  const promise = Promise.resolve(resolvedValue);
+  return {
+    then: promise.then.bind(promise),
+    catch: promise.catch.bind(promise),
+    finally: promise.finally.bind(promise),
+    asResponse: async () =>
+      new Response(null, cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {}),
+  };
+}
+
+describe("Anthropic wrapper — gateway cache-hit detection", () => {
+  it("skips billing when cf-aig-cache-status: HIT", async () => {
+    const { sdk, received } = newSdk();
+
+    class CachedMessages {
+      create(_args: any) {
+        return fakeApiPromise(
+          {
+            model: "claude-sonnet-4-6",
+            content: [{ type: "text", text: "hi" }],
+            usage: { input_tokens: 8, output_tokens: 16 },
+          },
+          "HIT",
+        );
+      }
+    }
+    class CachedAnthropic {
+      messages = new CachedMessages();
+    }
+    Object.defineProperty(CachedAnthropic, "name", { value: "Anthropic" });
+
+    const client = sdk.wrap(new CachedAnthropic() as any);
+    const resp: any = await client.messages.create({ model: "claude-sonnet-4-6", messages: [] });
+    expect(resp.usage.input_tokens).toBe(8); // customer still sees the real response
+    await sdk.flush(500);
+    await sdk.shutdown(500);
+    expect(received).toHaveLength(0); // a real cache HIT cost nothing — must not be billed
+  });
+
+  it("still bills normally when the header is absent (no gateway in the path)", async () => {
+    const { sdk, received } = newSdk();
+
+    class UncachedMessages {
+      create(_args: any) {
+        return fakeApiPromise({
+          model: "claude-sonnet-4-6",
+          content: [{ type: "text", text: "hi" }],
+          usage: { input_tokens: 8, output_tokens: 16 },
+        });
+      }
+    }
+    class UncachedAnthropic {
+      messages = new UncachedMessages();
+    }
+    Object.defineProperty(UncachedAnthropic, "name", { value: "Anthropic" });
+
+    const client = sdk.wrap(new UncachedAnthropic() as any);
+    await client.messages.create({ model: "claude-sonnet-4-6", messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received).toHaveLength(2); // input + output — billed as usual
+  });
+
+  it("still bills normally when cf-aig-cache-status is MISS", async () => {
+    const { sdk, received } = newSdk();
+
+    class MissMessages {
+      create(_args: any) {
+        return fakeApiPromise(
+          {
+            model: "claude-sonnet-4-6",
+            content: [{ type: "text", text: "hi" }],
+            usage: { input_tokens: 8, output_tokens: 16 },
+          },
+          "MISS",
+        );
+      }
+    }
+    class MissAnthropic {
+      messages = new MissMessages();
+    }
+    Object.defineProperty(MissAnthropic, "name", { value: "Anthropic" });
+
+    const client = sdk.wrap(new MissAnthropic() as any);
+    await client.messages.create({ model: "claude-sonnet-4-6", messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received).toHaveLength(2);
+  });
+});

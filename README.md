@@ -129,9 +129,41 @@ await sdk.flush();
 
 Wraps the modern `@google/genai` SDK. Covers `client.models.generateContent` + `generateContentStream`, sync + streaming. Reads usage from `response.usageMetadata` (both camelCase and snake_case forms supported).
 
-**Reasoning tokens** populate automatically on Gemini 2.5 — the model reasons internally by default and surfaces `thoughtsTokenCount`. Note the semantic difference vs OpenAI:
-- **OpenAI:** `reasoning_tokens` is a *subset* of `completion_tokens` (already counted in output)
-- **Gemini:** `thoughtsTokenCount` is *additive* to `candidatesTokenCount` (total Google bill = output + reasoning)
+**Reasoning tokens** populate automatically on Gemini 2.5 — the model reasons internally by default and surfaces `thoughtsTokenCount` (see the note on reasoning semantics below).
+
+## Cloudflare AI Gateway
+
+Point any of the clients above at your gateway instead of the provider directly — `wrap()` detects it and bills correctly, with two behaviors on top of the plain provider case:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { LagoSDK } from "lago-agent-sdk";
+
+const sdk = new LagoSDK({ apiKey: "...", defaultSubscriptionId: "sub_acme" });
+const client = sdk.wrap(new Anthropic({
+  apiKey: "...",
+  baseURL: `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/anthropic`,
+  defaultHeaders: { "cf-aig-authorization": `Bearer ${gatewayAuth}` },
+}));
+await client.messages.create({ model: "claude-sonnet-4-6", max_tokens: 200, messages: [{ role: "user", content: "Hello" }] });
+await sdk.flush();
+```
+
+- **Gateway cache hits aren't billed.** If the gateway serves a response from its own cache (`cf-aig-cache-status: HIT`), the provider was never called, so the SDK skips emitting for that response.
+- **Workers AI gets priced automatically.** Wrap an OpenAI-shaped client against the gateway's `/compat` endpoint (`model: "workers-ai/@cf/..."`) with `pricingMode: "price"`, and the SDK fetches Cloudflare's own published Workers AI rates in the background — no separate price table to maintain.
+
+For usage that already happened, backfill straight from the gateway's own Logs API instead of replaying calls — `lago-agent-sdk/gateway/adapters` extracts a log entry into `CanonicalUsage` and bills Cloudflare's own metered `cost` for it, so there's no separate price lookup and re-running over the same window never double-bills:
+
+```typescript
+import { extractCloudflareLog, resolveSubscription } from "lago-agent-sdk/gateway/adapters";
+
+for (const entry of await fetchGatewayLogs()) {  // GET .../ai-gateway/gateways/{id}/logs
+  const usage = extractCloudflareLog(entry);
+  const sub = resolveSubscription(entry) ?? "sub_default"; // from the call's cf-aig-metadata, if set
+  sdk.emit(usage, { subscription: sub, mode: "price", usdCost: entry.cost ?? 0, eventId: `cf_${entry.id}` });
+}
+await sdk.flush();
+```
 
 ## Multi-tenant — pick a subscription per call
 
@@ -166,7 +198,6 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 | Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
 | OpenAI | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream) | ✓ |
 | Google Gemini | `@google/genai` (`models.generateContent` + `generateContentStream`, sync + stream) | ✓ |
-| Vercel AI SDK | `wrapLanguageModel` middleware | Phase 4 |
 
 ## Token dimensions captured
 
@@ -183,19 +214,15 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 | tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ | ✓ |
 | audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
 | audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
-| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ (Phase 3) | ✓ (multimodal IMAGE) |
+| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ | ✓ (multimodal IMAGE) |
 
-**Semantic note on `reasoning`:**
-- **OpenAI's `reasoning_tokens` is a SUBSET of `output`** — already counted in `completion_tokens`.
-- **Gemini's `thoughtsTokenCount` is ADDITIVE to `output`** — `candidates + thoughts = total billable output`.
+**Reasoning:** OpenAI's `reasoning_tokens` is a *subset* of `output` (already counted in `completion_tokens`). Gemini's `thoughtsTokenCount` is *additive* to `output` (`candidates + thoughts = total billable output`).
 
-**Semantic note on input breakdowns (avoid double-counting):**
-For both OpenAI and Gemini, `cache_read`, `audio_input`, and `image_input` are **subsets of `input`**, not additive to it — they are a breakdown of tokens already counted in `llm_input_tokens`. For example, OpenAI reports `cached_tokens` under `prompt_tokens_details` *within* `prompt_tokens`, and Gemini's docs state `promptTokenCount` "includes the number of tokens in the cached content". A billable metric that sums `llm_input_tokens + llm_cached_input_tokens` (or `+ llm_audio_input_tokens`, `+ llm_image_input_tokens`) will **double-count**. Bill on `llm_input_tokens` as the total; use the breakdown fields only for cost attribution or discounted-rate tiers (e.g. cached input billed at a lower rate), subtracting them from `input` rather than adding.
+**Cache/audio/image on OpenAI and Gemini are subsets of `input`, not additive.** Both providers count cached/audio/image tokens *within* their input total, so summing `llm_input_tokens + llm_cached_input_tokens` (or `+ audio/image`) double-counts. Bill on `llm_input_tokens` alone; use the breakdown fields only for cost attribution (e.g. a discounted cache rate).
 
 ## Pricing mode — send dollar cost instead of tokens
 
-By default the SDK emits **token counts** (`pricingMode: "tokens"`). You can instead have it
-compute and emit the **dollar cost** of each call: `Σ(unit_price_per_token × tokens) × markup`.
+By default the SDK emits **token counts** (`pricingMode: "tokens"`). Set `pricingMode: "price"` to instead emit the **dollar cost** of each call: `Σ(unit_price_per_token × tokens) × markup`.
 
 ```typescript
 const sdk = new LagoSDK({
@@ -209,13 +236,7 @@ const sdk = new LagoSDK({
 const client = sdk.wrap(anthropicClient);
 ```
 
-In **price mode** the SDK emits **one event per call** with code `llm_cost`. The event carries a
-top-level `precise_total_amount_cents` (total cost in cents, after markup) for Lago's **dynamic
-charge model**, plus a breakdown in `properties`: `unit` (total tokens), `value` (USD total),
-`base_cost` (pre-markup), `markup`, `price_source`, and per-field `*_tokens` / `*_unit_price` /
-`*_cost`. Set up in Lago a `sum`-aggregation billable metric `llm_cost` on `field_name: "unit"`
-and a **dynamic** charge on it — Lago sums each event's `precise_total_amount_cents` into a
-single fee (`unit` is the displayed usage quantity).
+Price mode emits one `llm_cost` event per priced field (input, output, cache, ...), each carrying `precise_total_amount_cents` for Lago's **dynamic charge model** plus a `token_type` property so a single billable metric can be grouped by both `model` and `token_type`. Prices come from public sources (OpenRouter for native providers, the AWS Bedrock price list for Bedrock), fetched and cached in the background — your LLM call is never blocked on pricing. If a price isn't available yet, the SDK falls back to token-count events and reports via `onError` rather than under-billing.
 
 Per-call override via the inline `lago` option (Bedrock: the command's `__lago`):
 
@@ -227,25 +248,9 @@ await client.messages.create({
 } as any);
 ```
 
-**Live, public pricing sources (no API keys):** OpenRouter (`/api/v1/models`) for native
-anthropic/openai/mistral/gemini clients, and the AWS Bedrock Price List **Bulk** API for
-Bedrock. Prices are fetched + cached in the background (TTL `pricingTtlMs`, default 1h) on the
-queue loop, so **your LLM call is never blocked on pricing**.
-
-**Fallback (never under-bill):** if a price is unavailable (table not warm on the first call,
-or the model isn't found), the SDK **falls back to emitting token-count events** and calls
-`onError` — it never silently drops the usage.
-
-**Bedrock note:** AWS's public bulk data lists many models (Titan, Llama, Mistral, Cohere, and
-older Claude) but, at time of writing, **not the current Claude 3.5/3.7/4 models**. Bedrock
-calls for models absent from AWS's data fall back to token events. Native Anthropic clients are
-priced via OpenRouter and unaffected.
-
 ## Error policy
 
-The SDK never breaks your LLM call. If anything in instrumentation fails (adapter bug, Lago down, network error), the SDK swallows it, logs a warning, and your call returns normally.
-
-Wire your own observability via `onError`:
+The SDK never breaks your LLM call. If anything in instrumentation fails (adapter bug, Lago down, network error), it's swallowed, logged, and your call returns normally. Wire your own observability via `onError`:
 
 ```typescript
 new LagoSDK({

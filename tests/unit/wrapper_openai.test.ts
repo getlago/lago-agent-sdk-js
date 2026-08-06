@@ -323,3 +323,110 @@ describe("OpenAI wrapper — failure isolation", () => {
     await sdk.shutdown(500);
   });
 });
+
+// ---------------------------------------------------------------------
+// Gateway cache-hit detection. The real APIPromise exposes `.asResponse()`
+// alongside normal `.then()`/await — this fake mimics exactly that dual
+// surface (a thenable that ALSO has `.asResponse()`), the shape our
+// wrapper's cache-hit check actually depends on.
+// ---------------------------------------------------------------------
+function fakeApiPromise(resolvedValue: unknown, cacheStatus?: string) {
+  const promise = Promise.resolve(resolvedValue);
+  return {
+    then: promise.then.bind(promise),
+    catch: promise.catch.bind(promise),
+    finally: promise.finally.bind(promise),
+    asResponse: async () =>
+      new Response(null, cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {}),
+  };
+}
+
+describe("OpenAI wrapper — gateway cache-hit detection", () => {
+  it("skips billing when cf-aig-cache-status: HIT", async () => {
+    const { sdk, received } = newSdk();
+
+    class CachedCompletions {
+      create(_args: any) {
+        return fakeApiPromise(
+          {
+            model: "gpt-4o-mini",
+            choices: [{ message: { role: "assistant", content: "hi", tool_calls: null } }],
+            usage: { prompt_tokens: 8, completion_tokens: 16 },
+          },
+          "HIT",
+        );
+      }
+    }
+    class CachedChat {
+      completions = new CachedCompletions();
+    }
+    class CachedOpenAI {
+      chat = new CachedChat();
+    }
+    Object.defineProperty(CachedOpenAI, "name", { value: "OpenAI" });
+
+    const client = sdk.wrap(new CachedOpenAI() as any);
+    const resp: any = await client.chat.completions.create({ model: "gpt-4o-mini", messages: [] });
+    expect(resp.usage.prompt_tokens).toBe(8); // customer still sees the real response
+    await sdk.flush(500);
+    await sdk.shutdown(500);
+    expect(received).toHaveLength(0); // a real cache HIT cost nothing — must not be billed
+  });
+
+  it("still bills normally when the header is absent (no gateway in the path)", async () => {
+    const { sdk, received } = newSdk();
+
+    class UncachedCompletions {
+      create(_args: any) {
+        return fakeApiPromise({
+          model: "gpt-4o-mini",
+          choices: [{ message: { role: "assistant", content: "hi", tool_calls: null } }],
+          usage: { prompt_tokens: 8, completion_tokens: 16 },
+        });
+      }
+    }
+    class UncachedChat {
+      completions = new UncachedCompletions();
+    }
+    class UncachedOpenAI {
+      chat = new UncachedChat();
+    }
+    Object.defineProperty(UncachedOpenAI, "name", { value: "OpenAI" });
+
+    const client = sdk.wrap(new UncachedOpenAI() as any);
+    await client.chat.completions.create({ model: "gpt-4o-mini", messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received).toHaveLength(2); // input + output — billed as usual
+  });
+
+  it("still bills normally when cf-aig-cache-status is MISS", async () => {
+    const { sdk, received } = newSdk();
+
+    class MissCompletions {
+      create(_args: any) {
+        return fakeApiPromise(
+          {
+            model: "gpt-4o-mini",
+            choices: [{ message: { role: "assistant", content: "hi", tool_calls: null } }],
+            usage: { prompt_tokens: 8, completion_tokens: 16 },
+          },
+          "MISS",
+        );
+      }
+    }
+    class MissChat {
+      completions = new MissCompletions();
+    }
+    class MissOpenAI {
+      chat = new MissChat();
+    }
+    Object.defineProperty(MissOpenAI, "name", { value: "OpenAI" });
+
+    const client = sdk.wrap(new MissOpenAI() as any);
+    await client.chat.completions.create({ model: "gpt-4o-mini", messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received).toHaveLength(2);
+  });
+});

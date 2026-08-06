@@ -8,6 +8,24 @@
  *   - OpenRouter (https://openrouter.ai/api/v1/models) for native providers
  *     (anthropic / openai / mistral / gemini). Prices are USD per token.
  *   - AWS Bedrock Price List Bulk API (public, no credentials) for Bedrock.
+ *   - Cloudflare's own model catalog (/accounts/{id}/ai/models/search) for
+ *     "workers-ai" — the actual rate the gateway bills at, not a third
+ *     party's price for hosting the same open-weight model elsewhere
+ *     (verified live: Cloudflare's real charged cost for one call matched
+ *     this catalog's rate exactly; OpenRouter's listing for the same
+ *     underlying model came out ~3.5x lower — a genuinely different price,
+ *     not just a naming mismatch). Needs an account id + API token
+ *     (Cloudflare's catalog isn't public/no-auth the way OpenRouter/AWS
+ *     are); without both set, this source is simply empty.
+ *   - Mistral's own /v1/models for *alias resolution*, not pricing directly.
+ *     Mistral has no per-token price table of its own — but a customer
+ *     request commonly uses a moving alias ("mistral-small-latest") that
+ *     Mistral's response never resolves (unlike Anthropic/OpenAI, which
+ *     report the dated snapshot that answered) — so the OpenRouter lookup
+ *     below misses even though OpenRouter *does* list the resolved id
+ *     (e.g. "mistralai/mistral-small-2603") with real pricing. /v1/models
+ *     exposes the resolution directly via each model's `aliases` array;
+ *     needs the customer's own Mistral API key.
  *
  * `lookup()` is pure in-memory and never does network I/O, so the customer's
  * call is never blocked on pricing. All HTTP happens in `maybeRefresh()`, which
@@ -21,6 +39,9 @@
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
 export const AWS_PRICING_HOST = "https://pricing.us-east-1.amazonaws.com";
 export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/AmazonBedrock/current/region_index.json`;
+export const cloudflareModelsUrl = (accountId: string): string =>
+  `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
+export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
 
 export const PRICED_FIELDS = ["input", "output", "cache_read", "cache_write", "reasoning"] as const;
 export type PricedField = (typeof PRICED_FIELDS)[number];
@@ -49,6 +70,25 @@ const VENDOR_MAP: Record<string, string> = {
   gemini: "google",
   google: "google",
 };
+
+// Cloudflare's catalog price unit -> canonical field. Real, surveyed units
+// also include "per 1k characters", "per step", "per 512 by 512 tile", "per
+// audio minute (websocket)", "per audio minute", "per inference request" —
+// none of those are token-based, so they're deliberately absent: a model
+// priced only in those units yields a ModelPrice with no input/output/
+// cache_read at all, which computeCost already treats as "unpriced field,
+// skip it" — the same safe behavior as any other model with no usable price.
+const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
+  "per M input tokens": "input",
+  "per M output tokens": "output",
+  "per M cached input tokens": "cache_read",
+};
+
+// A real dated Mistral snapshot ends in a short numeric tag (e.g. "-2603",
+// "-2411", "-2508") — never a "-latest"-style moniker. Used to pick the one
+// genuine canonical name out of a family that mutually lists each other
+// (see parseMistralAliases).
+const MISTRAL_DATED_ID = /-\d{4,8}$/;
 
 const BEDROCK_REGION_PREFIX: Record<string, string> = {
   us: "us-east-1",
@@ -176,16 +216,66 @@ export function computeCost(
     baseScaled += costScaled;
     fields[f] = { tokens: String(count), unit_price: fmtMoney(unit), cost: fmtMoney(costScaled) };
   }
-  // base (1e12) * markup (1e12) / 1e12 -> 1e12, truncated (floor) — matches Python ROUND_DOWN.
+  return finalizeBreakdown(baseScaled, markupScaled, price.source, fields);
+}
+
+/**
+ * Shared tail for `computeCost`/`computePrecomputedCost`: base (1e12) *
+ * markup (1e12) / 1e12 -> 1e12, truncated (floor) — matches Python's
+ * ROUND_DOWN, so cents == billed-USD × 100 exactly.
+ */
+function finalizeBreakdown(
+  baseScaled: bigint,
+  markupScaled: bigint,
+  source: string,
+  fields: CostBreakdown["fields"],
+): CostBreakdown {
   const totalScaled = (baseScaled * markupScaled) / SCALE;
   return {
     total: fmtMoney(totalScaled),
     totalCents: fmtMoney(totalScaled * 100n),
     base: fmtMoney(baseScaled),
     markup: fmtMoney(markupScaled),
-    source: price.source,
+    source,
     fields,
   };
+}
+
+/**
+ * Build a CostBreakdown from a cost the CALLER already knows.
+ *
+ * For a gateway that reports its own real, metered price per call (e.g.
+ * Cloudflare AI Gateway's `cost` field), computing our own per-token
+ * estimate via the OpenRouter/Bedrock tables would be redundant AND less
+ * accurate than the number the gateway already gives us. This skips
+ * `computeCost` entirely — there's one lump sum, not a per-field
+ * breakdown, so `fields` is empty and the invalid/negative case floors to
+ * 0 the same way `parseScaled` always has, rather than throwing or
+ * silently mis-billing.
+ */
+export function computePrecomputedCost(usdCost: unknown, markupScaled: bigint): CostBreakdown {
+  const baseScaled = parseScaled(usdCost) ?? 0n;
+  return finalizeBreakdown(baseScaled, markupScaled, "precomputed", {});
+}
+
+/** A money string (already floored to 12dp) -> the same amount in cents,
+ * same floor-and-format conventions as everywhere else. */
+export function moneyStrToCents(usd: string): string {
+  const scaled = parseScaled(usd) ?? 0n;
+  return fmtMoney(scaled * 100n);
+}
+
+/**
+ * `computeCost`'s per-field `cost` values are PRE-markup — only the summed
+ * `total` has markup applied. Splitting a breakdown into one event per
+ * field (per token_type) needs markup applied to each field individually,
+ * with the same floor-to-12dp convention as everywhere else, or a markup
+ * != 1.0 would silently vanish from every per-field/token_type event.
+ */
+export function applyMarkup(usd: string, markup: string): string {
+  const usdScaled = parseScaled(usd) ?? 0n;
+  const markupScaled = parseScaled(markup) ?? SCALE;
+  return fmtMoney((usdScaled * markupScaled) / SCALE);
 }
 
 // ----------------------------------------------------------------------
@@ -230,6 +320,150 @@ export function lookupOpenRouter(table: OpenRouterTable, provider: string, model
     table.norm.get(`${vendor}\n${norm(stripVersion(model))}`) ??
     null
   );
+}
+
+// ----------------------------------------------------------------------
+// Cloudflare Workers AI parsing + matching
+//
+// Unlike OpenRouter/Bedrock, this is the ACTUAL rate the gateway bills at —
+// not a third party's price for hosting the same open-weight model
+// elsewhere, which can (and does) differ meaningfully. Model strings (e.g.
+// "@cf/meta/llama-3.3-70b-instruct-fp8-fast") are already exact and
+// self-contained; no vendor-prefix mapping is needed the way OpenRouter
+// needs one to disambiguate "anthropic" -> "anthropic" vs "mistral" ->
+// "mistralai".
+// ----------------------------------------------------------------------
+
+/**
+ * Parse `/ai/models/search` results into a `{modelName: ModelPrice}` map.
+ *
+ * A model with no `price` property at all, or whose price entries are all
+ * non-token units (per-image, per-audio-minute, ...), is simply absent from
+ * the table — `lookup` then returns null, same as any other priced-nowhere
+ * model, and the caller safely falls back to token events.
+ */
+export function parseCloudflareWorkersAi(models: unknown): Map<string, ModelPrice> {
+  const table = new Map<string, ModelPrice>();
+  if (!Array.isArray(models)) return table;
+  for (const m of models) {
+    if (!isObj(m)) continue;
+    const name = m.name;
+    if (typeof name !== "string" || !name) continue;
+    const properties = Array.isArray(m.properties) ? m.properties : [];
+    const priceProp = properties.find((p) => isObj(p) && p.property_id === "price");
+    if (!isObj(priceProp)) continue;
+    const entries = priceProp.value;
+    if (!Array.isArray(entries)) continue;
+    const fields: Partial<Record<PricedField, bigint>> = {};
+    for (const entry of entries) {
+      if (!isObj(entry) || entry.currency !== "USD") continue;
+      const field = CLOUDFLARE_UNIT_FIELD_MAP[String(entry.unit ?? "")];
+      if (!field) continue;
+      const perMillion = parseScaled(entry.price);
+      if (perMillion === null) continue;
+      fields[field] = perMillion / 1_000_000n; // per-million -> per-token, truncated
+    }
+    if (Object.keys(fields).length > 0) {
+      const mp = emptyPrice("cloudflare_workers_ai");
+      for (const f of PRICED_FIELDS) if (fields[f] !== undefined) mp[f] = fields[f]!;
+      table.set(name, mp);
+    }
+  }
+  return table;
+}
+
+/**
+ * Exact match first; a version-suffix fallback covers the same drift we've
+ * seen in practice — e.g. a live response naming a model "...instruct-v2"
+ * when the catalog itself only lists "...instruct".
+ */
+export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model: string): ModelPrice | null {
+  return table.get(model) ?? table.get(stripVersion(model)) ?? null;
+}
+
+// ----------------------------------------------------------------------
+// Mistral alias resolution
+// ----------------------------------------------------------------------
+
+/**
+ * Prefer a dated snapshot id (what OpenRouter actually lists models under)
+ * over a "-latest"-style moniker. Falls back to shortest-then-alphabetical
+ * so the choice is always deterministic even with no dated candidate in
+ * the group.
+ */
+function pickMistralCanonical(names: string[]): string {
+  const dated = names.filter((n) => MISTRAL_DATED_ID.test(n));
+  const pool = dated.length > 0 ? dated : names;
+  return [...pool].sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+}
+
+/**
+ * Parse Mistral's `/v1/models` response into a `{alias: canonicalId}` map.
+ *
+ * Naively mapping "each name in this entry's `aliases` -> this entry's
+ * `id`" is wrong: Mistral's real response lists EVERY name in a family as
+ * its own top-level entry, each one's `aliases` pointing at the others —
+ * e.g. `id="mistral-small-2603"`, `id="mistral-small-latest"`, AND
+ * `id="magistral-small-latest"` each appear separately, each listing the
+ * other two as `aliases`. A directional last-write-wins map is then
+ * order-dependent and can resolve an alias to ANOTHER alias instead of the
+ * real dated snapshot (confirmed live: this resolved "mistral-small-latest"
+ * -> "magistral-small-latest", which OpenRouter doesn't list, instead of ->
+ * "mistral-small-2603", which it does).
+ *
+ * Union-find instead: treat a model's id + its aliases as one connected
+ * group regardless of which entry mentions which, then pick a single
+ * canonical name per group (see `pickMistralCanonical`) and map every other
+ * member of the group to it.
+ */
+export function parseMistralAliases(data: unknown): Map<string, string> {
+  const models = isObj(data) && Array.isArray(data.data) ? data.data : [];
+
+  const parent = new Map<string, string>();
+  function find(x: string): string {
+    let root = x;
+    while (parent.has(root) && parent.get(root) !== root) root = parent.get(root)!;
+    return root;
+  }
+  function union(a: string, b: string): void {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  }
+
+  const names = new Set<string>();
+  for (const m of models) {
+    if (!isObj(m)) continue;
+    const mid = m.id;
+    if (typeof mid !== "string" || !mid) continue;
+    if (!parent.has(mid)) parent.set(mid, mid);
+    names.add(mid);
+    const aliases = Array.isArray(m.aliases) ? m.aliases : [];
+    for (const alias of aliases) {
+      if (typeof alias !== "string" || !alias) continue;
+      if (!parent.has(alias)) parent.set(alias, alias);
+      names.add(alias);
+      union(mid, alias);
+    }
+  }
+
+  const groups = new Map<string, string[]>();
+  for (const name of names) {
+    const root = find(name);
+    const arr = groups.get(root) ?? [];
+    arr.push(name);
+    groups.set(root, arr);
+  }
+
+  const result = new Map<string, string>();
+  for (const members of groups.values()) {
+    if (members.length < 2) continue; // no aliasing at all — nothing to resolve
+    const canonical = pickMistralCanonical(members);
+    for (const name of members) {
+      if (name !== canonical) result.set(name, canonical);
+    }
+  }
+  return result;
 }
 
 // ----------------------------------------------------------------------
@@ -342,16 +576,37 @@ export function lookupBedrock(regionTable: Map<string, ModelPrice>, model: strin
 export interface PricingFetcher {
   fetchOpenRouter(): Promise<OpenRouterTable>;
   fetchBedrock(region: string): Promise<Map<string, ModelPrice>>;
+  fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>>;
+  fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>>;
 }
 
+/**
+ * `cloudflareAccountId`/`cloudflareApiToken`: unlike OpenRouter/AWS,
+ * Cloudflare's model catalog is account-scoped and needs auth — there's no
+ * public, no-credentials equivalent. Without both set,
+ * `fetchCloudflareWorkersAi` returns an empty table rather than throwing, so
+ * Workers AI pricing is simply unavailable (safe token-event fallback)
+ * instead of breaking price mode for every other provider.
+ *
+ * `mistralApiKey`: same story — Mistral's `/v1/models` needs the customer's
+ * own key. Without it (and without one passed at call time either),
+ * `fetchMistralAliases` returns an empty map, so alias resolution is simply
+ * skipped and lookups fall back to whatever the request already spelled
+ * out (safe miss, not a break).
+ */
 export class HttpPricingFetcher implements PricingFetcher {
-  constructor(private timeoutMs: number = 10_000) {}
+  constructor(
+    private timeoutMs: number = 10_000,
+    private cloudflareAccountId?: string,
+    private cloudflareApiToken?: string,
+    private mistralApiKey?: string,
+  ) {}
 
-  private async getJson(url: string): Promise<unknown> {
+  private async getJson(url: string, headers?: Record<string, string>): Promise<unknown> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
-      const resp = await fetch(url, { signal: ctrl.signal });
+      const resp = await fetch(url, { signal: ctrl.signal, headers });
       if (!resp.ok) throw new Error(`GET ${url} -> ${resp.status}`);
       return await resp.json();
     } finally {
@@ -371,6 +626,34 @@ export class HttpPricingFetcher implements PricingFetcher {
     if (typeof url !== "string" || !url) return new Map();
     return parseBedrockOffer(await this.getJson(AWS_PRICING_HOST + url), region);
   }
+
+  async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+    if (!this.cloudflareAccountId || !this.cloudflareApiToken) return new Map();
+    const headers = { Authorization: `Bearer ${this.cloudflareApiToken}` };
+    const models: unknown[] = [];
+    let page = 1;
+    while (true) {
+      const url = `${cloudflareModelsUrl(this.cloudflareAccountId)}?per_page=50&page=${page}`;
+      const body = (await this.getJson(url, headers)) as Record<string, unknown>;
+      const batch = Array.isArray(body.result) ? body.result : [];
+      models.push(...batch);
+      const resultInfo = isObj(body.result_info) ? body.result_info : {};
+      const total = typeof resultInfo.total_count === "number" ? resultInfo.total_count : models.length;
+      if (batch.length < 50 || models.length >= total) break;
+      page++;
+    }
+    return parseCloudflareWorkersAi(models);
+  }
+
+  async fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>> {
+    // An explicitly configured key always wins over one learned from a
+    // wrapped client — a deliberate config value shouldn't be silently
+    // shadowed by an auto-detected one.
+    const key = this.mistralApiKey || apiKey;
+    if (!key) return new Map();
+    const headers = { Authorization: `Bearer ${key}` };
+    return parseMistralAliases(await this.getJson(MISTRAL_MODELS_URL, headers));
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -389,6 +672,17 @@ export class PricingProvider {
   private bedrock = new Map<string, Map<string, ModelPrice>>();
   private bedrockFetched = new Map<string, number>();
   private bedrockStale = new Set<string>();
+  private cloudflareWorkersAi: Map<string, ModelPrice> | null = null;
+  private cloudflareFetched = 0;
+  private cloudflareStale = false;
+  private mistralAliases: Map<string, string> | null = null;
+  private mistralFetched = 0;
+  private mistralStale = false;
+  // Learned from a wrapped Mistral client (see LagoSDK's auto-prime-on-wrap),
+  // not configured — the customer's own client already carries this key for
+  // making real calls, so alias resolution can reuse it without ever
+  // requiring a separate LagoConfig.mistralApiKey.
+  private mistralApiKeyOverride: string | null = null;
   private refreshing = new Set<string>();
 
   constructor(
@@ -397,17 +691,60 @@ export class PricingProvider {
       ttlMs?: number;
       defaultRegion?: string;
       onError?: (err: unknown, where: string) => void;
+      cloudflareAccountId?: string;
+      cloudflareApiToken?: string;
+      mistralApiKey?: string;
     } = {},
   ) {
-    this.fetcher = opts.fetcher ?? new HttpPricingFetcher();
+    this.fetcher =
+      opts.fetcher ??
+      new HttpPricingFetcher(10_000, opts.cloudflareAccountId, opts.cloudflareApiToken, opts.mistralApiKey);
     this.ttlMs = opts.ttlMs ?? 3_600_000;
     this.defaultRegion = opts.defaultRegion ?? "us-east-1";
     this.onError = opts.onError;
   }
 
-  /** Flag the OpenRouter table for an eager warm (price mode as the global default). */
-  prime(): void {
+  /**
+   * Flag OpenRouter for an eager warm (price mode as the global default).
+   *
+   * Deliberately does NOT also eagerly warm Cloudflare Workers AI or
+   * Mistral alias resolution by default — both are credential-gated and
+   * provider-specific; most price-mode customers never touch Workers AI
+   * or Mistral at all, and eagerly hitting either's API at construction
+   * time regardless of actual usage is real, unnecessary work. Instead
+   * they stay purely reactive: the first real `lookup()` for that provider
+   * flags it stale, `maybeRefresh()` fetches it on the next tick, and
+   * every call after that hits the cache with zero further network calls
+   * until the TTL expires.
+   *
+   * Pass `providers: ["mistral"]` and/or `["workers-ai"]` when you already
+   * know, in advance, which of these two you're about to call this
+   * session — this eagerly warms exactly that source too, so even ITS
+   * first call prices correctly instead of paying the one-time lazy
+   * cold-start cost. Unknown provider names are silently ignored rather
+   * than throwing, since this is a hint, not a contract.
+   */
+  prime(providers: string[] = []): void {
     this.openrouterStale = true;
+    for (const p of providers) {
+      const key = (p || "").toLowerCase();
+      if (key === "workers-ai") this.cloudflareStale = true;
+      else if (key === "mistral") this.mistralStale = true;
+    }
+  }
+
+  /**
+   * Adopt a Mistral API key discovered from a wrapped client, so alias
+   * resolution can run without ever requiring the customer to also
+   * declare it in LagoConfig — their Mistral client already carries the
+   * exact credential needed. Pure in-memory, no I/O. A key explicitly set
+   * via LagoConfig.mistralApiKey always wins over one learned this way
+   * (see HttpPricingFetcher.fetchMistralAliases); this only fills the gap
+   * when no explicit key was configured.
+   */
+  learnMistralApiKey(apiKey: string): void {
+    if (!apiKey) return;
+    if (!this.mistralApiKeyOverride) this.mistralApiKeyOverride = apiKey;
   }
 
   /** Non-blocking, pure in-memory lookup (runs on the customer's call). */
@@ -420,9 +757,27 @@ export class PricingProvider {
         if (!fresh) this.bedrockStale.add(region);
         return table !== undefined ? lookupBedrock(table, model) : null;
       }
+      if ((provider || "").toLowerCase() === "workers-ai") {
+        const table = this.cloudflareWorkersAi;
+        const fresh = table !== null && Date.now() - this.cloudflareFetched < this.ttlMs;
+        if (!fresh) this.cloudflareStale = true;
+        return table !== null ? lookupCloudflareWorkersAi(table, model) : null;
+      }
+      let resolvedModel = model;
+      const isMistral = (provider || "").toLowerCase() === "mistral";
+      if (isMistral) {
+        const aliases = this.mistralAliases;
+        const freshM = aliases !== null && Date.now() - this.mistralFetched < this.ttlMs;
+        if (!freshM) this.mistralStale = true;
+        // Cold/miss: resolvedModel stays the alias as-requested, and the
+        // OpenRouter lookup below misses safely, same as before this
+        // resolution step existed — never worse than the old behavior,
+        // only better once the table is warm.
+        if (aliases) resolvedModel = aliases.get(model) ?? model;
+      }
       const fresh = this.openrouter !== null && Date.now() - this.openrouterFetched < this.ttlMs;
       if (!fresh) this.openrouterStale = true;
-      return this.openrouter !== null ? lookupOpenRouter(this.openrouter, provider, model) : null;
+      return this.openrouter !== null ? lookupOpenRouter(this.openrouter, provider, resolvedModel) : null;
     } catch {
       return null;
     }
@@ -430,7 +785,14 @@ export class PricingProvider {
 
   /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale. */
   async maybeRefresh(): Promise<void> {
-    if (!this.openrouterStale && this.bedrockStale.size === 0) return;
+    if (
+      !this.openrouterStale &&
+      this.bedrockStale.size === 0 &&
+      !this.cloudflareStale &&
+      !this.mistralStale
+    ) {
+      return;
+    }
 
     if (this.openrouterStale && !this.refreshing.has("openrouter")) {
       this.refreshing.add("openrouter");
@@ -443,6 +805,34 @@ export class PricingProvider {
         this.report(err, "pricing.fetchOpenRouter");
       } finally {
         this.refreshing.delete("openrouter");
+      }
+    }
+
+    if (this.cloudflareStale && !this.refreshing.has("cloudflare_workers_ai")) {
+      this.refreshing.add("cloudflare_workers_ai");
+      try {
+        const table = await this.fetcher.fetchCloudflareWorkersAi();
+        this.cloudflareWorkersAi = table;
+        this.cloudflareFetched = Date.now();
+        this.cloudflareStale = false;
+      } catch (err) {
+        this.report(err, "pricing.fetchCloudflareWorkersAi");
+      } finally {
+        this.refreshing.delete("cloudflare_workers_ai");
+      }
+    }
+
+    if (this.mistralStale && !this.refreshing.has("mistral_aliases")) {
+      this.refreshing.add("mistral_aliases");
+      try {
+        const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
+        this.mistralAliases = aliases;
+        this.mistralFetched = Date.now();
+        this.mistralStale = false;
+      } catch (err) {
+        this.report(err, "pricing.fetchMistralAliases");
+      } finally {
+        this.refreshing.delete("mistral_aliases");
       }
     }
 

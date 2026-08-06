@@ -34,6 +34,7 @@
  * adapter handles both shapes.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { resolveModel } from "./_common.js";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   // snake_case (from Python model_dump or wire JSON)
@@ -126,7 +127,6 @@ export function extractGeminiNative(response: unknown, modelId: string = ""): Ca
   }
 
   const modelVersion = pick(resp, "model_version", "modelVersion");
-  const model = typeof modelVersion === "string" ? modelVersion : "";
 
   return makeCanonicalUsage({
     input: safeInt(pick(usage, "prompt_token_count", "promptTokenCount")),
@@ -137,7 +137,7 @@ export function extractGeminiNative(response: unknown, modelId: string = ""): Ca
     audio_output: modalityTokenCount(candidatesDetails, "AUDIO"),
     image_input: modalityTokenCount(promptDetails, "IMAGE"),
     tool_calls: countToolCalls(resp),
-    model: modelId || model,
+    model: resolveModel(modelVersion, modelId),
     provider: "gemini",
     api: "native",
     extras,

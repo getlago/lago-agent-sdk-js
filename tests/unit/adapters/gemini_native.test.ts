@@ -61,6 +61,30 @@ describe("Gemini native adapter — fixtures", () => {
   });
 });
 
+describe("Gemini native adapter — model attribution (bill on what answered, not the alias that was requested)", () => {
+  it("resolves to the response's model_version, not the requested alias", () => {
+    // Gemini hot-swaps "-latest" aliases (e.g. "gemini-flash-latest") to a
+    // dated snapshot server-side and reports the resolved id in
+    // `model_version` — see https://ai.google.dev/gemini-api/docs/models
+    // ("this alias will get hot-swapped with every new release"). Pricing
+    // must key off that, not the alias requested.
+    const resp = {
+      model_version: "gemini-flash-latest-002",
+      usage_metadata: { prompt_token_count: 10, candidates_token_count: 20 },
+    };
+    const u = extractGeminiNative(resp, "gemini-flash-latest");
+    expect(u.model).toBe("gemini-flash-latest-002");
+  });
+
+  it("falls back to the requested model when the response carries no model_version", () => {
+    const u = extractGeminiNative(
+      { usage_metadata: { prompt_token_count: 10, candidates_token_count: 20 } },
+      "gemini-2.5-flash",
+    );
+    expect(u.model).toBe("gemini-2.5-flash");
+  });
+});
+
 describe("Gemini native adapter — synthetic edges", () => {
   it("audio_input from prompt_tokens_details[modality=AUDIO]", () => {
     const resp = {
