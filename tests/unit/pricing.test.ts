@@ -5,10 +5,13 @@ import { describe, expect, it } from "vitest";
 import { LagoSDK, makeCanonicalUsage } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 import {
+  applyMarkup,
   bedrockModelKey,
   coerceMarkup,
   computeCost,
+  computePrecomputedCost,
   HttpPricingFetcher,
+  moneyStrToCents,
   lookupBedrock,
   lookupCloudflareWorkersAi,
   lookupOpenRouter,
@@ -25,7 +28,7 @@ import {
 
 const GOLDEN = JSON.parse(
   readFileSync(new URL("./fixtures/pricing/money_golden.json", import.meta.url), "utf8"),
-) as { cases: Array<Record<string, any>> };
+) as { cases: Array<Record<string, any>>; precomputed_cases: Array<Record<string, any>> };
 
 // ---------- stub fetcher (no network) ----------
 class StubFetcher {
@@ -437,12 +440,100 @@ describe("computeCost / money", () => {
   it("matches the cross-repo golden fixtures", () => {
     for (const c of GOLDEN.cases) {
       const price = modelPrice(c.prices);
-      const usage = makeCanonicalUsage(c.counts);
+      // `provider` is optional and defaults to a name in no INCLUDES_ set, so
+      // the pre-existing cases keep their original semantics; cases that pin
+      // per-provider token semantics set it explicitly.
+      const usage = makeCanonicalUsage({ ...c.counts, provider: c.provider ?? "p" });
       const b = computeCost(usage, price, parseScaled(c.markup)!);
       expect(b.base, `${c.name}: base`).toBe(c.base);
       expect(b.total, `${c.name}: total`).toBe(c.total);
       expect(b.totalCents, `${c.name}: cents`).toBe(c.total_cents);
     }
+  });
+
+  // The gateway path: a lump sum the caller already knows. Several of these are
+  // verbatim `cost` values from real Cloudflare AI Gateway log entries. String(n)
+  // renders anything below 1e-6 in exponential notation, so these are exactly the
+  // cases where this repo silently billed zero while Python billed correctly.
+  it("matches the cross-repo golden precomputed fixtures", () => {
+    for (const c of GOLDEN.precomputed_cases) {
+      const b = computePrecomputedCost(c.usd_cost, parseScaled(c.markup)!);
+      expect(b.base, `${c.name}: base`).toBe(c.base);
+      expect(b.total, `${c.name}: total`).toBe(c.total);
+      expect(b.totalCents, `${c.name}: cents`).toBe(c.total_cents);
+    }
+  });
+
+  // Regression: Workers AI is reached only through Cloudflare's OpenAI-COMPATIBLE
+  // endpoint, so its `prompt_tokens` already includes the cached tokens. Counts and
+  // rates here are real — a live cached call reported prompt=23233/cached=23168, and
+  // @cf/moonshotai/kimi-k2.6 lists input $0.95/M with cached input $0.16/M. Billing
+  // all 23233 at the input rate charged the cached portion twice (+583%).
+  it("workers-ai cache_read is a subset of input, billed once", () => {
+    const price = modelPrice({ input: "0.00000095", cache_read: "0.00000016" });
+    const usage = makeCanonicalUsage({
+      model: "@cf/moonshotai/kimi-k2.6",
+      provider: "workers-ai",
+      input: 23233,
+      cache_read: 23168,
+    });
+    const b = computeCost(usage, price, parseScaled("1")!);
+    expect(b.fields.input.tokens).toBe("65");
+    expect(b.fields.cache_read.tokens).toBe("23168");
+    expect(b.total).toBe("0.00376863");
+  });
+
+  it("anthropic cache_read stays additive", () => {
+    const price = modelPrice({ input: "0.00000095", cache_read: "0.00000016" });
+    const usage = makeCanonicalUsage({
+      model: "claude-x",
+      provider: "anthropic",
+      input: 23233,
+      cache_read: 23168,
+    });
+    const b = computeCost(usage, price, parseScaled("1")!);
+    expect(b.fields.input.tokens).toBe("23233");
+    expect(b.total).toBe("0.02577823");
+  });
+
+  // Regression: `String(n)` switches to exponential below 1e-6, so a real
+  // gateway-reported cost arrived as "9.807224944233895e-7" and a decimal-only
+  // pattern rejected it — after which `?? 0n` billed a real metered call at zero,
+  // with no onError. Python's Decimal always accepted these, so the repos
+  // disagreed on live money.
+  it("parseScaled accepts exponential notation", () => {
+    expect(parseScaled(9.807224944233895e-7)).toBe(980722n);
+    expect(parseScaled("8.91e-7")).toBe(891000n);
+    expect(parseScaled("9.78e-07")).toBe(978000n);
+    expect(parseScaled("1E+2")).toBe(100n * 1_000_000_000_000n);
+    // below the 12dp floor -> a real zero, not null
+    expect(parseScaled(1e-13)).toBe(0n);
+    expect(parseScaled("1e-999999999")).toBe(0n);
+  });
+
+  it("parseScaled still rejects negatives, junk and out-of-range magnitudes", () => {
+    expect(parseScaled("-1e-7")).toBeNull();
+    expect(parseScaled("NaN")).toBeNull();
+    expect(parseScaled("Infinity")).toBeNull();
+    expect(parseScaled("1e")).toBeNull();
+    expect(parseScaled("abc")).toBeNull();
+    // Python's Decimal.quantize raises above the 28-digit context precision and
+    // _parse_price returns None there; match it exactly rather than diverging.
+    expect(parseScaled("1e15")).toBe(10n ** 27n);
+    expect(parseScaled("1e16")).toBeNull();
+    expect(parseScaled("1e30")).toBeNull();
+    expect(parseScaled("1e999999999")).toBeNull();
+  });
+
+  it("computePrecomputedCost bills a real sub-1e-6 gateway cost", () => {
+    const b = computePrecomputedCost(9.807224944233895e-7, parseScaled("1")!);
+    expect(b.total).toBe("0.000000980722");
+    expect(b.totalCents).toBe("0.0000980722");
+  });
+
+  it("applyMarkup and moneyStrToCents handle exponential input", () => {
+    expect(applyMarkup(String(8.91e-7), "1.5")).toBe("0.0000013365");
+    expect(moneyStrToCents(String(8.91e-7))).toBe("0.0000891");
   });
 
   it("coerceMarkup falls back to 1.0 on invalid/non-positive", () => {

@@ -52,7 +52,17 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // separately would double-bill. Anthropic reports input exclusive of cache
 // (cache_read/cache_write additive) and Gemini's `thoughts` are additive, so
 // they're absent from the respective sets.
-const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini"]);
+//
+// "workers-ai" belongs here because it is only ever reached through
+// Cloudflare's OpenAI-COMPATIBLE endpoint (`.../compat`), so its usage payload
+// is the OpenAI shape: `prompt_tokens` includes
+// `prompt_tokens_details.cached_tokens`. It is a distinct provider only
+// because it prices against Cloudflare's own catalog (see inferProvider in
+// adapters/openai_native.ts) — the token semantics are still OpenAI's.
+// Omitting it billed the cached tokens twice: once at the full input rate
+// because they were never subtracted, and again at the cache-read rate, which
+// Cloudflare's catalog does publish for some models.
+const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
 const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
@@ -113,20 +123,52 @@ const BEDROCK_VENDOR_WORDS = new Set([
 // Money (fixed-point BigInt, scale 1e12, floored — matches Python Decimal)
 // ----------------------------------------------------------------------
 const SCALE = 1_000_000_000_000n; // 1e12
-const DEC_RE = /^\d+(\.\d+)?$/;
+
+// Mantissa + OPTIONAL exponent. The exponent half is not cosmetic: `String(n)`
+// on a JS number switches to exponential notation below 1e-6, so a real
+// gateway-reported cost of 9.807224944233895e-7 reaches us as
+// "9.807224944233895e-7", never "0.0000009807...". A decimal-only pattern
+// rejected those, and the callers' `?? 0n` then billed a real metered call at
+// ZERO with no error — while Python's Decimal accepted the same input and
+// billed it correctly, so the two repos disagreed on live money.
+const DEC_RE = /^(\d+(?:\.\d+)?)(?:[eE]([+-]?\d+))?$/;
+
+// Python's Decimal.quantize(1e-12) raises InvalidOperation once the result
+// exceeds the default 28-digit context precision — i.e. at 1e16 and up (16
+// integer + 12 fractional digits) — and `_parse_price` returns None there. We
+// return null for exactly the same inputs so the repos stay byte-identical.
+const MAX_SCALED = 10n ** 28n; // 1e16 USD, expressed at 1e12 scale
 
 /** Parse a non-negative decimal string/number to a BigInt scaled by 1e12 (truncated). null on invalid/negative. */
 export function parseScaled(value: unknown): bigint | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
-  const s = String(value).trim();
-  if (!DEC_RE.test(s)) return null; // rejects negatives, NaN, Infinity, junk
-  const [intPart, fracPart = ""] = s.split(".");
-  const frac12 = (fracPart + "000000000000").slice(0, 12);
+  const m = DEC_RE.exec(String(value).trim());
+  if (m === null) return null; // rejects negatives, NaN, Infinity, junk
+  const [intPart, fracPart = ""] = m[1].split(".");
+  const exp = m[2] ? Number(m[2]) : 0;
+  const digits = intPart + fracPart;
+  const significant = digits.replace(/^0+/, "");
+  if (significant === "") return 0n; // any number of zeros, at any exponent
+  // Decimal magnitude: the value sits in [10^(mag-1), 10^mag).
+  const mag = significant.length + exp - fracPart.length;
+  // Anything under 1e-12 floors to zero anyway. Short-circuiting here also
+  // stops an absurd exponent ("1e-999999999") from turning the 10n ** shift
+  // below into a memory bomb.
+  if (mag <= -12) return 0n;
+  // Same guard at the top end, before any exponentiation; the exact ceiling is
+  // enforced against MAX_SCALED once the value is known.
+  if (mag > 17) return null;
+  const shift = 12 - fracPart.length + exp;
+  let scaled: bigint;
   try {
-    return BigInt(intPart) * SCALE + BigInt(frac12);
+    const n = BigInt(digits);
+    // A negative shift divides, which truncates toward zero — and every value
+    // reaching here is non-negative, so that is floor, matching ROUND_DOWN.
+    scaled = shift >= 0 ? n * 10n ** BigInt(shift) : n / 10n ** BigInt(-shift);
   } catch {
     return null;
   }
+  return scaled >= MAX_SCALED ? null : scaled;
 }
 
 /** Format a scaled-1e12 BigInt to a plain decimal string, trailing zeros trimmed. */
@@ -314,6 +356,18 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
 
 export function lookupOpenRouter(table: OpenRouterTable, provider: string, model: string): ModelPrice | null {
   const vendor = VENDOR_MAP[(provider || "").toLowerCase()] ?? (provider || "").toLowerCase();
+  // Some sources report the model ALREADY carrying its vendor prefix — a real
+  // Cloudflare AI Gateway log for a REST-path call says
+  // model="anthropic/claude-opus-4.8" with provider="anthropic" — which would
+  // otherwise build "anthropic/anthropic/claude-opus-4.8" and never match.
+  // Strip it only when the prefix agrees with the vendor we just resolved, so
+  // this stays vendor-gated as documented: a model naming a DIFFERENT vendor
+  // than the call claims is still a miss, not a cross-vendor mispricing.
+  const slash = model.indexOf("/");
+  if (slash > 0) {
+    const head = model.slice(0, slash).toLowerCase();
+    if (head === vendor || head === (provider || "").toLowerCase()) model = model.slice(slash + 1);
+  }
   return (
     table.exact.get(`${vendor}/${model}`) ??
     table.norm.get(`${vendor}\n${norm(model)}`) ??

@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { nonzeroNumeric } from "../../../../src/canonical.js";
+import { makeCanonicalUsage, nonzeroNumeric } from "../../../../src/canonical.js";
 import { extractCloudflareLog, resolveSubscription } from "../../../../src/gateway/adapters/index.js";
+import { computeCost, lookupOpenRouter, parseOpenRouter, parseScaled } from "../../../../src/pricing.js";
 
 const FIX = join(__dirname, "fixtures", "cloudflare_gateway");
 
@@ -135,7 +136,11 @@ describe("Cloudflare gateway log adapter — real fixtures", () => {
     expect(u.input).toBe(9);
     expect(u.output).toBe(21);
     expect(u.reasoning).toBe(852);
-    expect(u.provider).toBe("google-ai-studio");
+    // Cloudflare logs this as "google-ai-studio"; the SDK's own vocabulary
+    // calls it "gemini", which is what the price and token-semantics tables
+    // key off.
+    expect(entry.provider).toBe("google-ai-studio");
+    expect(u.provider).toBe("gemini");
     expect(u.model).toBe("gemini-2.5-flash");
   });
 
@@ -227,5 +232,87 @@ describe("robustness — a poller processes entries in a batch", () => {
   it("survives negative and non-numeric tokens", () => {
     expect(extractCloudflareLog({ tokens_in: -5 }).input).toBe(0);
     expect(extractCloudflareLog({ tokens_out: "bogus" }).output).toBe(0);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Provider vocabulary — Cloudflare's names are not the SDK's names
+// --------------------------------------------------------------------------
+describe("Cloudflare gateway provider normalization", () => {
+  // Verified live: lookupOpenRouter with provider="google-ai-studio" missed
+  // against the real 400-model OpenRouter table and hit as "gemini".
+  it("maps Cloudflare's vocabulary onto the SDK's", () => {
+    const cases: Array<[string, string]> = [
+      ["google-ai-studio", "gemini"],
+      ["google-vertex-ai", "gemini"],
+      ["vertex", "gemini"],
+      ["azure-openai", "openai"],
+      ["azureopenai", "openai"],
+      ["workersai", "workers-ai"],
+    ];
+    for (const [raw, expected] of cases) {
+      expect(extractCloudflareLog({ provider: raw, tokens_in: 1 }).provider, raw).toBe(expected);
+    }
+  });
+
+  it("passes through names we already agree on", () => {
+    for (const raw of ["anthropic", "openai", "mistral", "workers-ai"]) {
+      expect(extractCloudflareLog({ provider: raw, tokens_in: 1 }).provider).toBe(raw);
+    }
+  });
+
+  it("passes an unknown provider through untouched", () => {
+    // An unrecognized provider is one we have no price table for; a clean miss
+    // falls back to token events, which beats inventing a mapping.
+    expect(extractCloudflareLog({ provider: "perplexity", tokens_in: 1 }).provider).toBe("perplexity");
+    // AWS Bedrock is deliberately NOT aliased — its prices key off the `api`
+    // field, which this connector always sets to "cloudflare_gateway".
+    expect(extractCloudflareLog({ provider: "bedrock", tokens_in: 1 }).provider).toBe("bedrock");
+  });
+
+  it("normalized gemini provider prices, and bills cache as a subset", () => {
+    // The two downstream consequences of the alias, end to end: the Gemini
+    // price is now findable, and cache_read is treated as a SUBSET of input
+    // (Gemini's semantics) instead of being billed on top of it.
+    const entry = load("16_real_gemini_via_dedicated_endpoint.json");
+    const u = extractCloudflareLog(entry);
+    const table = parseOpenRouter({
+      data: [
+        {
+          id: "google/gemini-2.5-flash",
+          pricing: {
+            prompt: "0.0000003",
+            completion: "0.0000025",
+            input_cache_read: "0.000000075",
+          },
+        },
+      ],
+    });
+    const price = lookupOpenRouter(table, u.provider, u.model);
+    expect(price, "gemini price must resolve after normalization").not.toBeNull();
+
+    const cached = makeCanonicalUsage({
+      model: u.model,
+      provider: u.provider,
+      api: u.api,
+      input: 1000,
+      cache_read: 800,
+    });
+    const b = computeCost(cached, price!, parseScaled("1")!);
+    expect(b.fields.input.tokens).toBe("200"); // 1000 - 800, not 1000
+    expect(b.fields.cache_read.tokens).toBe("800");
+  });
+
+  it("lookupOpenRouter strips a redundant vendor prefix", () => {
+    // Real fixture 07 reports model="anthropic/claude-opus-4.8" alongside
+    // provider="anthropic"; unstripped that built "anthropic/anthropic/..."
+    // and never matched.
+    const table = parseOpenRouter({
+      data: [{ id: "anthropic/claude-opus-4.8", pricing: { prompt: "0.000005" } }],
+    });
+    expect(lookupOpenRouter(table, "anthropic", "anthropic/claude-opus-4.8")).not.toBeNull();
+    expect(lookupOpenRouter(table, "anthropic", "claude-opus-4.8")).not.toBeNull();
+    // Still vendor-gated: a model claiming a different vendor must not match.
+    expect(lookupOpenRouter(table, "openai", "anthropic/claude-opus-4.8")).toBeNull();
   });
 });

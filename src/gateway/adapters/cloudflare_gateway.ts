@@ -52,6 +52,36 @@ function safeStr(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
+// Cloudflare AI Gateway logs its OWN provider vocabulary, which is not the name
+// the pricing tables and token-semantics tables key off — and not always its own
+// URL slug either (the logs say "workers-ai" where the endpoint path says
+// "workersai"). Passed through verbatim, "google-ai-studio" matched no vendor in
+// pricing's VENDOR_MAP, so every Gemini call backfilled through the gateway
+// missed on price; worse, it also missed INPUT_INCLUDES_CACHE_READ, so Gemini's
+// cache_read — a SUBSET of its input count, not additive — was billed twice.
+//
+// Only providers this SDK can actually price need an entry. Anything else passes
+// through unchanged: an unrecognized provider is one we have no table for, and a
+// clean miss falls back to token events, which is strictly better than inventing
+// a mapping. AWS Bedrock is deliberately absent for that reason — Bedrock prices
+// are keyed off `api.startsWith("bedrock")`, and this connector always sets
+// api="cloudflare_gateway", so mapping its provider name would route it to
+// OpenRouter under a vendor that cannot match. A miss there is honest.
+const PROVIDER_ALIASES: Record<string, string> = {
+  "google-ai-studio": "gemini",
+  "google-vertex-ai": "gemini",
+  vertex: "gemini",
+  "azure-openai": "openai",
+  azureopenai: "openai",
+  workersai: "workers-ai",
+};
+
+/** Map Cloudflare's provider name onto the SDK's own provider vocabulary. */
+function normalizeProvider(v: unknown): string {
+  const p = safeStr(v).toLowerCase();
+  return PROVIDER_ALIASES[p] ?? p;
+}
+
 /**
  * Translate one Cloudflare AI Gateway log entry -> CanonicalUsage.
  *
@@ -71,7 +101,7 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
     cache_write: safeInt(usageMeta.input_cache_creation_tokens),
     reasoning: safeInt(usageMeta.reasoningTokens ?? usageMeta.reasoning_tokens),
     model: safeStr(entry.model),
-    provider: safeStr(entry.provider),
+    provider: normalizeProvider(entry.provider),
     api: "cloudflare_gateway",
     extras: {
       cached: entry.cached,
