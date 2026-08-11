@@ -1,7 +1,13 @@
 /** Drift detection — unknown fields land in extras, not in numeric counts. */
 import { describe, expect, it } from "vitest";
 
-import { extractBedrockConverse, extractBedrockInvoke } from "../../src/adapters/index.js";
+import {
+  extractAnthropicNative,
+  extractBedrockConverse,
+  extractBedrockInvoke,
+  extractOpenAINative,
+} from "../../src/adapters/index.js";
+import { nonzeroNumeric } from "../../src/canonical.js";
 
 describe("Drift detection — Converse", () => {
   it("unknown top-level usage field goes to extras", () => {
@@ -61,5 +67,141 @@ describe("Drift detection — Invoke", () => {
     };
     const u = extractBedrockInvoke(resp, "openai.gpt-oss-safeguard-20b-1:0");
     expect(u.extras.prompt_tokens_details).toEqual({ cached_tokens: 48 });
+  });
+});
+
+describe("Drift detection — native OpenAI, ONE LEVEL DOWN", () => {
+  it("nested detail drift reaches extras", () => {
+    // The drift contract has to hold inside the *_tokens_details sub-objects, not
+    // just at the top level. This is the hole a live `gpt-5.6-sol` response found:
+    // it reports prompt_tokens_details.cache_write_tokens: 3022, and because
+    // prompt_tokens_details is itself a KNOWN top-level key the old sweep never
+    // looked inside it. 3022 real tokens were discarded with no error and no
+    // onError — the exact failure this file exists to prevent. Every drift test
+    // passed, because none of them looked one level down.
+    const u = extractOpenAINative({
+      usage: {
+        prompt_tokens: 3025,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 3022 },
+        completion_tokens_details: { reasoning_tokens: 0, future_nested_xyz: 42 },
+      },
+    });
+    expect(u.extras["prompt_tokens_details.cache_write_tokens"]).toBe(3022);
+    expect(u.extras["completion_tokens_details.future_nested_xyz"]).toBe(42);
+  });
+
+  it("mapped nested fields do not pollute extras", () => {
+    // The mirror of the above: a nested key we DO map must not also appear in
+    // extras, or every event carries a duplicate of a value already billed.
+    const u = extractOpenAINative({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        prompt_tokens_details: { cached_tokens: 40, audio_tokens: 5 },
+        completion_tokens_details: { reasoning_tokens: 20, audio_tokens: 3 },
+      },
+    });
+    expect(u.cache_read).toBe(40);
+    expect(u.reasoning).toBe(20);
+    expect(u.audio_input).toBe(5);
+    expect(u.audio_output).toBe(3);
+    for (const k of Object.keys(u.extras)) {
+      expect(k.endsWith(".cached_tokens")).toBe(false);
+      expect(k.endsWith(".reasoning_tokens")).toBe(false);
+      expect(k.endsWith(".audio_tokens")).toBe(false);
+    }
+  });
+
+  it("Responses-API shape gets the same guarantee", () => {
+    // Its detail containers are named differently.
+    const u = extractOpenAINative({
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        input_tokens_details: { cached_tokens: 2, novel_input_detail: "x" },
+        output_tokens_details: { reasoning_tokens: 1, novel_output_detail: "y" },
+      },
+    });
+    expect(u.api).toBe("responses");
+    expect(u.extras["input_tokens_details.novel_input_detail"]).toBe("x");
+    expect(u.extras["output_tokens_details.novel_output_detail"]).toBe("y");
+  });
+});
+
+describe("Drift detection — fields first seen through the Databricks gateway", () => {
+  it("Anthropic service_tier and inference_geo reach extras", () => {
+    // Two fields that appeared on live Anthropic responses through the Databricks
+    // gateway and are in no fixture predating it: service_tier ("standard") and
+    // inference_geo ("global" for sonnet-4-6, "not_available" for the others).
+    // Neither is a token count, so both must land in extras — never miscounted as a
+    // metric, never silently dropped.
+    const u = extractAnthropicNative({
+      model: "claude-sonnet-4-6",
+      usage: {
+        input_tokens: 8,
+        output_tokens: 4,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        service_tier: "standard",
+        inference_geo: "global",
+      },
+    });
+    expect(u.input).toBe(8);
+    expect(u.output).toBe(4);
+    expect(u.extras.service_tier).toBe("standard");
+    expect(u.extras.inference_geo).toBe("global");
+    expect(nonzeroNumeric(u)).toEqual({ input: 8, output: 4 });
+  });
+});
+
+describe("openai native — post-review drift holes", () => {
+  it("lets Responses audio_tokens reach extras, because nothing maps them", () => {
+    // `output_tokens_details.audio_tokens` was listed as a MAPPED nested key, so it was
+    // excluded from extras — while the Responses branch hardcodes `audioOutput = 0`
+    // because the API doesn't expose it. Both true at once means the count is neither
+    // billed nor surfaced: 500 real tokens gone with no error.
+    const u = extractOpenAINative({
+      usage: {
+        input_tokens: 10,
+        output_tokens: 500,
+        output_tokens_details: { reasoning_tokens: 0, audio_tokens: 500 },
+      },
+    });
+    expect(u.api).toBe("responses");
+    expect(u.audio_output).toBe(0);
+    expect(u.extras["output_tokens_details.audio_tokens"]).toBe(500);
+  });
+
+  it("does not double-bill additive reasoning via the total_tokens guard", () => {
+    // The guard folds an unexplained delta into `output`. For a provider whose reasoning
+    // is ADDITIVE (this adapter now stamps `databricks` and `workers-ai`, not only
+    // `openai`), a payload reporting BOTH reasoning_tokens and an inflated total would be
+    // charged twice — inside the grown output and again as a reasoning line.
+    const u = extractOpenAINative(
+      {
+        usage: {
+          prompt_tokens: 57,
+          completion_tokens: 47,
+          total_tokens: 1253,
+          completion_tokens_details: { reasoning_tokens: 1149 },
+        },
+      },
+      "",
+      "databricks",
+    );
+    expect(u.reasoning).toBe(1149);
+    expect(u.output).toBe(47);
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+  });
+
+  it("still recovers tokens nobody broke out", () => {
+    // The case the guard was written for, measured live: prompt 57, completion 47,
+    // total 1253, no completion_tokens_details to recover the 1,149 from.
+    const u = extractOpenAINative({
+      usage: { prompt_tokens: 57, completion_tokens: 47, total_tokens: 1253 },
+    });
+    expect(u.output).toBe(47 + 1149);
+    expect(u.extras.unaccounted_output_tokens).toBe(1149);
   });
 });
