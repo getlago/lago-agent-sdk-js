@@ -20,12 +20,21 @@ describe("EventQueue — buffer overflow", () => {
     const blocked = new Promise<void>((r) => {
       release = r;
     });
+    // maxBatchSize must stay ABOVE maxBufferSize. `push` sets the wake signal whenever
+    // `buffer.length >= maxBatchSize`, so with the two equal the overflowing push below
+    // both drops i=0 AND wakes the worker, which then drains all 10,000. This repo gets
+    // away with it only because the buffer read below is synchronous — there is no await
+    // in that window for the worker to interleave at. The Python twin, with a real
+    // background thread, failed in CI on exactly this (`assert 0 == 10000`). Kept in step
+    // so the two files stay mirrored and so inserting an await here cannot resurrect it.
+    //
+    // Nothing here depends on batch size — every assertion is about buffer CONTENTS.
     const q = new EventQueue(
       async () => {
         await blocked;
       },
       10_000, // never timer-flush
-      10_000, // batch == cap so worker takes the lot once unpaused
+      20_000, // batch above the cap, so push never wakes the worker
       10_000, // buffer cap
     );
     try {
