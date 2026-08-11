@@ -421,6 +421,88 @@ export class LagoSDK {
     }
   }
 
+  /**
+   * Read a window of Databricks AI Gateway usage and bill all of it.
+   *
+   * The one-call entrypoint: give it a window, it does the rest. Returns counts of
+   * what it emitted, e.g. `{cost: 56, tokens: 45, skipped: 0}`.
+   *
+   * Billing follows the rule the connector establishes rather than re-deriving it: a
+   * BYOK row carries Databricks' own metered USD and bills as a dollar cost; a
+   * Databricks-hosted row has no per-request dollar figure anywhere in Databricks'
+   * system tables and bills as token counts.
+   *
+   * `unified: true` bills everything to `defaultSubscription`, ignoring per-call
+   * `request_tags` — right when one gateway serves one customer. Left false, each row
+   * goes to the subscription its own tags name, falling back to `defaultSubscription`
+   * only when a row is untagged.
+   *
+   * Every event also carries the Databricks-side grouping key for its row —
+   * `endpoint_name` for hosted, `bucket` for BYOK — so grouping Lago the same way the
+   * Databricks page groups puts the two side by side. See
+   * `DatabricksUsageRow.reconcileDimensions`. Anything in `dimensions` is added on top
+   * and wins on a key collision.
+   *
+   * Idempotent: every event id is derived from the source row's own id and scoped by
+   * subscription, so re-running the same window has Lago reject the duplicates rather
+   * than double-bill. Does not flush — call `flush()` when you want to await delivery.
+   *
+   * `source` is normally a `DatabricksSource`, and `since` the window. It also accepts an
+   * already-read array of `DatabricksUsageRow` — pass one when you have inspected the rows
+   * first, so the window is read ONCE. Reading twice is not just slow: a SQL warehouse
+   * costs roughly 1,500x the model-serving usage it reports on, and rows landing between
+   * the two reads make the summary you printed disagree with what was billed.
+   */
+  async backfillDatabricks(
+    source: { readUsage(since: any, opts?: { eventIdPrefix?: string }): Promise<any[]> } | any[],
+    since: any = "1 day",
+    opts: {
+      defaultSubscription?: string;
+      unified?: boolean;
+      dimensions?: Record<string, unknown>;
+      eventIdPrefix?: string;
+    } = {},
+  ): Promise<{ cost: number; tokens: number; skipped: number }> {
+    const counts = { cost: 0, tokens: 0, skipped: 0 };
+    const rows = Array.isArray(source)
+      ? source
+      : await source.readUsage(since, { eventIdPrefix: opts.eventIdPrefix ?? "dbx" });
+    for (const row of rows) {
+      const sub = opts.unified ? opts.defaultSubscription : row.subscription || opts.defaultSubscription;
+      if (!sub) {
+        // No attribution and no fallback — emit() would drop it anyway, but counting
+        // it here makes the gap visible instead of silent.
+        counts.skipped += 1;
+        continue;
+      }
+      // Row's own reconciliation key first, so an explicit caller dimension of the same
+      // name wins rather than being silently overwritten.
+      const dims = { ...row.reconcileDimensions, ...(opts.dimensions || {}) };
+      if (row.usdCost !== undefined) {
+        this.emit(row.usage, {
+          subscription: sub,
+          dimensions: dims,
+          mode: "price",
+          usdCost: row.usdCost,
+          // Keyed off the subscription actually billed, not the row's own tag — an
+          // untagged row billed to the default must not carry an id that blocks it
+          // from a different default on a later run.
+          eventId: row.eventIdFor(sub),
+        });
+        counts.cost += 1;
+      } else {
+        this.emit(row.usage, {
+          subscription: sub,
+          dimensions: dims,
+          mode: "tokens",
+          eventId: row.eventIdFor(sub),
+        });
+        counts.tokens += 1;
+      }
+    }
+    return counts;
+  }
+
   flush(timeoutMs: number = 5000): Promise<boolean> {
     return this.queue.flush(timeoutMs);
   }
