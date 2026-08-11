@@ -1,5 +1,6 @@
 /** OpenAI wrapper tests — fake client, no live API. */
 import { describe, expect, it } from "vitest";
+import { providerHintFor } from "../../src/wrappers/openai.js";
 
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -428,5 +429,44 @@ describe("OpenAI wrapper — gateway cache-hit detection", () => {
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
     expect(received).toHaveLength(2);
+  });
+});
+
+describe("Databricks: baseURL decides the provider", () => {
+  const DBX = "https://dbc-0223ef70-2638.cloud.databricks.com";
+
+  it.each([
+    // Hosted foundation models — DBU-billed, must NOT reach a vendor price table.
+    [`${DBX}/ai-gateway/mlflow/v1`, "databricks"],
+    [`${DBX}/ai-gateway/mlflow/v1/`, "databricks"],
+    // BYOK surfaces keep their real vendor so they price against OpenRouter.
+    [`${DBX}/ai-gateway/openai/v1`, ""],
+    [`${DBX}/ai-gateway/anthropic`, ""],
+    // Unrelated clients are untouched.
+    ["https://api.openai.com/v1", ""],
+    ["https://gateway.ai.cloudflare.com/v1/acct/gw/compat", ""],
+    ["", ""],
+  ])("providerHintFor(%s) -> %s", (baseURL, expected) => {
+    // Two of Databricks' four surfaces use the SAME OpenAI class, and the response
+    // body cannot tell them apart — a hosted call echoes a served-entity name with
+    // no marker. baseURL is the only signal. Matching `/ai-gateway/mlflow/` and not
+    // `/ai-gateway/` is load-bearing: the BYOK surfaces share that prefix and must
+    // keep their vendor provider or they stop being priceable.
+    expect(providerHintFor({ baseURL })).toBe(expected);
+  });
+
+  it("survives a client without baseURL", () => {
+    // Instrumentation must never break the customer's call over a missing attribute.
+    expect(providerHintFor({})).toBe("");
+    expect(providerHintFor(null)).toBe("");
+    expect(
+      providerHintFor(
+        Object.defineProperty({}, "baseURL", {
+          get() {
+            throw new Error("boom");
+          },
+        }),
+      ),
+    ).toBe("");
   });
 });

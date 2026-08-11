@@ -1008,6 +1008,92 @@ describe("SDK price mode", () => {
     expect(errors).toContain("PricingUnavailableError");
   });
 
+  it("token-billed provider emits tokens without reporting an error", async () => {
+    // A Databricks-hosted model has no per-token rate anywhere — not a cold table, not
+    // an unmatched name, none exists. So token counts are the complete answer, and
+    // calling that a failure on every request trains the reader to ignore onError.
+    const errors: string[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 11,
+        output: 4,
+        model: "meta-llama-4-maverick-040225",
+        provider: "databricks",
+        api: "chat_completions",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(errors).toEqual([]);
+  });
+
+  it("still reports a real price miss", async () => {
+    // The narrow exception above must not become a blanket silence: an unmatched model
+    // on a provider that DOES publish rates is a genuine miss the customer can act on.
+    const errors: string[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async () => {});
+    sdk.emit(makeCanonicalUsage({ input: 5, model: "no-such-model", provider: "anthropic", api: "native" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(errors).toContain("PricingUnavailableError");
+  });
+
+  it("notes a token-billed provider once per model, not once per call", async () => {
+    // It is a standing fact about the provider, not an event about this call.
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const { sdk } = priceSdk(await warmProvider());
+      for (let i = 0; i < 3; i++) {
+        sdk.emit(
+          makeCanonicalUsage({ input: 1, model: "llama-4-maverick", provider: "databricks", api: "x" }),
+        );
+      }
+      sdk.emit(makeCanonicalUsage({ input: 1, model: "gpt-oss-20b", provider: "databricks", api: "x" }));
+      await sdk.shutdown(1000);
+      const notes = spy.mock.calls.filter((c) => String(c[0]).includes("in its own units"));
+      expect(notes).toHaveLength(2); // one per distinct model
+      expect(notes.some((c) => String(c[0]).includes("llama-4-maverick"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still prices BYOK traffic through the same gateway", async () => {
+    // TOKEN_BILLED_PROVIDERS keys on provider, so it covers Databricks-HOSTED models
+    // only — BYOK traffic through the same gateway is stamped with the real vendor and
+    // must keep pricing normally.
+    const { sdk, received } = priceSdk(await warmProvider());
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 100,
+        output: 50,
+        model: "claude-opus-4.8",
+        provider: "anthropic",
+        api: "native",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect([...new Set(received.map((e) => e.code))]).toEqual(["llm_cost"]);
+  });
+
   it("per-call mode='price' overrides global tokens default", async () => {
     const received: LagoEvent[] = [];
     const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: "sub_default" }); // global tokens

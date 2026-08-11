@@ -65,6 +65,25 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
 const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
 
+// Providers this SDK bills as TOKEN COUNTS by design, even in price mode — because no
+// per-token rate for them exists anywhere the SDK could read it.
+//
+// "databricks" means a Databricks-HOSTED foundation model (`system.ai.*`). Databricks
+// bills those in DBUs at a per-model rate published only as an HTML page — verified
+// absent from every column of all 88 system tables — so there is nothing to look up now
+// and nothing a later refresh could supply. Token counts are the honest, complete answer
+// for them, not a degraded one.
+//
+// This is a deliberate, NARROW exception to "a price miss is reported via onError". It
+// applies only where the miss is *structural and permanent*. A cold table, an unmatched
+// model name, a mistyped provider — all still report, because those are genuine misses a
+// customer can act on. Reporting this one on every call would be a permanent false
+// alarm, and an alarm that always fires is one nobody reads.
+//
+// Note this keys on the PROVIDER, so it only ever covers Databricks-hosted models: BYOK
+// traffic through the same gateway is stamped "openai"/"anthropic" and prices normally
+// (verified exact against Databricks' own metered spend, 38 of 38 buckets).
+export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set(["databricks"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",

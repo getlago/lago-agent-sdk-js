@@ -10,6 +10,7 @@ import { LagoClient, LagoEvent } from "./lago_client.js";
 import {
   CostBreakdown,
   PricingProvider,
+  TOKEN_BILLED_PROVIDERS,
   applyMarkup,
   coerceMarkup,
   computeCost,
@@ -67,6 +68,8 @@ export class LagoSDK {
   private client: LagoClient;
   private queue: EventQueue;
   private pricing: PricingProvider;
+  /** (provider, model) pairs already noted as token-billed — see `noteTokenBilled`. */
+  private tokenBilledNoted = new Set<string>();
 
   constructor(opts: LagoSDKOptions) {
     this.config = makeConfig({
@@ -290,6 +293,14 @@ export class LagoSDK {
       let breakdown: CostBreakdown;
       if (opts.usdCost !== undefined) {
         breakdown = computePrecomputedCost(opts.usdCost, markupScaled);
+      } else if (TOKEN_BILLED_PROVIDERS.has(usage.provider)) {
+        // NOT a failure, so deliberately not routed through onError: this provider
+        // publishes no per-token rate at all, so token counts are the complete answer
+        // rather than a fallback. Said once per model instead of once per call. See
+        // TOKEN_BILLED_PROVIDERS for the reasoning.
+        this.noteTokenBilled(usage);
+        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+        return;
       } else {
         const price = this.pricing.lookup(usage.provider, usage.model, usage.api);
         if (price === null) {
@@ -409,6 +420,22 @@ export class LagoSDK {
         },
       });
     }
+  }
+
+  /**
+   * Say it once per model, at info level.
+   *
+   * It is a standing fact about the provider, not an event about this call, so repeating
+   * it per request would bury the log in something the reader can neither fix nor act on.
+   */
+  private noteTokenBilled(usage: CanonicalUsage): void {
+    const key = `${usage.provider}\u0000${usage.model}`;
+    if (this.tokenBilledNoted.has(key)) return;
+    this.tokenBilledNoted.add(key);
+    console.info(
+      `[lago] ${usage.provider} bills ${JSON.stringify(usage.model)} in its own units, not ` +
+        `per token — emitting token counts for it instead of a dollar cost`,
+    );
   }
 
   private reportError(err: unknown, where: string): void {
