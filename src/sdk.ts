@@ -380,13 +380,18 @@ export class LagoSDK {
     eventId: string | undefined,
   ): void {
     const now = Math.floor(Date.now() / 1000);
+    // Caller dimensions are spread LAST in each `properties` below, not here — they
+    // must win over every SDK-computed key, exactly as they already do in
+    // `emitTokenEvents`. Spreading them into `baseProperties` put them *before*
+    // `unit`/`value`/`base_cost`/`unit_price`, so those four silently overwrote a
+    // caller's same-named dimension on this path while honouring it on the token
+    // path — one customer config, two different outcomes.
     const baseProperties: Record<string, unknown> = {
       model: usage.model,
       provider: usage.provider,
       api: usage.api,
       price_source: breakdown.source,
       markup: breakdown.markup,
-      ...(dimensions || {}),
     };
 
     if (Object.keys(breakdown.fields).length === 0) {
@@ -403,6 +408,7 @@ export class LagoSDK {
           unit: String(usage.input + usage.output),
           value: breakdown.total,
           base_cost: breakdown.base,
+          ...(dimensions || {}),
         },
       });
       return;
@@ -427,6 +433,7 @@ export class LagoSDK {
           value: billedCost,
           base_cost: parts.cost,
           unit_price: parts.unit_price,
+          ...(dimensions || {}),
         },
       });
     }

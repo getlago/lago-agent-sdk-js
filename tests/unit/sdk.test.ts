@@ -64,6 +64,54 @@ describe("LagoSDK.emit", () => {
     expect(received[0].properties.tenant).toBe("acme");
   });
 
+  it("caller dimensions win on a collision, on both emitters", async () => {
+    // One rule across both paths: a caller dimension overrides every
+    // SDK-computed property of the same name. The cost path used to spread
+    // dimensions into `baseProperties`, i.e. BEFORE
+    // `unit`/`value`/`base_cost`/`unit_price`, so those four silently overwrote
+    // a same-named caller dimension there while the token path honoured it —
+    // same customer config, two different outcomes depending on the mode.
+    const dimensions = { unit: "seat", value: "CUSTOM", model: "my-label", team: "platform" };
+    const usage = makeCanonicalUsage({
+      input: 100,
+      output: 50,
+      model: "claude-sonnet-4-5",
+      provider: "anthropic",
+      api: "native",
+    });
+
+    const tok = newSdk();
+    tok.sdk.emit(usage, { dimensions, mode: "tokens" });
+    expect(await tok.sdk.flush(2000)).toBe(true);
+    await tok.sdk.shutdown(1000);
+
+    // Precomputed cost, so no price table is needed.
+    const cost = newSdk();
+    cost.sdk.emit(usage, { dimensions, mode: "price", usdCost: 0.01 });
+    expect(await cost.sdk.flush(2000)).toBe(true);
+    await cost.sdk.shutdown(1000);
+
+    expect(tok.received.length).toBeGreaterThan(0);
+    expect(cost.received.length).toBeGreaterThan(0);
+    for (const [label, events] of [
+      ["token", tok.received],
+      ["cost", cost.received],
+    ] as const) {
+      for (const e of events) {
+        expect(e.properties.unit, `${label}: caller unit must win`).toBe("seat");
+        expect(e.properties.value, `${label}: caller value must win`).toBe("CUSTOM");
+        expect(e.properties.model, `${label}: caller model must win`).toBe("my-label");
+        expect(e.properties.team).toBe("platform");
+      }
+    }
+
+    // The accepted consequence of that rule, pinned deliberately: a dimension
+    // named `value` overrides the reported quantity. It cannot touch the charged
+    // amount on a cost event, because `precise_total_amount_cents` is a sibling
+    // of `properties`, not a member of it.
+    expect(cost.received[0].precise_total_amount_cents).toBe("1");
+  });
+
   it("unknown client at wrap() raises UnknownClientError", () => {
     const { sdk } = newSdk();
     expect(() => sdk.wrap({ foo: 1 })).toThrow(UnknownClientError);
