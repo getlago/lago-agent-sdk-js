@@ -252,15 +252,25 @@ export function wrapOpenAIClient<T extends OpenAILike>(
  * Responses API:    usage sits under `event.response.usage` on the terminal
  *   `response.completed` event:
  *   `{ type: "response.completed", response: { usage: {...} } }`
+ *
+ * Carries the chunk's own `model` through alongside the usage. Rebuilding a
+ * usage-ONLY payload made `resolveModel` fall back to the requested alias on every
+ * streaming call, which is precisely the attribution bug the non-streaming path was
+ * fixed for: a streamed `gpt-5-chat-latest` stayed `gpt-5-chat-latest` instead of
+ * resolving to the dated snapshot OpenRouter lists, so price mode missed and
+ * silently degraded to token events. It matters most on a gateway, where the
+ * resolved name is what decides which price table the call is even looked up in.
  */
 function extractStreamUsage(payload: unknown): Record<string, unknown> | null {
   if (!isObject(payload)) return null;
   if (isObject(payload.usage)) {
-    return { usage: payload.usage };
+    return { usage: payload.usage, model: payload.model };
   }
+  // Responses API stream events nest usage under `.response.usage` — and the
+  // resolved model under `.response.model`, not at the event's top level.
   const response = payload.response;
   if (isObject(response) && isObject(response.usage)) {
-    return { usage: response.usage };
+    return { usage: response.usage, model: response.model };
   }
   return null;
 }

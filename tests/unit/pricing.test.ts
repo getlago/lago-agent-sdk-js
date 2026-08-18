@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage } from "../../src/index.js";
+import { extractOpenAINative } from "../../src/adapters/openai_native.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 import {
   applyMarkup,
@@ -345,6 +346,43 @@ describe("Cloudflare Workers AI matching", () => {
     const mp = lookupCloudflareWorkersAi(table, "@cf/meta/llama-3.3-70b-instruct-fp8-fast-v2");
     expect(mp).not.toBeNull();
     expect(mp!.input).toBe(parseScaled("0.000000293"));
+  });
+
+  it.each([
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    // The routing prefix and the version-suffix drift, together.
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast-v2",
+  ])("lookup accepts the /compat routing prefix: %s", (requested) => {
+    // Cloudflare's catalog lists bare "@cf/..." names, but reaching a model
+    // through the gateway's OpenAI-compatible `/compat` endpoint requires the
+    // "workers-ai/" prefix — the form the README prescribes and the only form a
+    // streaming call reports. Both must price to the same rate.
+    const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
+    const mp = lookupCloudflareWorkersAi(table, requested);
+    expect(mp).not.toBeNull();
+    expect(mp!.input).toBe(parseScaled("0.000000293"));
+  });
+
+  it("a miss is still a miss with the prefix", () => {
+    // The prefix strip must not turn an unknown model into a false hit.
+    const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
+    expect(lookupCloudflareWorkersAi(table, "workers-ai/@cf/nope/not-a-model")).toBeNull();
+  });
+
+  it.each([
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  ])("provider is inferred from both spellings: %s", (requested) => {
+    // A streaming Workers AI call carries no response model, so the requested
+    // string — which the docs give in prefixed form — is all `inferProvider`
+    // has. Stamping "openai" there priced it against OpenRouter, missed, and
+    // silently degraded to token events.
+    const u = extractOpenAINative({ usage: { prompt_tokens: 10, completion_tokens: 5 } }, requested);
+    expect(u.provider).toBe("workers-ai");
+    // The model keeps the spelling the customer used — the strip happens at
+    // lookup, so reporting stays faithful to the request.
+    expect(u.model).toBe(requested);
   });
 
   it("fetcher returns empty without credentials — never makes a request", async () => {

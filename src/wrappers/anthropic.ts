@@ -252,22 +252,35 @@ function isAsyncIterable(v: unknown): v is AsyncIterable<unknown> {
  * bill `input_tokens = 0`. Merge both locations; Object.assign lets the more
  * complete / more recent values win while preserving the input counts from
  * `message_start` when a delta omits them.
+ *
+ * Also reports the model this event carried. `message_start` holds the RESOLVED
+ * snapshot under `message.model` — e.g. "claude-sonnet-4-5-20250929" for a
+ * requested "claude-sonnet-4-5" — and discarding it made every streaming call
+ * attribute (and price) the alias instead, the same bug the non-streaming path was
+ * fixed for. The caller keeps the first one it sees.
  */
-function mergeStreamUsage(accumulated: Record<string, unknown>, payload: unknown): boolean {
-  if (!isObject(payload)) return false;
+function mergeStreamUsage(
+  accumulated: Record<string, unknown>,
+  payload: unknown,
+): { merged: boolean; model: string | null } {
+  if (!isObject(payload)) return { merged: false, model: null };
   let merged = false;
-  // message_start: input/cache live under message.usage
+  let model: string | null = null;
+  // message_start: input/cache live under message.usage, resolved model alongside
   const message = payload.message;
-  if (isObject(message) && isObject(message.usage)) {
-    Object.assign(accumulated, message.usage);
-    merged = true;
+  if (isObject(message)) {
+    if (isObject(message.usage)) {
+      Object.assign(accumulated, message.usage);
+      merged = true;
+    }
+    if (typeof message.model === "string" && message.model) model = message.model;
   }
   // message_delta (and others): cumulative usage at the top level
   if (isObject(payload.usage)) {
     Object.assign(accumulated, payload.usage);
     merged = true;
   }
-  return merged;
+  return { merged, model };
 }
 
 async function* wrapAsyncIterableStream(
@@ -278,6 +291,7 @@ async function* wrapAsyncIterableStream(
 ): AsyncIterable<unknown> {
   const accumulated: Record<string, unknown> = {};
   let sawUsage = false;
+  let resolvedModel: string | null = null;
   try {
     for await (const event of src) {
       // Each event is a RawMessageStreamEvent — most carry a payload with snake_case fields.
@@ -285,13 +299,15 @@ async function* wrapAsyncIterableStream(
         isObject(event) && "model_dump" in (event as object)
           ? (event as { model_dump: () => unknown }).model_dump()
           : event;
-      if (mergeStreamUsage(accumulated, payload)) sawUsage = true;
+      const { merged, model } = mergeStreamUsage(accumulated, payload);
+      if (merged) sawUsage = true;
+      resolvedModel = model ?? resolvedModel;
       yield event;
     }
   } finally {
     if (sawUsage) {
       try {
-        const usage = extractAnthropicNative({ usage: accumulated }, modelId);
+        const usage = extractAnthropicNative({ usage: accumulated, model: resolvedModel }, modelId);
         sdk.emit(usage, opts);
       } catch {
         /* swallow */

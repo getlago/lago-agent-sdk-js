@@ -62,6 +62,17 @@ function pickUsageMetadata(payload: unknown): Record<string, unknown> | null {
   return isObject(um) ? um : null;
 }
 
+/** The chunk's resolved model version, in either casing the SDK might use.
+ *
+ * Gemini hot-swaps "-latest" aliases server-side, so the chunk's own version is
+ * what OpenRouter lists and what pricing must key off. A usage-only streaming
+ * payload silently reverted to the requested alias on every call. */
+function pickModelVersion(payload: unknown): string | null {
+  if (!isObject(payload)) return null;
+  const mv = payload.modelVersion ?? payload.model_version;
+  return typeof mv === "string" && mv ? mv : null;
+}
+
 export function wrapGeminiClient<T extends GoogleGenAILike>(
   sdk: SDKLike,
   client: T,
@@ -125,11 +136,13 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
 
       async function* iterate(): AsyncIterable<unknown> {
         let lastWithUsage: Record<string, unknown> | null = null;
+        let resolvedModel: string | null = null;
         try {
           for await (const chunk of src) {
+            resolvedModel = pickModelVersion(chunk) ?? resolvedModel;
             const usage = pickUsageMetadata(chunk);
             if (usage) {
-              lastWithUsage = { usageMetadata: usage };
+              lastWithUsage = { usageMetadata: usage, modelVersion: resolvedModel };
             }
             yield chunk;
           }

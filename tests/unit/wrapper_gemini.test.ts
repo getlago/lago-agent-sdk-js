@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest";
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 
+// What Gemini resolves the requested "gemini-2.5-flash" alias to. Google
+// hot-swaps these server-side, so the chunk's own version is what OpenRouter
+// lists and what pricing must key off.
+const RESOLVED_STREAM_MODEL = "gemini-2.5-flash-002";
+
 class FakeModels {
   generateCalls = 0;
   streamCalls = 0;
@@ -30,9 +35,13 @@ class FakeModels {
       {
         candidates: [{ content: { parts: [{ text: "hi" }] } }],
         usage_metadata: null,
+        // Gemini hot-swaps "-latest" aliases, so every chunk reports the version
+        // that actually answered.
+        model_version: RESOLVED_STREAM_MODEL,
       },
       {
         candidates: [{ content: { parts: [{ text: "." }] }, finish_reason: "STOP" }],
+        model_version: RESOLVED_STREAM_MODEL,
         usage_metadata: {
           prompt_token_count: 9,
           candidates_token_count: 4,
@@ -121,6 +130,24 @@ describe("Gemini wrapper", () => {
     expect(() => sdk.wrap(new LegacyGoogleGenerativeAI())).toThrow(/@google\/genai/i);
     expect(() => sdk.wrap(new LegacyGoogleGenerativeAI())).toThrow(/migrate/i);
     await sdk.shutdown(500);
+  });
+
+  it("stream attributes the resolved model, not the requested alias", async () => {
+    // Gemini resolves "-latest" and short aliases server-side and reports the
+    // real version as `model_version`. The stream wrapper rebuilt a usage-only
+    // payload and dropped it, reverting attribution to the requested alias.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeGoogleGenAI() as any);
+    const stream = (await client.models.generateContentStream({
+      model: "gemini-2.5-flash",
+      contents: "hi",
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
   });
 
   it("generateContentStream captures usage from final chunk", async () => {

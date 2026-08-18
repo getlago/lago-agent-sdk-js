@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest";
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 
+// What OpenAI resolves the requested "gpt-4o-mini" alias to. Streaming chunks
+// report it on every frame; the wrapper must carry it through to the event, or
+// pricing looks up an alias OpenRouter doesn't list.
+const RESOLVED_STREAM_MODEL = "gpt-4o-mini-2024-07-18";
+
 // ---------------------------------------------------------------------
 // Fake openai SDK that mimics the surface area of `openai` v4+:
 //   client.chat.completions.create(...)
@@ -24,10 +29,13 @@ class FakeCompletions {
     if (args?.stream === true) {
       // Stream yields several chunks; the LAST one carries usage (because
       // the wrapper auto-injects stream_options.include_usage:true).
+      // Every real chunk carries the RESOLVED model — a short alias like
+      // "gpt-4o-mini" comes back as a dated snapshot. Pricing keys off it.
       const chunks = [
-        { choices: [{ delta: { content: "hi" } }], usage: null },
+        { choices: [{ delta: { content: "hi" } }], usage: null, model: RESOLVED_STREAM_MODEL },
         {
           choices: [],
+          model: RESOLVED_STREAM_MODEL,
           usage: {
             prompt_tokens: 12,
             completion_tokens: 22,
@@ -182,6 +190,29 @@ describe("OpenAI wrapper — Chat Completions", () => {
     const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
     expect(map.llm_input_tokens).toBe(12);
     expect(map.llm_output_tokens).toBe(22);
+  });
+
+  it("stream attributes the resolved model, not the requested alias", async () => {
+    // The model-attribution fix has to reach the streaming path too. The wrapper
+    // rebuilds a synthetic usage payload from the chunks, and dropping the
+    // chunk's own `model` made `resolveModel` fall back to the requested alias —
+    // so a streamed call was attributed (and priced) as "gpt-4o-mini" while the
+    // identical non-streaming call correctly resolved to the dated snapshot. In
+    // price mode that means the OpenRouter lookup misses and silently degrades
+    // to token events.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeOpenAI());
+    const stream = (await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
   });
 
   it("auto-injects stream_options.include_usage when missing", async () => {

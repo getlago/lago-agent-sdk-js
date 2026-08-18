@@ -207,6 +207,113 @@ describe("EventQueue — permanent vs transient failures", () => {
 });
 
 // ----------------------------------------------------------------------
+// The throttling 4xxs. 429 and 408 sit inside the 400-499 range but mean "try
+// again, later" — classifying them as permanent dropped billable events and
+// aimed `maxBatchSize` extra requests at a server that had just asked us to
+// slow down.
+// ----------------------------------------------------------------------
+describe("EventQueue — throttling 4xx is transient", () => {
+  it.each([429, 408])("retries rather than drops a %i", async (status) => {
+    // Dropping loses revenue, and isolating one-by-one multiplies the load on
+    // a server that is already shedding it.
+    let attempts = 0;
+    const delivered: string[] = [];
+
+    const sender = async (batch: LagoEvent[]) => {
+      attempts++;
+      if (attempts === 1) throw new LagoApiError(status, '{"error":"too many requests"}');
+      for (const e of batch) delivered.push(e.transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      q.push(evId("a"));
+      q.push(evId("b"));
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && delivered.length === 0) await sleep(50);
+      expect(delivered).toEqual(["a", "b"]);
+      // Delivered as one batch, i.e. never fanned out into per-event requests.
+      expect(attempts).toBe(2);
+    } finally {
+      await q.shutdown(2000);
+    }
+  });
+
+  it.each([429, 408])("applies backoff on a %i", async (status) => {
+    // The inverse of "does not apply backoff after a permanent failure": a
+    // throttling failure is transient, so it MUST leave a backoff in place —
+    // that pause is the whole point of respecting a rate limit.
+    const sender = async () => {
+      throw new LagoApiError(status, "slow down");
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      q.push(evId("a"));
+      const deadline = Date.now() + 2000;
+      // @ts-expect-error — touch private backoffMs for test
+      while (Date.now() < deadline && q.backoffMs === 0) await sleep(50);
+      // @ts-expect-error — touch private backoffMs for test
+      expect(q.backoffMs).toBeGreaterThan(0);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it("treats an unrecognized 4xx as transient", async () => {
+    // Only the enumerated validation statuses are permanent. An unfamiliar 4xx
+    // errs toward retrying: a needless delay costs latency, a wrong drop costs
+    // revenue.
+    let attempts = 0;
+    const delivered: string[] = [];
+
+    const sender = async (batch: LagoEvent[]) => {
+      attempts++;
+      if (attempts === 1) throw new LagoApiError(418, "i am a teapot");
+      for (const e of batch) delivered.push(e.transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      q.push(evId("a"));
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && delivered.length === 0) await sleep(50);
+      expect(delivered).toEqual(["a"]);
+    } finally {
+      await q.shutdown(2000);
+    }
+  });
+
+  it.each([400, 401, 403, 404, 409, 422])("still isolates and drops on a %i", async (status) => {
+    // The statuses that genuinely cannot succeed on a re-send keep the
+    // isolate-one-by-one behaviour, so a single bad transaction_id still
+    // doesn't take the rest of its batch down with it.
+    const sentIndividually: string[] = [];
+
+    const sender = async (batch: LagoEvent[]) => {
+      if (batch.length > 1) throw new LagoApiError(status, "batch rejected");
+      const event = batch[0];
+      sentIndividually.push(event.transaction_id);
+      if (event.transaction_id.startsWith("bad")) {
+        throw new LagoApiError(status, "this one really is invalid");
+      }
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      q.push(evId("bad_1"));
+      q.push(evId("good_1"));
+      expect(await q.flush(2000)).toBe(true);
+      expect(new Set(sentIndividually)).toEqual(new Set(["bad_1", "good_1"]));
+      // @ts-expect-error — touch private backoffMs for test
+      expect(q.backoffMs).toBe(0);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+});
+
+// ----------------------------------------------------------------------
 // Shutdown's final drain. Previously: a single best-effort attempt at a
 // single batch, with any failure silently swallowed — a buffer holding
 // more than one batch's worth of events at shutdown time left the rest

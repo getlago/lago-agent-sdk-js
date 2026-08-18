@@ -94,6 +94,12 @@ const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
   "per M cached input tokens": "cache_read",
 };
 
+// The routing prefix the gateway's OpenAI-compatible `/compat` endpoint requires.
+// Cloudflare's catalog keys models as bare "@cf/...", so this comes off before a
+// lookup. Kept in sync with `adapters/openai_native.WORKERS_AI_COMPAT_PREFIX`, which
+// decides the provider from the same two spellings.
+const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
+
 // A real dated Mistral snapshot ends in a short numeric tag (e.g. "-2603",
 // "-2411", "-2508") — never a "-latest"-style moniker. Used to pick the one
 // genuine canonical name out of a family that mutually lists each other
@@ -430,9 +436,22 @@ export function parseCloudflareWorkersAi(models: unknown): Map<string, ModelPric
  * Exact match first; a version-suffix fallback covers the same drift we've
  * seen in practice — e.g. a live response naming a model "...instruct-v2"
  * when the catalog itself only lists "...instruct".
+ *
+ * The "workers-ai/" routing prefix comes off first. Cloudflare's catalog keys
+ * models as bare "@cf/...", but calling one through the gateway's `/compat`
+ * endpoint requires "workers-ai/@cf/..." — the form the README prescribes and the
+ * only form a streaming call can report. Without the strip, recognising the
+ * prefixed spelling as Workers AI upstream just moves the miss here.
  */
 export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model: string): ModelPrice | null {
-  return table.get(model) ?? table.get(stripVersion(model)) ?? null;
+  const bare = model.startsWith(WORKERS_AI_COMPAT_PREFIX)
+    ? model.slice(WORKERS_AI_COMPAT_PREFIX.length)
+    : model;
+  for (const candidate of bare === model ? [model] : [model, bare]) {
+    const hit = table.get(candidate) ?? table.get(stripVersion(candidate));
+    if (hit !== undefined) return hit;
+  }
+  return null;
 }
 
 // ----------------------------------------------------------------------

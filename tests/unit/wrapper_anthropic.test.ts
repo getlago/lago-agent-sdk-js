@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest";
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 
+// What Anthropic resolves the requested "claude-sonnet-4-6" alias to. Only
+// `message_start` reports it, so the wrapper has to keep it across the whole
+// stream or pricing looks up an alias OpenRouter doesn't list.
+const RESOLVED_STREAM_MODEL = "claude-sonnet-4-6-20260214";
+
 class FakeMessages {
   createCalls = 0;
   streamCalls = 0;
@@ -21,6 +26,9 @@ class FakeMessages {
         {
           type: "message_start",
           message: {
+            // message_start is also where the RESOLVED snapshot arrives — the
+            // requested alias never appears again.
+            model: RESOLVED_STREAM_MODEL,
             usage: {
               input_tokens: 12,
               cache_creation_input_tokens: 0,
@@ -124,6 +132,26 @@ describe("Anthropic wrapper", () => {
     await sdk.shutdown(1000);
     expect(received).toHaveLength(2);
     expect(fake.messages.createCalls).toBe(1);
+  });
+
+  it("stream attributes the resolved model, not the requested alias", async () => {
+    // Only `message_start` carries the resolved snapshot, and the wrapper
+    // accumulates usage across several events before emitting — so the model has
+    // to survive the whole stream. Rebuilding a usage-only payload reverted the
+    // attribution to the requested alias, which OpenRouter doesn't list.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeAnthropic());
+    const stream = (await client.messages.create({
+      model: "claude-sonnet-4-6",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
   });
 
   it("messages.create with stream=true merges message_start + message_delta usage", async () => {
