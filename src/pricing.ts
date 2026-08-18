@@ -459,15 +459,46 @@ export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model:
 // ----------------------------------------------------------------------
 
 /**
- * Prefer a dated snapshot id (what OpenRouter actually lists models under)
- * over a "-latest"-style moniker. Falls back to shortest-then-alphabetical
- * so the choice is always deterministic even with no dated candidate in
- * the group.
+ * Normalize a dated Mistral suffix to a comparable number; newest = largest.
+ *
+ * Mistral's own convention is a 4-digit YYMM ("-2411", "-2603"), but the regex
+ * admits 4-8 digits and mixed widths do NOT compare correctly as raw strings:
+ * "20241101" sorts *below* "2411" lexicographically. Widening YYMM to YYYYMM00
+ * puts both shapes on one scale.
+ */
+function mistralDateKey(name: string): number {
+  const m = MISTRAL_DATED_ID.exec(name);
+  if (m === null) return -1;
+  const digits = m[0].slice(1); // drop the leading "-"
+  if (digits.length === 4) return Number(`20${digits}00`); // YYMM -> 20YY-MM, day unknown
+  return Number(digits); // YYYYMMDD, or an unexpected width taken at face value
+}
+
+/**
+ * Prefer the NEWEST dated snapshot id (what OpenRouter actually lists models
+ * under) over a "-latest"-style moniker.
+ *
+ * Newest, not shortest. Every dated id in one family is the same length, so a
+ * shortest-then-alphabetical tie-break silently resolved on the DATE — and
+ * ascending: `mistral-large-2402` / `-2407` / `-2411` / `-latest` all collapsed
+ * onto `mistral-large-2402`, the OLDEST, so the whole family got priced at a
+ * two-year-old rate. `-2411` had matched OpenRouter directly before alias
+ * resolution existed, which makes that a regression rather than a gap.
+ *
+ * Falls back to shortest-then-code-point only when the group has no dated
+ * candidate at all, so the choice stays deterministic either way. Deliberately
+ * NOT `localeCompare`: that is ICU/locale-dependent, so it is not reproducible
+ * across environments and it made this port pick a different canonical than the
+ * Python one for the same input (`mistral_small_2603` vs `Mistral-Small-2603`,
+ * and the former normalizes onto a name OpenRouter does not list).
  */
 function pickMistralCanonical(names: string[]): string {
+  const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
   const dated = names.filter((n) => MISTRAL_DATED_ID.test(n));
-  const pool = dated.length > 0 ? dated : names;
-  return [...pool].sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+  if (dated.length > 0) {
+    return [...dated].sort((a, b) => mistralDateKey(b) - mistralDateKey(a) || byCodePoint(a, b))[0];
+  }
+  return [...names].sort((a, b) => a.length - b.length || byCodePoint(a, b))[0];
 }
 
 /**
@@ -533,7 +564,13 @@ export function parseMistralAliases(data: unknown): Map<string, string> {
     if (members.length < 2) continue; // no aliasing at all — nothing to resolve
     const canonical = pickMistralCanonical(members);
     for (const name of members) {
-      if (name !== canonical) result.set(name, canonical);
+      if (name === canonical) continue;
+      // An explicit dated snapshot is already the real id OpenRouter lists, so it
+      // must pass through untouched — never rewritten onto a sibling. Without this,
+      // requesting `mistral-large-2411` was remapped to the group's canonical and
+      // priced at THAT snapshot's rate instead of its own, a mispricing not a miss.
+      if (MISTRAL_DATED_ID.test(name)) continue;
+      result.set(name, canonical);
     }
   }
   return result;

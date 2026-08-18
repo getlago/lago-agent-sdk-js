@@ -456,6 +456,59 @@ describe("Mistral alias resolution", () => {
     expect(aliases.get("voxtral-small-latest")).toBe("voxtral-small-2507");
     expect(aliases.has("voxtral-small-2507")).toBe(false);
   });
+
+  const family = (names: string[]) => ({
+    data: names.map((n) => ({ id: n, aliases: names.filter((x) => x !== n) })),
+  });
+
+  it("a family resolves to the NEWEST dated snapshot", () => {
+    // Regression: the tie-break used to resolve on the date ASCENDING. Every
+    // dated id in one family is the same length, so `a.length - b.length` fell
+    // through to the alphabetical term — which for `-2402` / `-2407` / `-2411`
+    // is the date, oldest first. The whole family collapsed onto
+    // `mistral-large-2402` and got priced at a two-year-old rate.
+    const aliases = parseMistralAliases(
+      family(["mistral-large-2402", "mistral-large-2407", "mistral-large-2411", "mistral-large-latest"]),
+    );
+    expect(aliases.get("mistral-large-latest")).toBe("mistral-large-2411");
+  });
+
+  it("an explicit dated snapshot is never remapped", () => {
+    // An exact snapshot request is already the id OpenRouter lists, so it must
+    // pass through untouched. Remapping it onto the group's canonical priced it
+    // at a sibling's rate — a mispricing, not a miss.
+    const aliases = parseMistralAliases(
+      family(["mistral-large-2402", "mistral-large-2411", "mistral-large-latest"]),
+    );
+    expect(aliases.has("mistral-large-2402")).toBe(false);
+    expect(aliases.has("mistral-large-2411")).toBe(false);
+    expect(aliases.get("mistral-large-latest")).toBe("mistral-large-2411");
+  });
+
+  it.each([
+    // Mistral's own 4-digit YYMM convention.
+    [["m-2402", "m-2411", "m-latest"], "m-2411"],
+    // Mixed widths: "20250929" sorts BELOW "2411" as a raw string, so the
+    // normalization to one scale is what makes this come out right.
+    [["m-2411", "m-20250929", "m-latest"], "m-20250929"],
+  ])("picks the newest across suffix shapes: %s", (names, expected) => {
+    const aliases = parseMistralAliases(family(names as string[]));
+    expect(aliases.get("m-latest")).toBe(expected);
+  });
+
+  it("orders by code point, not locale", () => {
+    // Cross-repo parity: `localeCompare` is ICU/locale-dependent, so it is not
+    // reproducible across environments AND it made this port pick a different
+    // canonical than Python for the same input — `mistral_small_2603`, which
+    // normalizes onto a name OpenRouter does not list, instead of
+    // `Mistral-Small-2603`, which does.
+    const aliases = parseMistralAliases(family(["mistral-small-2603", "Mistral-Small-2603"]));
+    expect([...aliases.values()]).toEqual([]); // both are dated -> both pass through
+    const withAlias = parseMistralAliases(
+      family(["mistral-small-2603", "Mistral-Small-2603", "mistral-small-latest"]),
+    );
+    expect(withAlias.get("mistral-small-latest")).toBe("Mistral-Small-2603");
+  });
 });
 
 // ---------- money + golden parity ----------
