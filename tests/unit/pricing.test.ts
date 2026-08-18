@@ -1200,7 +1200,9 @@ describe("SDK price mode", () => {
   it("eventId is suffixed per field in token mode", async () => {
     // Token mode can push several events from one call (input, output,
     // ...); reusing the same eventId verbatim for all of them would
-    // collide, so each field gets its own suffix off the same base id.
+    // collide, so each field gets its own suffix off the same base id — in
+    // the `_tok_` namespace, which keeps it distinct from the cost path's
+    // suffix for the same field.
     const received: LagoEvent[] = [];
     const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: "sub_default" });
     sdk._setSender(async (b) => {
@@ -1219,8 +1221,46 @@ describe("SDK price mode", () => {
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
     expect(new Set(received.map((e) => e.transaction_id))).toEqual(
-      new Set(["backfill_01ABC_input", "backfill_01ABC_output"]),
+      new Set(["backfill_01ABC_tok_input", "backfill_01ABC_tok_output"]),
     );
+  });
+
+  it("token-fallback and cost ids never collide for one eventId", async () => {
+    // The bug this namespacing exists for. A price miss falls back to token
+    // events; the SAME window re-run once the table is warm takes the cost
+    // path. Under one shared namespace both emitted `{eventId}_input`, so Lago
+    // rejected the second as a duplicate — and since `/events/batch` is
+    // all-or-nothing, that rejection failed every other event in the batch too.
+    // The dollar amounts for that window were never billed, only the raw token
+    // counts, and nothing surfaced it.
+    const usage = makeCanonicalUsage({
+      input: 10,
+      output: 5,
+      model: "claude-opus-4-8",
+      provider: "anthropic",
+      api: "native",
+    });
+
+    // Run 1: cold table -> price miss -> token fallback, same eventId.
+    const cold = priceSdk(new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 }));
+    cold.sdk.emit(usage, { eventId: "backfill_01ABC" });
+    expect(await cold.sdk.flush(2000)).toBe(true);
+    await cold.sdk.shutdown(1000);
+    const coldIds = new Set(cold.received.map((e) => e.transaction_id));
+
+    // Run 2: warm table -> real per-field cost events, same eventId.
+    const warm = priceSdk(await warmProvider());
+    warm.sdk.emit(usage, { eventId: "backfill_01ABC" });
+    expect(await warm.sdk.flush(2000)).toBe(true);
+    await warm.sdk.shutdown(1000);
+    const warmIds = new Set(warm.received.map((e) => e.transaction_id));
+
+    expect(coldIds.size).toBeGreaterThan(0);
+    expect(warmIds.size).toBeGreaterThan(0);
+    const overlap = [...coldIds].filter((i) => warmIds.has(i));
+    expect(overlap).toEqual([]);
+    expect([...coldIds].every((i) => i.includes("_tok_"))).toBe(true);
+    expect([...warmIds].every((i) => i.includes("_cost_"))).toBe(true);
   });
 
   it("no eventId still falls back to a random id — works exactly as before this option existed", async () => {

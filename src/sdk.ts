@@ -54,10 +54,24 @@ export interface WrapOptions {
    * random UUID — pass the source log entry's own id when replaying/
    * backfilling from a gateway's logs, so re-running against the same
    * window never double-bills. A live, one-shot call has no natural id to
-   * reuse and should leave this unset. In token mode (which can push
-   * several events from one call) and in price mode's per-`token_type`
-   * split, each field's event gets a `${eventId}_${fieldName}` suffix so
-   * they don't collide with each other.
+   * reuse and should leave this unset.
+   *
+   * Both multi-event paths suffix per field so they don't collide with each
+   * other, and they use DIFFERENT namespaces so they can't collide across
+   * modes either:
+   *
+   *   - token events      `${eventId}_tok_${fieldName}`
+   *   - split cost events `${eventId}_cost_${fieldName}`
+   *   - single cost event `eventId` (one event, nothing to disambiguate)
+   *
+   * The namespaces are load-bearing. Both paths are reachable for the SAME
+   * `eventId`: a price lookup that misses falls back to token events, and the
+   * same window re-run once the table is warm takes the cost path. Under one
+   * shared namespace the second run re-sent `{eventId}_input` under a different
+   * metric code, Lago rejected it as a duplicate — and because `/events/batch`
+   * is all-or-nothing, that rejection failed every other event in the batch
+   * too. Net effect: the dollar amounts for that window were never billed, only
+   * the raw token counts, and nothing surfaced it.
    */
   eventId?: string;
 }
@@ -320,7 +334,11 @@ export class LagoSDK {
       const code = this.config.metricCodes[field];
       if (!code) continue;
       this.queue.push({
-        transaction_id: eventId ? `${eventId}_${field}` : randomUUID(),
+        // `_tok_` namespace: the cost path suffixes with the same field
+        // vocabulary, and both are reachable for one `eventId` (price miss ->
+        // token fallback, then the cost path once the table is warm). See
+        // EmitOpts.eventId for what a shared namespace cost.
+        transaction_id: eventId ? `${eventId}_tok_${field}` : randomUUID(),
         external_subscription_id: sub,
         code,
         timestamp: now,
@@ -373,6 +391,8 @@ export class LagoSDK {
 
     if (Object.keys(breakdown.fields).length === 0) {
       this.queue.push({
+        // Unsuffixed: this branch pushes exactly ONE event, so there is nothing
+        // to disambiguate. It cannot collide with the namespaced multi-event ids.
         transaction_id: eventId || randomUUID(),
         external_subscription_id: sub,
         code: this.config.costMetricCode,
@@ -394,7 +414,8 @@ export class LagoSDK {
       // from every split event.
       const billedCost = applyMarkup(parts.cost, breakdown.markup);
       this.queue.push({
-        transaction_id: eventId ? `${eventId}_${fieldName}` : randomUUID(),
+        // `_cost_` namespace — see the `_tok_` note in emitTokenEvents.
+        transaction_id: eventId ? `${eventId}_cost_${fieldName}` : randomUUID(),
         external_subscription_id: sub,
         code: this.config.costMetricCode,
         timestamp: now,
