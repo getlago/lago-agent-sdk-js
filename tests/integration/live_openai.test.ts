@@ -122,24 +122,42 @@ describe.skipIf(SKIP)("Live OpenAI", () => {
     }
   });
 
-  it("o-series reasoning model — emits llm_reasoning_tokens", async () => {
+  it("o-series reasoning model — emits llm_reasoning_tokens", async (ctx) => {
+    // Asserted against what the PROVIDER reported, not against the model choosing
+    // to reason. `o4-mini` spends a variable number of reasoning tokens on the same
+    // prompt — measured 0 on some calls and non-zero on others, minutes apart — and
+    // since the SDK only emits non-zero fields, a hardcoded assertion made this a
+    // coin flip. It failed and passed on identical input in both repos, alternating
+    // between them, which is exactly the noise that hides a real regression.
+    //
+    // The SDK's contract is "emit reasoning tokens WHEN the provider reports them",
+    // so that is what this checks; a call the model answered without reasoning has
+    // nothing to assert.
     const lago = await spawnMockLago();
     try {
       const OpenAIMod = await import("openai");
       const OpenAI = OpenAIMod.default;
       const sdk = new LagoSDK({ apiKey: "x", apiUrl: lago.url, defaultSubscriptionId: "sub_int" });
       const client = sdk.wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY! }));
-      await client.chat.completions.create({
+      const resp: any = await client.chat.completions.create({
         model: "o4-mini",
         messages: [{ role: "user", content: "What is 17 * 23? Just the number." }],
         max_completion_tokens: 2000,
       });
+      const reported = Number(resp?.usage?.completion_tokens_details?.reasoning_tokens ?? 0) || 0;
       expect(await sdk.flush(30000)).toBe(true);
       await sdk.shutdown(2000);
       const codes = new Set(lago.received.map((e) => e.code));
       expect(codes.has("llm_input_tokens")).toBe(true);
       expect(codes.has("llm_output_tokens")).toBe(true);
+      if (reported === 0) {
+        // Skip rather than return: a silent pass would hide that the reasoning
+        // assertion never ran. Mirrors the Python port's `pytest.skip`.
+        ctx.skip();
+      }
       expect(codes.has("llm_reasoning_tokens")).toBe(true);
+      const ev = lago.received.find((e) => e.code === "llm_reasoning_tokens")!;
+      expect(parseInt(String(ev.properties.value), 10)).toBe(reported);
     } finally {
       await lago.close();
     }
