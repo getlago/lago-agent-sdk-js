@@ -16,7 +16,7 @@ export {
   UnknownClientError,
 } from "./exceptions.js";
 
-export { HttpPricingFetcher, PricingProvider, computeCost } from "./pricing.js";
+export { TOKEN_BILLED_PROVIDERS, HttpPricingFetcher, PricingProvider, computeCost } from "./pricing.js";
 export type { CostBreakdown, ModelPrice, PricingFetcher } from "./pricing.js";
 
 export {

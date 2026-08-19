@@ -37,6 +37,7 @@
  */
 import { extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
+import { RAMP_ROUTER_PROVIDER } from "../ramp_router_ids.js";
 
 const INSTRUMENTED = Symbol.for("lago_instrumented_openai");
 
@@ -141,12 +142,83 @@ function ensureStreamOptionsIncludeUsage(opts: Record<string, unknown> | undefin
   }
 }
 
+// A Databricks-HOSTED foundation model answers on the unified mlflow surface. It
+// has to be told apart from an OpenAI-BYOK call, which uses the SAME OpenAI class
+// against `/ai-gateway/openai/v1` — and the response gives no clue: a hosted call
+// echoes a served-entity name ("meta-llama-4-maverick-040225") with no
+// distinguishing marker, so inferProvider's model-string rule cannot see it.
+// `baseURL` is the only signal, and only the wrapper has it.
+//
+// Matching `/ai-gateway/mlflow/` specifically, NOT `/ai-gateway/`, is the whole
+// point: the openai and anthropic surfaces live under the same prefix and must keep
+// their real vendor provider so they price against OpenRouter.
+const DATABRICKS_HOSTED_PATH = "/ai-gateway/mlflow/";
+
+// Ramp Router (https://docs.router.com/api/endpoint) fronts many providers behind one
+// OpenAI-Responses surface at `https://api.router.com/v1`. Like the Databricks hosted
+// path, the response body cannot identify it: Router echoes an OpenAI-shaped Response
+// whose `model` is a Router id, so `inferProvider`'s model-string rule would stamp it
+// "openai" and price a Fireworks-served DeepSeek call at OpenAI's rate. `baseURL` is
+// again the only signal, and only the wrapper has it.
+//
+// Matched on the HOSTNAME, not as a substring of the whole URL: a plain
+// `url.includes("api.router.com")` also fires on an unrelated base URL that merely
+// carries the string in a path or query, and stamping a non-Router call as Router
+// prices it against the wrong catalog entirely.
+const RAMP_ROUTER_HOST = "api.router.com";
+
+/** Hostname of a base URL, lowercased, or "" if it is not a parseable absolute URL. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Return a provider override implied by the client's baseURL, or "".
+ *
+ * "databricks" matches no vendor in pricing's VENDOR_MAP, so a hosted call CANNOT
+ * hit a price table. `emit()` then emits token counts via TOKEN_BILLED_PROVIDERS with
+ * no error reported — that is the complete answer for these models, not a fallback.
+ * Deliberate: Databricks bills them in DBUs
+ * against its own rate card, which is published only as HTML and exists in no
+ * system table, while OpenRouter DOES list bare `openai/gpt-oss-20b` and
+ * `meta-llama/llama-4-maverick` at 0.2-0.4x of Databricks' real rate. Left as
+ * "openai", a rename of the served entity to an 8-digit date suffix would let
+ * stripVersion strip it into a match and silently under-bill 2.5-5x. Stamping
+ * "databricks" turns that accident into a guaranteed honest miss.
+ *
+ * "ramp_router" is stamped for the same structural reason and priced against Router's
+ * own published rate card, because Router is what bills the customer. It matches no
+ * vendor in VENDOR_MAP either, so until that catalog resolves a given id the call
+ * falls back to token events rather than being priced as OpenAI.
+ *
+ * KNOWN LIMITATION, documented rather than guessed at: Router's base URL is
+ * configurable (`RAMP_ROUTER_BASE_URL`), so a customer pointing at a regional or
+ * self-hosted Router host is not recognized here and bills as plain OpenAI. Detecting
+ * that needs a signal the response does not carry; a config-driven override is the
+ * seam for it, not a looser host match.
+ */
+export function providerHintFor(client: unknown): string {
+  try {
+    const url = String((client as { baseURL?: unknown })?.baseURL ?? "");
+    if (url.includes(DATABRICKS_HOSTED_PATH)) return "databricks";
+    if (hostOf(url) === RAMP_ROUTER_HOST) return RAMP_ROUTER_PROVIDER;
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 export function wrapOpenAIClient<T extends OpenAILike>(
   sdk: SDKLike,
   client: T,
   opts: WrapOpenAIOptions = {},
 ): T {
   const c = client as unknown as Record<symbol, unknown>;
+  const providerHint = providerHintFor(client);
   if (c[INSTRUMENTED]) return client;
 
   const baseDims = { ...(opts.dimensions || {}) };
@@ -161,7 +233,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
 
   const emitFrom = (payload: unknown, modelId: string, emitOpts: EmitOpts) => {
     try {
-      const usage = extractOpenAINative(payload, modelId);
+      const usage = extractOpenAINative(payload, modelId, providerHint);
       sdk.emit(usage, emitOpts);
     } catch (err) {
       if (typeof console !== "undefined") {
@@ -216,7 +288,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                       emitFrom(value, modelId, emitOpts);
                     }
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
+                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
                   }
                 } catch {
                   /* never break the call */
@@ -312,6 +384,7 @@ async function* wrapAsyncIterableStream(
   sdk: SDKLike,
   modelId: string,
   opts: EmitOpts,
+  providerHint: string = "",
 ): AsyncIterable<unknown> {
   let lastUsage: Record<string, unknown> | null = null;
   try {
@@ -332,7 +405,7 @@ async function* wrapAsyncIterableStream(
   } finally {
     if (lastUsage) {
       try {
-        const usage = extractOpenAINative(lastUsage, modelId);
+        const usage = extractOpenAINative(lastUsage, modelId, providerHint);
         sdk.emit(usage, opts);
       } catch {
         /* swallow */

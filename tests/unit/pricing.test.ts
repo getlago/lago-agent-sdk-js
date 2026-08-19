@@ -1265,6 +1265,92 @@ describe("SDK price mode", () => {
     expect(errors).toContain("PricingUnavailableError");
   });
 
+  it("token-billed provider emits tokens without reporting an error", async () => {
+    // A Databricks-hosted model has no per-token rate anywhere — not a cold table, not
+    // an unmatched name, none exists. So token counts are the complete answer, and
+    // calling that a failure on every request trains the reader to ignore onError.
+    const errors: string[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 11,
+        output: 4,
+        model: "meta-llama-4-maverick-040225",
+        provider: "databricks",
+        api: "chat_completions",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(errors).toEqual([]);
+  });
+
+  it("still reports a real price miss", async () => {
+    // The narrow exception above must not become a blanket silence: an unmatched model
+    // on a provider that DOES publish rates is a genuine miss the customer can act on.
+    const errors: string[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async () => {});
+    sdk.emit(makeCanonicalUsage({ input: 5, model: "no-such-model", provider: "anthropic", api: "native" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(errors).toContain("PricingUnavailableError");
+  });
+
+  it("notes a token-billed provider once per model, not once per call", async () => {
+    // It is a standing fact about the provider, not an event about this call.
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const { sdk } = priceSdk(await warmProvider());
+      for (let i = 0; i < 3; i++) {
+        sdk.emit(
+          makeCanonicalUsage({ input: 1, model: "llama-4-maverick", provider: "databricks", api: "x" }),
+        );
+      }
+      sdk.emit(makeCanonicalUsage({ input: 1, model: "gpt-oss-20b", provider: "databricks", api: "x" }));
+      await sdk.shutdown(1000);
+      const notes = spy.mock.calls.filter((c) => String(c[0]).includes("in its own units"));
+      expect(notes).toHaveLength(2); // one per distinct model
+      expect(notes.some((c) => String(c[0]).includes("llama-4-maverick"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still prices BYOK traffic through the same gateway", async () => {
+    // TOKEN_BILLED_PROVIDERS keys on provider, so it covers Databricks-HOSTED models
+    // only — BYOK traffic through the same gateway is stamped with the real vendor and
+    // must keep pricing normally.
+    const { sdk, received } = priceSdk(await warmProvider());
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 100,
+        output: 50,
+        model: "claude-opus-4.8",
+        provider: "anthropic",
+        api: "native",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect([...new Set(received.map((e) => e.code))]).toEqual(["llm_cost"]);
+  });
+
   it("per-call mode='price' overrides global tokens default", async () => {
     const received: LagoEvent[] = [];
     const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: "sub_default" }); // global tokens
@@ -1555,5 +1641,65 @@ describe("SDK price mode", () => {
     expect(fetcher.mistralAliasesCalls).toBe(1);
     expect(provider.lookup("mistral", "mistral-small-latest", "native")).not.toBeNull();
     await sdk.shutdown(1000);
+  });
+});
+
+describe("date-suffix shapes — both vendors' conventions must strip", () => {
+  // OpenRouter lists BARE ids for the current OpenAI lineup; the API returns dated
+  // ones. `resolveModel` prefers the response's own name, so the dated form is what
+  // reaches lookup.
+  const BARE_OPENAI = parseOpenRouter({
+    data: ["gpt-4.1", "gpt-4.1-mini", "gpt-5", "gpt-5-mini", "o3", "o4-mini"].map((m) => ({
+      id: `openai/${m}`,
+      pricing: { prompt: "0.000001", completion: "0.000002" },
+    })),
+  });
+
+  it.each([
+    "gpt-4.1-2025-04-14",
+    "gpt-4.1-mini-2025-04-14",
+    "gpt-5-2025-08-07",
+    "gpt-5-mini-2025-08-07",
+    "o3-2025-04-16",
+    "o4-mini-2025-04-16",
+  ])("OpenAI hyphenated date suffix strips to a hit: %s", (dated) => {
+    // OpenAI stamps HYPHENATED dates ("gpt-5-2025-08-07"), Anthropic COMPACT ones
+    // ("claude-sonnet-4-5-20250929"). Handling only the compact shape silently broke
+    // price mode for every current OpenAI model — all six of these missed and fell
+    // back to token events. Verified against the live 400-model OpenRouter table
+    // before and after.
+    expect(lookupOpenRouter(BARE_OPENAI, "openai", dated)).not.toBeNull();
+  });
+
+  it.each([
+    ["claude-sonnet-4-5-20250929", "anthropic/claude-sonnet-4.5"],
+    ["claude-haiku-4-5-20251001", "anthropic/claude-haiku-4.5"],
+    ["claude-opus-4-5-20251101", "anthropic/claude-opus-4.5"],
+  ])("Anthropic compact date suffix still strips: %s", (dated, bare) => {
+    // Regression guard: widening the pattern must not break the compact form.
+    const t = parseOpenRouter({ data: [{ id: bare, pricing: { prompt: "0.000003" } }] });
+    expect(lookupOpenRouter(t, "anthropic", dated)).not.toBeNull();
+  });
+
+  it("a non-date suffix is not stripped", () => {
+    // `gpt-5.6-sol` resolves with a `-sol` suffix that is neither a date nor a
+    // version tag. It must be left intact — OpenRouter lists it verbatim, so
+    // stripping would turn a hit into a miss.
+    const t = parseOpenRouter({ data: [{ id: "openai/gpt-5.6-sol", pricing: { prompt: "0.000005" } }] });
+    expect(lookupOpenRouter(t, "openai", "gpt-5.6-sol")).not.toBeNull();
+  });
+
+  it("workers-ai model names are never date-stripped", () => {
+    // Workers AI ids carry dotted versions and fp8 suffixes, not dates. The widened
+    // pattern must leave them untouched or the Cloudflare catalog lookup breaks.
+    const cf = parseCloudflareWorkersAi([
+      {
+        name: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        properties: [
+          { property_id: "price", value: [{ currency: "USD", unit: "per M input tokens", price: 0.29 }] },
+        ],
+      },
+    ]);
+    expect(lookupCloudflareWorkersAi(cf, "@cf/meta/llama-3.3-70b-instruct-fp8-fast")).not.toBeNull();
   });
 });

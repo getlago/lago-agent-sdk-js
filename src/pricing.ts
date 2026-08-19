@@ -62,8 +62,38 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // Omitting it billed the cached tokens twice: once at the full input rate
 // because they were never subtracted, and again at the cache-read rate, which
 // Cloudflare's catalog does publish for some models.
-const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
+//
+// "mistral" belongs here for the same reason: the API is OpenAI-shaped and
+// reports `prompt_tokens_details.cached_tokens` as a SUBSET of `prompt_tokens`.
+// Mistral's own documented example is unambiguous — prompt_tokens=1013,
+// cached_tokens=1008, total_tokens=1043 = prompt + completion, which only
+// reconciles if the cached tokens sit inside the prompt count. Omitting it
+// double-billed the cached portion by 6.15x on that payload. 13 of 18 Mistral
+// models on OpenRouter publish a cache-read rate, so the wrong path was
+// reachable for most of them, including Mistral traffic routed through a
+// Cloudflare gateway (the gateway adapter leaves provider="mistral" as-is).
+const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai", "mistral"]);
 const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
+
+// Providers this SDK bills as TOKEN COUNTS by design, even in price mode — because no
+// per-token rate for them exists anywhere the SDK could read it.
+//
+// "databricks" means a Databricks-HOSTED foundation model (`system.ai.*`). Databricks
+// bills those in DBUs at a per-model rate published only as an HTML page — verified
+// absent from every column of all 88 system tables — so there is nothing to look up now
+// and nothing a later refresh could supply. Token counts are the honest, complete answer
+// for them, not a degraded one.
+//
+// This is a deliberate, NARROW exception to "a price miss is reported via onError". It
+// applies only where the miss is *structural and permanent*. A cold table, an unmatched
+// model name, a mistyped provider — all still report, because those are genuine misses a
+// customer can act on. Reporting this one on every call would be a permanent false
+// alarm, and an alarm that always fires is one nobody reads.
+//
+// Note this keys on the PROVIDER, so it only ever covers Databricks-hosted models: BYOK
+// traffic through the same gateway is stamped "openai"/"anthropic" and prices normally
+// (verified exact against Databricks' own metered spend, 38 of 38 buckets).
+export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set(["databricks"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -210,14 +240,34 @@ function alnum(s: string): string {
 /**
  * Strip a trailing version/revision marker OpenRouter usually omits from its ids.
  *
- * Shapes seen live: Anthropic's compact date ("-20250929"), an explicit "-v2", and
- * Gemini's 3-digit revision ("-002", which `model_version` can report where
- * OpenRouter lists only the bare name). Verified safe against the live 415-model
- * catalog: ZERO ids have a model part ending in exactly three digits, so the
- * "-\d{3}" arm cannot shorten a real listing.
+ * FOUR shapes, each arm added by a separate measured miss. OpenRouter lists the BARE
+ * id ("openai/gpt-5"), so a name we cannot strip back to bare never matches:
+ *
+ *   -\d{8}           Anthropic's COMPACT date ("claude-sonnet-4-5-20250929").
+ *   -\d{4}-\d{2}-\d{2}  OpenAI's HYPHENATED date ("gpt-5-2025-08-07", "o3-2025-04-16").
+ *   -\d{3}           Gemini's 3-digit revision ("-002", which `model_version` can
+ *                    report where OpenRouter lists only the bare name).
+ *   -v\d+            an explicit "-v2".
+ *
+ * Handling only the compact form silently broke price mode for every current OpenAI
+ * model: `create({model: "gpt-5"})` returns model="gpt-5-2025-08-07", and
+ * `resolveModel` prefers the response's own name over the requested one, so
+ * gpt-4.1 / gpt-4.1-mini / gpt-5 / gpt-5-mini / o3 / o4-mini all fell through to
+ * token events. gpt-4o looked fine only by luck — OpenRouter happens to list
+ * "openai/gpt-4o-2024-08-06" verbatim.
+ *
+ * The "-\d{3}" arm is verified safe against the live 415-model catalog: ZERO ids have
+ * a model part ending in exactly three digits, so it cannot shorten a real listing.
+ * The two date arms cannot collide with it either — both require more than three
+ * trailing digits, and alternation is ordered longest-first — so a 4-digit Mistral
+ * snapshot tag ("mistral-medium-2508") survives all four arms untouched.
+ *
+ * Reconciliation note: the hyphenated-date arm and the 3-digit arm were added on
+ * separate connector branches and only ever existed one at a time. Dropping either
+ * on merge silently restores that branch's miss, so both are kept.
  */
 function stripVersion(model: string): string {
-  return model.replace(/-(?:\d{8}|\d{3}|v\d+)$/, "");
+  return model.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{3}|v\d+)$/, "");
 }
 
 // ----------------------------------------------------------------------

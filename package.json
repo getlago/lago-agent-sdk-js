@@ -11,6 +11,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./gateway": {
+      "import": "./dist/gateway/index.js",
+      "types": "./dist/gateway/index.d.ts"
+    },
     "./gateway/adapters": {
       "import": "./dist/gateway/adapters/index.js",
       "types": "./dist/gateway/adapters/index.d.ts"
