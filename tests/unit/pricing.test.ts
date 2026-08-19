@@ -1,6 +1,6 @@
 /** Pricing — matching, money math, provider cache, and SDK price mode. */
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage } from "../../src/index.js";
 import { extractOpenAINative } from "../../src/adapters/openai_native.js";
@@ -481,6 +481,80 @@ describe("de-overlapped token total (precomputed `unit` basis)", () => {
     await single.sdk.shutdown(1000);
     expect(single.received).toHaveLength(1);
     expect(parseInt(String(single.received[0].properties.unit), 10)).toBe(splitTotal);
+  });
+});
+
+describe("Cloudflare catalog fetch — pagination and malformed entries", () => {
+  const priced = (name: string) => ({
+    name,
+    properties: [
+      { property_id: "price", value: [{ unit: "per M input tokens", price: 1.0, currency: "USD" }] },
+    ],
+  });
+
+  const pages = (counts: number[], totalCount: number | null) =>
+    counts.map((n, i) => ({
+      result: Array.from({ length: n }, (_, j) => priced(`@cf/m/p${i + 1}-${j}`)),
+      result_info: {
+        page: i + 1,
+        per_page: 50,
+        count: n,
+        ...(totalCount === null ? {} : { total_count: totalCount }),
+      },
+    }));
+
+  async function runFetch(body: ReturnType<typeof pages>) {
+    const seen: number[] = [];
+    vi.stubGlobal("fetch", async (url: string) => {
+      const page = Number(new URL(url).searchParams.get("page") ?? 1);
+      seen.push(page);
+      const b = page - 1 < body.length ? body[page - 1] : { result: [], result_info: {} };
+      return { ok: true, status: 200, json: async () => b } as unknown as Response;
+    });
+    try {
+      const f = new HttpPricingFetcher(10_000, "acct", "tok");
+      const table = await f.fetchCloudflareWorkersAi();
+      return { size: table.size, seen };
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("an entry with null properties does not unprice everything", () => {
+    // Only the malformed entry is dropped; a sibling must survive.
+    const table = parseCloudflareWorkersAi([
+      { name: "@cf/broken/model", properties: null },
+      priced("@cf/good/model"),
+    ]);
+    expect(table.has("@cf/good/model")).toBe(true);
+    expect(table.has("@cf/broken/model")).toBe(false);
+  });
+
+  it("walks until a short page — matching the real endpoint's 50 then 14", async () => {
+    const { size, seen } = await runFetch(pages([50, 14], 291));
+    expect(seen).toEqual([1, 2]);
+    expect(size).toBe(64);
+  });
+
+  it("survives a missing total_count", async () => {
+    // The bug: total_count falling back to models.length made an absent count break
+    // after page one, silently keeping 50 of the 64 available.
+    const { size, seen } = await runFetch(pages([50, 14], null));
+    expect(seen).toEqual([1, 2]);
+    expect(size).toBe(64);
+  });
+
+  it("ignores a wrong total_count", async () => {
+    // Measured live: the endpoint reports total_count=291 while serving 64.
+    const { size } = await runFetch(pages([50, 14], 291));
+    expect(size).toBe(64);
+  });
+
+  it("is bounded", async () => {
+    // Runs on the queue's flush tick ahead of the drain, so an endpoint that always
+    // returns a full page must not stall event delivery.
+    const { seen } = await runFetch(pages(Array(60).fill(50), 100000));
+    expect(seen.length).toBeLessThanOrEqual(40);
   });
 });
 

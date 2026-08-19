@@ -100,6 +100,13 @@ const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
 // decides the provider from the same two spellings.
 const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
 
+// Cloudflare's catalog page size, and a hard bound on the paging loop. The loop runs
+// on the queue's flush tick ahead of the drain, so it must terminate even if the
+// endpoint keeps returning full pages. 40 pages covers ~2000 models against a real
+// catalog of 64.
+const CF_PER_PAGE = 50;
+const CF_MAX_PAGES = 40;
+
 // A real dated Mistral snapshot ends in a short numeric tag (e.g. "-2603",
 // "-2411", "-2508") — never a "-latest"-style moniker. Used to pick the one
 // genuine canonical name out of a family that mutually lists each other
@@ -795,14 +802,32 @@ export class HttpPricingFetcher implements PricingFetcher {
     const headers = { Authorization: `Bearer ${this.cloudflareApiToken}` };
     const models: unknown[] = [];
     let page = 1;
-    while (true) {
-      const url = `${cloudflareModelsUrl(this.cloudflareAccountId)}?per_page=50&page=${page}`;
+    for (;;) {
+      const url = `${cloudflareModelsUrl(this.cloudflareAccountId)}?per_page=${CF_PER_PAGE}&page=${page}`;
       const body = (await this.getJson(url, headers)) as Record<string, unknown>;
       const batch = Array.isArray(body.result) ? body.result : [];
-      models.push(...batch);
-      const resultInfo = isObj(body.result_info) ? body.result_info : {};
-      const total = typeof resultInfo.total_count === "number" ? resultInfo.total_count : models.length;
-      if (batch.length < 50 || models.length >= total) break;
+      // `push(...batch)` spreads every element as an argument, which throws
+      // RangeError once a batch is large enough — on exactly the one-wide-read
+      // pattern this is used for. A loop has no argument ceiling.
+      for (const m of batch) models.push(m);
+      // A SHORT page is the only reliable end-of-catalog signal here.
+      // `result_info.total_count` is not: measured live it reports 291 while the
+      // endpoint serves 64 (50 then 14 then 0), so a `models.length >= total` test
+      // never fires. It must also never fall back to `models.length` — that made an
+      // ABSENT total_count break after page one, silently keeping 50 of the 64
+      // available.
+      if (batch.length < CF_PER_PAGE) break;
+      if (page >= CF_MAX_PAGES) {
+        // Bounded because this runs on the queue's flush tick, ahead of the drain —
+        // an endpoint that always returns a full page must not stall event delivery
+        // indefinitely. Truncation is reported rather than silent, since a short
+        // catalog reads as "these models are unpriced".
+        console.warn(
+          `[lago] cloudflare model catalog truncated at ${CF_MAX_PAGES} pages ` +
+            `(${models.length} models); prices for later models are unavailable`,
+        );
+        break;
+      }
       page++;
     }
     return parseCloudflareWorkersAi(models);
