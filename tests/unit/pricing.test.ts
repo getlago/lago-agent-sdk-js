@@ -11,6 +11,7 @@ import {
   coerceMarkup,
   computeCost,
   computePrecomputedCost,
+  deoverlappedTokenTotal,
   HttpPricingFetcher,
   moneyStrToCents,
   lookupBedrock,
@@ -392,6 +393,52 @@ describe("Cloudflare Workers AI matching", () => {
 });
 
 // ---------- Mistral alias resolution ----------
+describe("de-overlapped token total (precomputed `unit` basis)", () => {
+  it.each([
+    // Ancor's cited case: a real captured Gemini row. `input + output` dropped 852
+    // additive reasoning tokens and published unit="30" for 882 consumed.
+    [{ input: 9, output: 21, reasoning: 852, provider: "gemini" }, 882],
+    // Cache-inclusive provider: cache_read sits INSIDE input, so counting both doubles it.
+    [{ input: 10000, output: 100, cache_read: 9000, provider: "openai" }, 10100],
+    // Additive provider: cache_read/cache_write are real extra consumption — the old
+    // basis under-reported this one by 9.6x.
+    [{ input: 1000, output: 100, cache_read: 9000, cache_write: 500, provider: "anthropic" }, 10600],
+    // reasoning ⊆ output for openai — must not be added on top.
+    [{ input: 10, output: 100, reasoning: 80, provider: "openai" }, 110],
+    // tool_calls is a CALL COUNT, not tokens, so it must never land in a token total.
+    [{ input: 10, output: 20, tool_calls: 3, provider: "openai" }, 30],
+  ])("%o -> %i", (fields, expected) => {
+    expect(deoverlappedTokenTotal(makeCanonicalUsage(fields as any))).toBe(expected);
+  });
+
+  it("precomputed unit matches the split path basis", async () => {
+    // The two cost branches must report the same quantity for one call — that was
+    // the actual complaint: `unit` on the single-event path used a different basis
+    // from `parts.tokens` on the split path.
+    const usage = makeCanonicalUsage({
+      input: 1000,
+      output: 100,
+      cache_read: 900,
+      model: "claude-opus-4-8",
+      provider: "anthropic",
+      api: "native",
+    });
+
+    const split = priceSdk(await warmProvider());
+    split.sdk.emit(usage);
+    expect(await split.sdk.flush(2000)).toBe(true);
+    await split.sdk.shutdown(1000);
+    const splitTotal = split.received.reduce((a, e) => a + parseInt(String(e.properties.unit), 10), 0);
+
+    const single = priceSdk(await warmProvider());
+    single.sdk.emit(usage, { usdCost: 0.05 });
+    expect(await single.sdk.flush(2000)).toBe(true);
+    await single.sdk.shutdown(1000);
+    expect(single.received).toHaveLength(1);
+    expect(parseInt(String(single.received[0].properties.unit), 10)).toBe(splitTotal);
+  });
+});
+
 describe("Mistral alias resolution", () => {
   it("parses the real alias shape", () => {
     const aliases = parseMistralAliases(MISTRAL_MODELS_RAW);

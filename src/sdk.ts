@@ -14,6 +14,7 @@ import {
   coerceMarkup,
   computeCost,
   computePrecomputedCost,
+  deoverlappedTokenTotal,
   moneyStrToCents,
 } from "./pricing.js";
 import { EventQueue } from "./queue.js";
@@ -422,7 +423,14 @@ export class LagoSDK {
         precise_total_amount_cents: breakdown.totalCents,
         properties: {
           ...baseProperties,
-          unit: String(usage.input + usage.output),
+          // Same basis as the split path below (which reports the de-overlapped
+          // per-field `parts.tokens`), so the two branches can't report different
+          // quantities for one call. `input + output` dropped `reasoning` and
+          // `cache_write` entirely — on a real captured Gemini row with 9 in /
+          // 21 out / 852 reasoning it published unit="30" for a call that
+          // consumed 882 — and counted a cache-inclusive provider's cached
+          // tokens at full weight.
+          unit: String(deoverlappedTokenTotal(usage)),
           value: breakdown.total,
           base_cost: breakdown.base,
           ...(dimensions || {}),
