@@ -316,3 +316,63 @@ describe("Cloudflare gateway provider normalization", () => {
     expect(lookupOpenRouter(table, "openai", "anthropic/claude-opus-4.8")).toBeNull();
   });
 });
+
+// ----------------------------------------------------------------------
+// Cache-key casing. The gateway forwards some provider keys unnormalized — the
+// real Gemini fixture carries camelCase `reasoningTokens` — and a missed cache key
+// does not merely lose a field: `gemini` is in INPUT_INCLUDES_CACHE_READ, so
+// computeCost needs `cache_read` populated to SUBTRACT the cached portion out of
+// `input`. A silent 0 bills those tokens at the full prompt rate.
+// ----------------------------------------------------------------------
+describe("Cloudflare gateway — cache key casing", () => {
+  it.each(["input_cached_tokens", "inputCachedTokens", "cachedContentTokenCount"])(
+    "cache_read resolves under %s",
+    (key) => {
+      const u = extractCloudflareLog({
+        tokens_in: 100,
+        tokens_out: 10,
+        provider: "google-ai-studio",
+        usage_metadata: { [key]: 90 },
+      });
+      expect(u.cache_read).toBe(90);
+    },
+  );
+
+  it.each(["input_cache_creation_tokens", "inputCacheCreationTokens", "cache_creation_input_tokens"])(
+    "cache_write resolves under %s",
+    (key) => {
+      const u = extractCloudflareLog({
+        tokens_in: 100,
+        tokens_out: 10,
+        provider: "anthropic",
+        usage_metadata: { [key]: 40 },
+      });
+      expect(u.cache_write).toBe(40);
+    },
+  );
+
+  it("a zeroed alias falls through to the real count", () => {
+    // Fallthrough is on a falsy value, not just a missing key. `??` only skips
+    // null/undefined, so a provider sending both its own name and the gateway's
+    // with one zeroed resolved to the ZERO and lost the real count — while
+    // Python's `or` chain did not, so the two repos disagreed on live money.
+    const u = extractCloudflareLog({
+      tokens_in: 100,
+      tokens_out: 10,
+      provider: "google-ai-studio",
+      usage_metadata: { input_cached_tokens: 0, cachedContentTokenCount: 77 },
+    });
+    expect(u.cache_read).toBe(77);
+  });
+
+  it("stays zero when genuinely absent", () => {
+    const u = extractCloudflareLog({
+      tokens_in: 100,
+      tokens_out: 10,
+      provider: "anthropic",
+      usage_metadata: {},
+    });
+    expect(u.cache_read).toBe(0);
+    expect(u.cache_write).toBe(0);
+  });
+});
