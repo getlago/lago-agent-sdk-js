@@ -94,6 +94,85 @@ describe("LagoSDK.emit", () => {
     await sdk.shutdown(1000);
   });
 
+  it("an ignored usdCost is reported, not silently dropped", async () => {
+    // A caller who supplies a real metered cost while the effective mode isn't
+    // "price" had it discarded with no log and no onError — so a hand-rolled
+    // backfill could bill token counts only and look successful.
+    const errors: Array<[string, string]> = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub",
+      config: {
+        pricingMode: "tokens",
+        onError: (e: unknown, where: string) => errors.push([String(e), where]),
+      },
+    });
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(makeCanonicalUsage({ input: 10, output: 5, model: "m", provider: "anthropic", api: "native" }), {
+      usdCost: 0.0123,
+    });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors[0][0]).toContain("usdCost");
+    expect(errors[0][0]).toContain("0.0123");
+    expect(errors[0][1]).toBe("pricing");
+    // And the call is still billed as token counts — reporting must not drop events.
+    expect(new Set(received.map((e) => e.code))).toEqual(new Set(["llm_input_tokens", "llm_output_tokens"]));
+  });
+
+  it("no usdCost in token mode reports nothing", async () => {
+    const errors: unknown[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub",
+      config: { pricingMode: "tokens", onError: (e: unknown) => errors.push(e) },
+    });
+    sdk._setSender(async () => {});
+    sdk.emit(makeCanonicalUsage({ input: 10, output: 5, model: "m", provider: "anthropic", api: "native" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(errors).toEqual([]);
+  });
+
+  it("an explicit usdCost: null is not billed as $0.00", async () => {
+    // `!== undefined` alone let an explicit null into the precomputed branch, where
+    // `parseScaled(null) ?? 0n` billed the call at $0.00 — while Python's
+    // `usd_cost is not None` treated the same input as "not supplied" and priced it
+    // normally. Any nullable-column or deserialized-payload caller under-billed in
+    // JS only. With a cold table it must now take the lookup path and fall back to
+    // token events, never push a zero-cost llm_cost event.
+    const errors: unknown[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub",
+      config: { pricingMode: "price", onError: (e: unknown) => errors.push(e) },
+    });
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 10,
+        output: 5,
+        model: "nope-no-such-model",
+        provider: "anthropic",
+        api: "native",
+      }),
+      { usdCost: null as unknown as number },
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    expect(received.some((e) => e.code === "llm_cost")).toBe(false);
+    expect(new Set(received.map((e) => e.code))).toEqual(new Set(["llm_input_tokens", "llm_output_tokens"]));
+  });
+
   it("dimensions merge into event properties", async () => {
     const { sdk, received } = newSdk();
     sdk.emit(makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" }), {

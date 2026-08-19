@@ -308,6 +308,23 @@ export class LagoSDK {
       }
       const mode = opts.mode ?? this.config.pricingMode;
       if (mode !== "price") {
+        if (opts.usdCost !== undefined && opts.usdCost !== null) {
+          // A caller who went to the trouble of supplying a real metered cost gets
+          // told it was dropped, rather than discovering later that a whole backfill
+          // billed token counts only. Reported per occurrence, deliberately not
+          // deduped: the number of discarded costs is exactly what a caller
+          // reconciling on `onError` needs, and the documented backfill pattern
+          // passes an explicit `mode: "price"`, so reaching this at volume means a
+          // real misconfiguration rather than normal operation.
+          this.reportError(
+            new Error(
+              `usdCost=${opts.usdCost} ignored: effective pricing mode is "${mode}", not ` +
+                `"price" — emitting token counts instead. Pass mode: "price" per call, ` +
+                `or set pricingMode: "price".`,
+            ),
+            "pricing",
+          );
+        }
         this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
         return;
       }
@@ -320,7 +337,12 @@ export class LagoSDK {
       }
 
       let breakdown: CostBreakdown;
-      if (opts.usdCost !== undefined) {
+      // `!= null` covers BOTH undefined and null. `!== undefined` alone let an
+      // explicit `null` into the precomputed branch, where `parseScaled(null) ?? 0n`
+      // billed the call at $0.00 — while Python's `usd_cost is not None` treated the
+      // same input as "not supplied" and priced it normally. Any nullable-column or
+      // deserialized-payload caller therefore under-billed in JS only.
+      if (opts.usdCost != null) {
         breakdown = computePrecomputedCost(opts.usdCost, markupScaled);
       } else {
         const price = this.pricing.lookup(usage.provider, usage.model, usage.api);
