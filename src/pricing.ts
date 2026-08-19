@@ -200,8 +200,17 @@ function alnum(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+/**
+ * Strip a trailing version/revision marker OpenRouter usually omits from its ids.
+ *
+ * Shapes seen live: Anthropic's compact date ("-20250929"), an explicit "-v2", and
+ * Gemini's 3-digit revision ("-002", which `model_version` can report where
+ * OpenRouter lists only the bare name). Verified safe against the live 415-model
+ * catalog: ZERO ids have a model part ending in exactly three digits, so the
+ * "-\d{3}" arm cannot shorten a real listing.
+ */
 function stripVersion(model: string): string {
-  return model.replace(/-(?:\d{8}|v\d+)$/, "");
+  return model.replace(/-(?:\d{8}|\d{3}|v\d+)$/, "");
 }
 
 // ----------------------------------------------------------------------
@@ -381,11 +390,23 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
     if (typeof id !== "string" || !isObj(pricing)) continue;
     const mp = emptyPrice("openrouter");
     for (const f of PRICED_FIELDS) mp[f] = parseScaled(pricing[OPENROUTER_FIELD_MAP[f]]);
+    // OpenRouter marks a MOVING alias with a leading "~" on the vendor —
+    // "~anthropic/claude-sonnet-latest", "~openai/gpt-latest",
+    // "~google/gemini-flash-latest". Measured live: 11 such ids across 6 vendors,
+    // every one a "-latest" moniker, every one carrying real token pricing. Indexed
+    // verbatim they were ALL unpriceable, because the vendor parsed as
+    // "~anthropic"/"~openai"/"~google" — none of which appear in VENDOR_MAP — so a
+    // customer in price mode asking for a plain "-latest" alias missed and fell back
+    // to token events, billing nothing at all in an llm_cost-only setup. Stripping
+    // the marker indexes them under their real vendor. Verified collision-free
+    // against the live catalog: no un-prefixed id duplicates a "~"-prefixed one.
+    const bare = id.startsWith("~") ? id.slice(1) : id;
     exact.set(id, mp);
-    const slash = id.indexOf("/");
+    if (bare !== id) exact.set(bare, mp);
+    const slash = bare.indexOf("/");
     if (slash > 0) {
-      const vendor = id.slice(0, slash).toLowerCase();
-      const suffix = id.slice(slash + 1);
+      const vendor = bare.slice(0, slash).toLowerCase();
+      const suffix = bare.slice(slash + 1);
       normMap.set(`${vendor}\n${norm(suffix)}`, mp);
     }
   }

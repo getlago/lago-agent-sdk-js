@@ -304,6 +304,51 @@ describe("Bedrock matching", () => {
 });
 
 // ---------- Cloudflare Workers AI parsing + matching ----------
+// ----------------------------------------------------------------------
+// OpenRouter's "~" moving-alias marker. Measured live: 11 ids across 6 vendors,
+// every one a "-latest" moniker with real token pricing, and every one unpriceable
+// before this — the vendor parsed as "~anthropic"/"~openai"/"~google", which match
+// nothing in VENDOR_MAP.
+// ----------------------------------------------------------------------
+const TILDE_RAW = {
+  data: [
+    { id: "~anthropic/claude-sonnet-latest", pricing: { prompt: "0.000002", completion: "0.00001" } },
+    { id: "~openai/gpt-latest", pricing: { prompt: "0.0000025", completion: "0.000015" } },
+    {
+      id: "~google/gemini-flash-latest",
+      pricing: { prompt: "0.000000375", completion: "0.000001875" },
+    },
+  ],
+};
+
+describe("OpenRouter moving-alias (~) ids", () => {
+  it.each([
+    ["anthropic", "claude-sonnet-latest"],
+    ["openai", "gpt-latest"],
+    ["gemini", "gemini-flash-latest"],
+  ])("%s/%s is priceable", (provider, model) => {
+    // A "-latest" alias a customer plausibly requests must resolve. Billing nothing
+    // at all is the outcome in an llm_cost-only setup.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(lookupOpenRouter(t, provider, model)).not.toBeNull();
+  });
+
+  it("still indexed under its verbatim id", () => {
+    // Stripping the marker must ADD a key, not replace one.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(t.exact.has("~openai/gpt-latest")).toBe(true);
+    expect(t.exact.has("openai/gpt-latest")).toBe(true);
+  });
+
+  it("a 3-digit revision suffix strips to a hit", () => {
+    // Gemini's `model_version` can report a "-002" revision where OpenRouter lists
+    // only the bare name. Verified against the live catalog that no real id's model
+    // part ends in exactly three digits, so this arm is safe.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(lookupOpenRouter(t, "gemini", "gemini-flash-latest-002")).not.toBeNull();
+  });
+});
+
 describe("Cloudflare Workers AI matching", () => {
   it("parses the real price shape", () => {
     const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
