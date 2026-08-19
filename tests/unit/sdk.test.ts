@@ -53,6 +53,47 @@ describe("LagoSDK.emit", () => {
     expect(received).toHaveLength(0);
   });
 
+  // Constructor precedence. `...(opts.config || {})` used to be spread LAST, so a
+  // `config.apiUrl` overrode an explicitly passed `apiUrl` — the inverse of what
+  // the Python port documents, so the same call billed a different Lago instance
+  // depending on which SDK you used.
+  it("config-only apiUrl survives", async () => {
+    const sdk = new LagoSDK({ apiKey: "k", config: { apiUrl: "http://localhost:3000/api/v1" } });
+    expect(sdk.config.apiUrl).toBe("http://localhost:3000/api/v1");
+    await sdk.shutdown(1000);
+  });
+
+  it("explicit apiUrl wins over config", async () => {
+    const sdk = new LagoSDK({
+      apiKey: "k",
+      apiUrl: "http://explicit:3000/api/v1",
+      config: { apiUrl: "http://fromconfig:3000/api/v1" },
+    });
+    expect(sdk.config.apiUrl).toBe("http://explicit:3000/api/v1");
+    await sdk.shutdown(1000);
+  });
+
+  it("default apiUrl is still production when nothing is passed", async () => {
+    const sdk = new LagoSDK({ apiKey: "k" });
+    expect(sdk.config.apiUrl).toBe("https://api.getlago.com/api/v1");
+    await sdk.shutdown(1000);
+  });
+
+  it("verifySsl needs no config object", async () => {
+    // A local Lago on a self-signed cert is reachable without building a config —
+    // which is what pushed callers toward the clobber, since a custom apiUrl and
+    // verifySsl:false go together.
+    const sdk = new LagoSDK({ apiKey: "k", apiUrl: "https://api.lago.dev/api/v1", verifySsl: false });
+    expect(sdk.config.verifySsl).toBe(false);
+    await sdk.shutdown(1000);
+  });
+
+  it("explicit verifySsl wins over config", async () => {
+    const sdk = new LagoSDK({ apiKey: "k", verifySsl: true, config: { verifySsl: false } });
+    expect(sdk.config.verifySsl).toBe(true);
+    await sdk.shutdown(1000);
+  });
+
   it("dimensions merge into event properties", async () => {
     const { sdk, received } = newSdk();
     sdk.emit(makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" }), {

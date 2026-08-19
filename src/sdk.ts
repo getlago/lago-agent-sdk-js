@@ -29,6 +29,13 @@ export interface LagoSDKOptions {
   apiKey: string;
   apiUrl?: string;
   defaultSubscriptionId?: string | null;
+  /**
+   * TLS certificate verification for requests to `apiUrl`. Accepted directly so a
+   * local dev Lago behind a self-signed cert (Traefik's default) needs no `config`
+   * object at all — `{ apiKey, apiUrl, verifySsl: false }` is enough. Mirrors the
+   * Python port's `verify_ssl=` parameter.
+   */
+  verifySsl?: boolean;
   config?: Partial<LagoConfig>;
 }
 
@@ -83,11 +90,21 @@ export class LagoSDK {
   private pricing: PricingProvider;
 
   constructor(opts: LagoSDKOptions) {
+    // Explicit options win over anything set on `config`; `config` supplies every
+    // field they don't mention. The spread order is load-bearing and was inverted:
+    // with `...(opts.config || {})` LAST, a `config.apiUrl` overrode an explicitly
+    // passed `apiUrl`, which is the opposite of what the Python port documents and
+    // does — so the same call billed a different Lago instance depending on which
+    // SDK you used. Each explicit field is applied only when actually provided, so
+    // an unset one leaves the config's value intact.
     this.config = makeConfig({
-      apiKey: opts.apiKey,
-      apiUrl: opts.apiUrl,
-      defaultSubscriptionId: opts.defaultSubscriptionId,
       ...(opts.config || {}),
+      apiKey: opts.apiKey,
+      ...(opts.apiUrl !== undefined ? { apiUrl: opts.apiUrl } : {}),
+      ...(opts.defaultSubscriptionId !== undefined
+        ? { defaultSubscriptionId: opts.defaultSubscriptionId }
+        : {}),
+      ...(opts.verifySsl !== undefined ? { verifySsl: opts.verifySsl } : {}),
     });
     this.client = new LagoClient(
       this.config.apiKey,
