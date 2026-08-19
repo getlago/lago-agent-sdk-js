@@ -215,6 +215,60 @@ describe("OpenAI wrapper — Chat Completions", () => {
     expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
   });
 
+  it("does not mutate the caller's params object", async () => {
+    // `delete firstArg.lago` and the stream_options injection both mutated the
+    // object the customer handed us, so a params object reused across calls — a
+    // retry loop, or a request-scoped config — lost its `lago` key after the first
+    // call, and every later one silently fell back to the default subscription,
+    // dimensions, mode and markup.
+    const { sdk, received } = newSdk("sub_default");
+    const client = sdk.wrap(new FakeOpenAI());
+    const params: any = {
+      model: "gpt-4o-mini",
+      messages: [],
+      lago: { subscription: "sub_per_call" },
+    };
+    await client.chat.completions.create(params);
+    await client.chat.completions.create(params); // same object, second time
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    expect(params.lago).toEqual({ subscription: "sub_per_call" }); // untouched
+    expect(params.stream_options).toBeUndefined(); // no injection into caller state
+    // BOTH calls must be attributed to the per-call subscription.
+    expect(received.length).toBe(4); // 2 calls x (input + output)
+    expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
+  });
+
+  it("withResponse() is billed, not silently skipped", async () => {
+    // `withResponse()` resolves to { data, response } and is a documented public
+    // API for reading rate-limit headers — but it calls `this.parse()` on the
+    // target, so the Proxy's `then` trap never fired and the call was never billed.
+    const { sdk, received } = newSdk();
+    class WrCompletions {
+      create(_args: any) {
+        return fakeApiPromise({
+          model: "gpt-4o-mini",
+          choices: [{ message: { role: "assistant", content: "hi", tool_calls: null } }],
+          usage: { prompt_tokens: 8, completion_tokens: 16 },
+        });
+      }
+    }
+    class WrClient {
+      chat = { completions: new WrCompletions() };
+    }
+    Object.defineProperty(WrClient, "name", { value: "OpenAI" });
+    const client2 = sdk.wrap(new WrClient() as any);
+    const promise: any = client2.chat.completions.create({ model: "gpt-4o-mini", messages: [] } as any);
+    const result = await promise.withResponse();
+    expect(result.data).toBeDefined();
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(8);
+    expect(map.llm_output_tokens).toBe(16);
+  });
+
   it("auto-injects stream_options.include_usage when missing", async () => {
     const { sdk } = newSdk();
     const fake = new FakeOpenAI();
@@ -369,6 +423,12 @@ function fakeApiPromise(resolvedValue: unknown, cacheStatus?: string) {
     finally: promise.finally.bind(promise),
     asResponse: async () =>
       new Response(null, cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {}),
+    // The real APIPromise resolves `withResponse()` via `this.parse()`, so it never
+    // passes through a `then` interceptor — which is what left that path unbilled.
+    withResponse: async () => ({
+      data: await promise,
+      response: new Response(null, cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {}),
+    }),
   };
 }
 

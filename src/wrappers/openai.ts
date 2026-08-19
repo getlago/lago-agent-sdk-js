@@ -177,14 +177,22 @@ export function wrapOpenAIClient<T extends OpenAILike>(
    */
   const makeWrappedCreate = (original: (...args: unknown[]) => unknown, autoIncludeUsage: boolean) => {
     return (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      // Work on a COPY. `delete caller.lago` and the stream_options injection both
+      // mutated the object the customer handed us, so a params object reused across
+      // calls — a retry loop, or a request-scoped config — lost its `lago` key after
+      // the first call and every later one silently fell back to the default
+      // subscription, dimensions, mode and markup. Python pops from its own per-call
+      // `**kwargs` dict and never touches caller state; this now matches.
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       if (autoIncludeUsage) ensureStreamOptionsIncludeUsage(firstArg);
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
 
-      const apiPromise = original(...args) as object;
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      const apiPromise = original(...forwarded) as object;
 
       // APIPromise has class-private fields (#httpResponse). Methods accessed
       // through the Proxy must be bound to the underlying target — not the
@@ -215,6 +223,30 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                 }
                 return onfulfilled ? onfulfilled(next) : next;
               }, onrejected);
+          }
+          // `withResponse()` resolves to `{ data, response }` and is a documented
+          // public API for reading rate-limit headers — but it calls `this.parse()`
+          // on the TARGET, so the `then` trap above never fires and the call was
+          // never billed at all. Bill from its parsed `data`, with the same
+          // cache-hit suppression the `then` path uses.
+          //
+          // `asResponse()` is deliberately NOT wrapped: it hands back an unparsed
+          // `Response`, and reading the body to find usage would consume the stream
+          // the caller is about to read. An unbillable call beats a broken one.
+          const rawWithResponse = (target as { withResponse?: unknown }).withResponse;
+          if (prop === "withResponse" && typeof rawWithResponse === "function") {
+            const orig = (rawWithResponse as () => Promise<unknown>).bind(target);
+            return async () => {
+              const result = (await orig()) as { data?: unknown };
+              try {
+                if (looksLikeResponse(result?.data) && !(await isCacheHit(target))) {
+                  emitFrom(result.data, modelId, emitOpts);
+                }
+              } catch {
+                /* never break the call */
+              }
+              return result;
+            };
           }
           const value = Reflect.get(target, prop, target);
           if (typeof value === "function") {

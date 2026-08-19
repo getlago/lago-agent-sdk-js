@@ -120,6 +120,12 @@ export class EventQueue {
         this.wakeResolvers = this.wakeResolvers.filter((fn) => fn !== once);
         resolve();
       }, timeoutMs);
+      // `unref` so an idle queue does NOT hold the event loop open. Without it the
+      // loop never drains, which means `beforeExit` never fires — so a process that
+      // relied on the shutdown hook instead of calling `shutdown()` neither exited
+      // nor flushed, and its buffered events were lost. Python's daemon thread plus
+      // `atexit` has neither problem.
+      (id as unknown as { unref?: () => void }).unref?.();
       const once = () => {
         clearTimeout(id);
         resolve();
@@ -265,14 +271,28 @@ export class EventQueue {
 
   private installShutdownHook(): void {
     if (typeof process !== "undefined" && typeof process.on === "function") {
-      const handler = async () => {
+      let ran = false;
+      const drain = async () => {
+        if (ran) return;
+        ran = true;
         try {
           await this.shutdown(2000);
         } catch {
           /* ignore */
         }
       };
-      process.once("beforeExit", handler);
+      // `beforeExit` alone was not enough: it does not fire on SIGINT, SIGTERM or
+      // an explicit `process.exit()` — i.e. the normal ways a containerized poller
+      // dies — so buffered events were silently lost in exactly those cases, where
+      // Python's `atexit` drained them. Signals re-raise after draining so the
+      // caller's own handlers and the process's exit code are unaffected.
+      process.once("beforeExit", drain);
+      for (const sig of ["SIGINT", "SIGTERM"] as const) {
+        process.once(sig, async () => {
+          await drain();
+          if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+        });
+      }
     }
   }
 }
