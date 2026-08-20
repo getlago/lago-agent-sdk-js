@@ -1,37 +1,15 @@
 /**
- * OpenAI native adapter — verified against real fixtures.
+ * OpenAI native adapter — Chat Completions and the Responses API, told apart by the
+ * shape of `usage` (they carry the same concepts under different field names).
  *
- * Handles both Chat Completions API (`client.chat.completions.create`) and
- * the Responses API (`client.responses.create`). They share a similar
- * concept but use different field names — we detect which by looking at
- * the usage shape.
- *
- * CHAT COMPLETIONS field mapping (`usage.*`):
- *   prompt_tokens                                    → input
- *   completion_tokens                                → output
- *   prompt_tokens_details.cached_tokens              → cache_read
- *   prompt_tokens_details.audio_tokens               → audio_input
- *   completion_tokens_details.reasoning_tokens       → reasoning   (o-series models)
- *   completion_tokens_details.audio_tokens           → audio_output (GPT-4o-audio output)
- *   count of choices[0].message.tool_calls           → tool_calls
- *
- * RESPONSES API field mapping (`usage.*`):
- *   input_tokens                                     → input
- *   output_tokens                                    → output
- *   input_tokens_details.cached_tokens               → cache_read
- *   output_tokens_details.reasoning_tokens           → reasoning
- *   count of output[].type == "function_call"        → tool_calls
- *
- * Not exposed by either API:
- *   cache_write, cache_write_5m, cache_write_1h — OpenAI auto-caches without
- *   surfacing creation counts.
- *
- * Known gaps (intentional, documented):
- *   - completion_tokens_details.accepted_prediction_tokens — Predicted Outputs
- *     feature: subset of completion_tokens. Skipped to avoid double-counting.
- *   - completion_tokens_details.rejected_prediction_tokens — Predicted Outputs:
- *     extra cost beyond completion_tokens. Skipped for v1 — customers using
- *     the feature can access via the openai response object directly.
+ * Billing semantics that are NOT visible from the field names:
+ *   - `cache_read` is counted INSIDE `input`, and `reasoning` INSIDE `output`. Summing
+ *     them as separate metrics double-counts — see `_INPUT_INCLUDES_CACHE_READ` /
+ *     `_OUTPUT_INCLUDES_REASONING` in pricing.
+ *   - No cache_write counts exist: OpenAI auto-caches without surfacing creation.
+ *   - `accepted_prediction_tokens` is a subset of `completion_tokens` and is skipped to
+ *     avoid double-counting. `rejected_prediction_tokens` is real extra cost we do not
+ *     bill; a customer using Predicted Outputs must read it off the response.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
 import { resolveModel } from "./_common.js";
@@ -90,24 +68,16 @@ function countResponsesToolCalls(resp: Record<string, unknown>): number {
 }
 
 /**
- * The SDK shape only ever tells you "this looks like an OpenAI response" —
- * it can't tell you who actually served it. Going through a gateway's
- * OpenAI-compatible endpoint (e.g. Cloudflare's `.../compat`), the resolved
- * model string is the only real signal: "@cf/..." is Cloudflare Workers
- * AI's own naming convention, never a real OpenAI model. This isn't
- * cosmetic — `provider` is what price-mode keys pricing off of, and
- * Workers AI has a genuinely different price table (Cloudflare's own
- * catalog) than real OpenAI models (OpenRouter); stamping "openai" on a
- * Workers AI call would make it permanently unpriceable, quietly, at the
- * extraction layer.
+ * The response shape says "OpenAI-compatible", never who served it. Through a gateway's
+ * compat endpoint the model string is the only signal: `@cf/...` is Workers AI naming,
+ * never a real OpenAI model. `provider` is what price mode keys off, and Workers AI
+ * prices against Cloudflare's catalog rather than OpenRouter, so stamping "openai" here
+ * makes the call quietly unpriceable at the extraction layer.
  *
- * BOTH spellings have to match. Cloudflare's `/compat` endpoint takes the
- * provider-prefixed form — `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast`
- * — which is what the README and the demo notebook prescribe, and what a
- * streaming call always reports (the synthetic usage payload carries no model,
- * so `resolveModel` falls back to the requested string verbatim). Matching only
- * the bare `@cf/` left every documented Workers AI call stamped "openai", priced
- * against OpenRouter, missed, and silently degraded to token events.
+ * BOTH spellings must match: the documented form is provider-prefixed
+ * (`workers-ai/@cf/...`), and that is also what a streaming call reports, since the
+ * synthetic usage payload carries no model and `resolveModel` falls back to the
+ * requested string verbatim.
  */
 function inferProvider(resolvedModel: string): string {
   return resolvedModel.startsWith(WORKERS_AI_MODEL_PREFIX) ||

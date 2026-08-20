@@ -5,26 +5,23 @@
  * call as `Σ(unit_price × token_count) × markup`.
  *
  * Sources:
- *   - OpenRouter (https://openrouter.ai/api/v1/models) for native providers
- *     (anthropic / openai / mistral / gemini). Prices are USD per token.
- *   - AWS Bedrock Price List Bulk API (public, no credentials) for Bedrock.
- *   - Cloudflare's own model catalog (/accounts/{id}/ai/models/search) for
- *     "workers-ai" — the rate the gateway actually bills at, which is NOT the same
- *     number as a third party's price for the same open-weight model. Needs an account
- *     id + API token; without both, this source is simply empty.
- *   - Mistral's own /v1/models for *alias resolution*, not pricing. Mistral publishes no
- *     per-token table, and unlike Anthropic/OpenAI its response never resolves a moving
- *     alias ("mistral-small-latest"), so the OpenRouter lookup misses even though
- *     OpenRouter lists the resolved id with real pricing. Each model's `aliases` array
- *     gives the resolution directly; needs the customer's own Mistral API key.
+ *   - OpenRouter, for native providers (anthropic / openai / mistral / gemini).
+ *   - AWS Bedrock Price List Bulk API, for Bedrock.
+ *   - Cloudflare's model catalog, for "workers-ai" — the rate the gateway actually bills
+ *     at, which is NOT a third party's price for the same open-weight model. Needs an
+ *     account id + token; without both, the source is empty.
+ *   - Mistral's /v1/models, for ALIAS RESOLUTION, not pricing: Mistral publishes no
+ *     per-token table and never resolves a moving alias ("mistral-small-latest") in its
+ *     response, so the OpenRouter lookup misses even though OpenRouter lists the
+ *     resolved id. Needs the customer's own Mistral key.
  *
- * `lookup()` is pure in-memory and never does network I/O, so the customer's
- * call is never blocked on pricing. All HTTP happens in `maybeRefresh()`, which
- * the EventQueue's background loop awaits on its flush tick. A cold/missing
- * table returns null → the caller falls back to token events (never under-bill).
+ * `lookup()` is pure in-memory and O(1) — the customer's call is never blocked on
+ * pricing. ALL HTTP happens in `maybeRefresh()`, on the queue's background loop. A cold
+ * or missing table returns null and the caller falls back to token events; it must never
+ * bill zero.
  *
- * Money uses fixed-point BigInt scaled by 1e12, floored (truncated) to 12
- * decimal places — deterministic and identical to the Python implementation.
+ * Money is fixed-point BigInt scaled by 1e12, floored to 12dp — byte-identical to the
+ * Python port's Decimal path, which `money_golden.json` pins in both repos.
  */
 
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
@@ -37,22 +34,18 @@ export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
 export const PRICED_FIELDS = ["input", "output", "cache_read", "cache_write", "reasoning"] as const;
 export type PricedField = (typeof PRICED_FIELDS)[number];
 
-// Providers whose reported `input` ALREADY includes the cached (cache_read)
-// tokens — cache_read is a subset of input, not additive — and whose `output`
-// already includes reasoning. Pricing the parent at full count AND the subset
-// separately would double-bill. Anthropic reports input exclusive of cache
-// (cache_read/cache_write additive) and Gemini's `thoughts` are additive, so
-// they're absent from the respective sets.
+// MEMBERSHIP IS BILLING-CRITICAL. These two sets say whether a subset metric is already
+// counted inside its parent; pricing the parent at full count AND the subset separately
+// double-bills the overlap. Getting a provider's side wrong over-bills real customers,
+// and the error scales with cache hit rate.
 //
-// "workers-ai" belongs here because it is only ever reached through
-// Cloudflare's OpenAI-COMPATIBLE endpoint (`.../compat`), so its usage payload
-// is the OpenAI shape: `prompt_tokens` includes
-// `prompt_tokens_details.cached_tokens`. It is a distinct provider only
-// because it prices against Cloudflare's own catalog (see inferProvider in
-// adapters/openai_native.ts) — the token semantics are still OpenAI's.
-// Omitting it billed the cached tokens twice: once at the full input rate
-// because they were never subtracted, and again at the cache-read rate, which
-// Cloudflare's catalog does publish for some models.
+//   openai, gemini    — cache_read is INSIDE input (`prompt_tokens_details.cached_tokens`)
+//   anthropic         — cache_read/cache_write are ADDITIVE to input, hence absent
+//   workers-ai        — only ever reached through Cloudflare's OpenAI-COMPATIBLE
+//                       endpoint, so the payload is the OpenAI shape and the OpenAI
+//                       semantics apply. It is a separate provider only because it
+//                       prices against Cloudflare's catalog (see inferProvider in
+//                       adapters/openai_native.ts).
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
 const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
 
@@ -307,17 +300,13 @@ function finalizeBreakdown(
  *   - reasoning ⊆ output for providers in OUTPUT_INCLUDES_REASONING
  *   - cache_read ⊆ input  for providers in INPUT_INCLUDES_CACHE_READ
  *
- * Deliberately NOT gated on a unit price existing, unlike `computeCost`'s
- * subtraction — this is a token count, so whether a rate happens to be published
- * cannot change how many tokens were consumed. The two still agree: when a
- * cache-inclusive provider has no cache_read price, `computeCost` leaves the cached
- * tokens inside `input` and emits no cache_read event, and this skips cache_read for
- * the same reason.
+ * NOT gated on a unit price existing (unlike `computeCost`'s subtraction): a published
+ * rate cannot change how many tokens were consumed. The two still agree in the case
+ * that matters — a cache-inclusive provider with no cache_read price leaves the cached
+ * tokens inside `input` on both paths.
  *
- * Deliberately limited to PRICED_FIELDS — the five text fields. `tool_calls` is a
- * count of calls rather than tokens, and `cache_write_5m` / `cache_write_1h` are a
- * breakdown OF `cache_write`, so including any of them would not be a token total.
- * This mirrors price mode's documented five-field scope.
+ * Limited to PRICED_FIELDS, the five text fields: `tool_calls` counts calls not tokens,
+ * and `cache_write_5m`/`_1h` are a breakdown OF `cache_write`.
  */
 export function deoverlappedTokenTotal(usage: CanonicalUsageLike): number {
   const provider = (usage.provider || "").toLowerCase();
@@ -385,16 +374,11 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
     if (typeof id !== "string" || !isObj(pricing)) continue;
     const mp = emptyPrice("openrouter");
     for (const f of PRICED_FIELDS) mp[f] = parseScaled(pricing[OPENROUTER_FIELD_MAP[f]]);
-    // OpenRouter marks a MOVING alias with a leading "~" on the vendor —
-    // "~anthropic/claude-sonnet-latest", "~openai/gpt-latest",
-    // "~google/gemini-flash-latest". Measured live: 11 such ids across 6 vendors,
-    // every one a "-latest" moniker, every one carrying real token pricing. Indexed
-    // verbatim they were ALL unpriceable, because the vendor parsed as
-    // "~anthropic"/"~openai"/"~google" — none of which appear in VENDOR_MAP — so a
-    // customer in price mode asking for a plain "-latest" alias missed and fell back
-    // to token events, billing nothing at all in an llm_cost-only setup. Stripping
-    // the marker indexes them under their real vendor. Verified collision-free
-    // against the live catalog: no un-prefixed id duplicates a "~"-prefixed one.
+    // OpenRouter marks a MOVING alias with a leading "~" on the vendor
+    // ("~anthropic/claude-sonnet-latest"). The marker must be stripped or the vendor
+    // parses as "~anthropic", which is not in VENDOR_MAP, and every "-latest" alias
+    // becomes unpriceable despite carrying real pricing. Collision-free: no
+    // un-prefixed id duplicates a "~"-prefixed one.
     const bare = id.startsWith("~") ? id.slice(1) : id;
     exact.set(id, mp);
     if (bare !== id) exact.set(bare, mp);
@@ -526,19 +510,14 @@ function mistralDateKey(name: string): number {
  * Prefer the NEWEST dated snapshot id (what OpenRouter actually lists models
  * under) over a "-latest"-style moniker.
  *
- * Newest, not shortest. Every dated id in one family is the same length, so a
- * shortest-then-alphabetical tie-break silently resolved on the DATE — and
- * ascending: `mistral-large-2402` / `-2407` / `-2411` / `-latest` all collapsed
- * onto `mistral-large-2402`, the OLDEST, so the whole family got priced at a
- * two-year-old rate. `-2411` had matched OpenRouter directly before alias
- * resolution existed, which makes that a regression rather than a gap.
+ * Newest, not shortest: every dated id in a family is the same length, so a
+ * shortest-then-alphabetical tie-break resolves on the DATE, ascending — which picks
+ * the OLDEST snapshot and prices the whole family at a years-old rate.
  *
- * Falls back to shortest-then-code-point only when the group has no dated
- * candidate at all, so the choice stays deterministic either way. Deliberately
- * NOT `localeCompare`: that is ICU/locale-dependent, so it is not reproducible
- * across environments and it made this port pick a different canonical than the
- * Python one for the same input (`mistral_small_2603` vs `Mistral-Small-2603`,
- * and the former normalizes onto a name OpenRouter does not list).
+ * Falls back to shortest-then-code-point when no dated candidate exists, so the choice
+ * is deterministic either way. NOT `localeCompare`: it is ICU/locale-dependent, so it
+ * is not reproducible across environments and made the two ports disagree on which
+ * canonical name to pick for the same input.
  */
 function pickMistralCanonical(names: string[]): string {
   const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -552,21 +531,12 @@ function pickMistralCanonical(names: string[]): string {
 /**
  * Parse Mistral's `/v1/models` response into a `{alias: canonicalId}` map.
  *
- * Naively mapping "each name in this entry's `aliases` -> this entry's
- * `id`" is wrong: Mistral's real response lists EVERY name in a family as
- * its own top-level entry, each one's `aliases` pointing at the others —
- * e.g. `id="mistral-small-2603"`, `id="mistral-small-latest"`, AND
- * `id="magistral-small-latest"` each appear separately, each listing the
- * other two as `aliases`. A directional last-write-wins map is then
- * order-dependent and can resolve an alias to ANOTHER alias instead of the
- * real dated snapshot (confirmed live: this resolved "mistral-small-latest"
- * -> "magistral-small-latest", which OpenRouter doesn't list, instead of ->
- * "mistral-small-2603", which it does).
- *
- * Union-find instead: treat a model's id + its aliases as one connected
- * group regardless of which entry mentions which, then pick a single
- * canonical name per group (see `pickMistralCanonical`) and map every other
- * member of the group to it.
+ * Mistral lists EVERY name in a family as its own top-level entry, each one's
+ * `aliases` pointing at the others, so a directional last-write-wins map is
+ * order-dependent and can resolve an alias to ANOTHER alias rather than the dated
+ * snapshot OpenRouter actually lists. Union-find instead: id + aliases form one
+ * connected group whichever entry mentions which, then one canonical per group (see
+ * `pickMistralCanonical`) that every member maps to.
  */
 export function parseMistralAliases(data: unknown): Map<string, string> {
   const models = isObj(data) && Array.isArray(data.data) ? data.data : [];
@@ -798,12 +768,11 @@ export class HttpPricingFetcher implements PricingFetcher {
       // RangeError once a batch is large enough — on exactly the one-wide-read
       // pattern this is used for. A loop has no argument ceiling.
       for (const m of batch) models.push(m);
-      // A SHORT page is the only reliable end-of-catalog signal here.
-      // `result_info.total_count` is not: measured live it reports 291 while the
-      // endpoint serves 64 (50 then 14 then 0), so a `models.length >= total` test
-      // never fires. It must also never fall back to `models.length` — that made an
-      // ABSENT total_count break after page one, silently keeping 50 of the 64
-      // available.
+      // A SHORT page is the only reliable end-of-catalog signal. `result_info.total_count`
+      // is not — it can report several times the number the endpoint actually serves, so
+      // a `models.length >= total` test never fires — and it must never fall back to
+      // `models.length`, which breaks after page one and silently keeps a partial
+      // catalog.
       if (batch.length < CF_PER_PAGE) break;
       if (page >= CF_MAX_PAGES) {
         // Bounded because this runs on the queue's flush tick, ahead of the drain —

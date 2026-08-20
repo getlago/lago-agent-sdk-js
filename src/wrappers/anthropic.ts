@@ -286,17 +286,14 @@ function isAsyncIterable(v: unknown): v is AsyncIterable<unknown> {
  *   - `message_delta` carries the *cumulative* `output_tokens` at the top level
  *     (and, in some API shapes, echoes input/cache there too).
  *
- * Reading only the top-level usage misses `message_start`'s input/cache, so a
- * basic stream — whose `message_delta` is just `{ output_tokens: N }` — would
- * bill `input_tokens = 0`. Merge both locations; Object.assign lets the more
- * complete / more recent values win while preserving the input counts from
- * `message_start` when a delta omits them.
+ * Both locations must be merged: reading only the top-level usage bills
+ * `input_tokens = 0`, since a basic stream's `message_delta` is just
+ * `{ output_tokens: N }`. Object.assign lets newer values win while keeping
+ * `message_start`'s input counts when a delta omits them.
  *
- * Also reports the model this event carried. `message_start` holds the RESOLVED
- * snapshot under `message.model` — e.g. "claude-sonnet-4-5-20250929" for a
- * requested "claude-sonnet-4-5" — and discarding it made every streaming call
- * attribute (and price) the alias instead, the same bug the non-streaming path was
- * fixed for. The caller keeps the first one it sees.
+ * `message_start.message.model` is the RESOLVED snapshot and is reported alongside;
+ * the requested alias usually is not in OpenRouter's table, so dropping it makes price
+ * mode miss. The caller keeps the first one it sees.
  */
 function mergeStreamUsage(
   accumulated: Record<string, unknown>,

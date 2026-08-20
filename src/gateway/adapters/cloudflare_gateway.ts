@@ -1,25 +1,11 @@
 /**
  * Cloudflare AI Gateway log adapter — maps a Logs API entry to CanonicalUsage.
  *
- * Field mapping (`GET .../ai-gateway/gateways/{id}/logs` and the single-entry
- * `GET .../logs/{log_id}`):
- *   tokens_in                                       -> input
- *   tokens_out                                       -> output
- *   usage_metadata.input_cached_tokens               -> cache_read
- *   usage_metadata.input_cache_creation_tokens       -> cache_write
- *   usage_metadata.reasoningTokens/reasoning_tokens  -> reasoning
- *   model, provider                                  -> passed straight through
- *
- * `usage_metadata` key casing is NOT normalized by Cloudflare: it passes through
- * whatever the underlying provider used (Anthropic/OpenAI snake_case
- * `input_cached_tokens`, Gemini camelCase `reasoningTokens`), so both cases are checked
- * for every mapped field. Observed across two providers, not a documented guarantee.
- *
- * There is no request-side model kwarg to reconcile here — a log entry always names the
- * model that actually served the request.
+ * Reads both the list and single-entry Logs API shapes. No request-side model kwarg to
+ * reconcile: a log entry always names the model that actually served the request.
  *
  * Billing *policy* is deliberately not decided here; this module only extracts. `cached`,
- * `step` and the log's own `id` land in `extras` because the caller needs them: `cached`
+ * `step` and the log's own `id` land in `extras` because the caller needs them — `cached`
  * to skip a request Cloudflare served for free, `id` as the idempotency key against
  * replays. `resolveSubscription()` is separate because attribution can be absent, and
  * dropping vs. warning on that is the caller's policy too.
@@ -44,25 +30,18 @@ function safeStr(v: unknown): string {
 /**
  * First of `names` present in `meta` with a usable value, as a number.
  *
- * The gateway does NOT normalize every key it forwards. Its own counters are
- * consistently snake_case across every captured fixture (`input_tokens`,
- * `output_tokens`, `total_tokens`, `input_cached_tokens`,
- * `input_cache_creation_tokens`), but a provider's native key can come through
- * untouched: the real Gemini entry carries `reasoningTokens`, camelCase, and an
- * unmapped `input_text_tokens` alongside it. So the spelling of a cache key on a
- * provider we have no cached capture for is genuinely unknown.
+ * The gateway does NOT normalize every key it forwards: its own counters are
+ * snake_case, but a provider's native key passes through untouched (the real Gemini
+ * entry carries camelCase `reasoningTokens`), so a cache key's spelling on a provider
+ * we have no capture for is unknown. Hence every plausible spelling is checked.
  *
- * Checking every plausible spelling is close to free and the downside is lopsided.
- * A silent 0 here does not merely lose a field — `gemini` is in
- * INPUT_INCLUDES_CACHE_READ, so `computeCost` relies on `cache_read` being
- * populated in order to SUBTRACT the cached portion out of `input`. A missed cache
- * key therefore bills those tokens at the full prompt rate instead of the cache
- * rate: an over-bill, not an omission.
+ * A silent 0 here OVER-bills, it does not merely lose a field: `gemini` is in
+ * INPUT_INCLUDES_CACHE_READ, so `computeCost` needs `cache_read` populated in order to
+ * subtract the cached portion out of `input`.
  *
- * Falls through on a zero as well as on a missing key — deliberately NOT `??`,
- * which only skips null/undefined. With `??`, a provider sending both its own name
- * and the gateway's with one of them zeroed resolved to the zero and lost the real
- * count; Python's `or` chain did not, so the two repos disagreed.
+ * Falls through on zero as well as on a missing key — NOT `??`, which skips only
+ * null/undefined and would resolve to a zeroed duplicate key, losing the real count and
+ * disagreeing with Python's `or` chain.
  */
 function firstInt(meta: Record<string, unknown>, ...names: string[]): number {
   for (const name of names) {
@@ -72,21 +51,17 @@ function firstInt(meta: Record<string, unknown>, ...names: string[]): number {
   return 0;
 }
 
-// Cloudflare AI Gateway logs its OWN provider vocabulary, which is not the name
-// the pricing tables and token-semantics tables key off — and not always its own
-// URL slug either (the logs say "workers-ai" where the endpoint path says
-// "workersai"). Passed through verbatim, "google-ai-studio" matched no vendor in
-// pricing's VENDOR_MAP, so every Gemini call backfilled through the gateway
-// missed on price; worse, it also missed INPUT_INCLUDES_CACHE_READ, so Gemini's
-// cache_read — a SUBSET of its input count, not additive — was billed twice.
+// The gateway logs its OWN provider vocabulary, which is neither the name the pricing
+// and token-semantics tables key off nor even its own URL slug (logs say "workers-ai",
+// the endpoint path says "workersai"). An unmapped name misses VENDOR_MAP *and*
+// INPUT_INCLUDES_CACHE_READ — so it does not just fail to price, it double-bills the
+// cache overlap for a cache-inclusive provider.
 //
-// Only providers this SDK can actually price need an entry. Anything else passes
-// through unchanged: an unrecognized provider is one we have no table for, and a
-// clean miss falls back to token events, which is strictly better than inventing
-// a mapping. AWS Bedrock is deliberately absent for that reason — Bedrock prices
-// are keyed off `api.startsWith("bedrock")`, and this connector always sets
-// api="cloudflare_gateway", so mapping its provider name would route it to
-// OpenRouter under a vendor that cannot match. A miss there is honest.
+// Only providers this SDK can price need an entry; anything else passes through and
+// takes a clean miss to token events, which beats inventing a mapping. Bedrock is
+// deliberately absent: its prices key off `api.startsWith("bedrock")` and this
+// connector always sets api="cloudflare_gateway", so a mapping would route it to
+// OpenRouter under a vendor that cannot match.
 const PROVIDER_ALIASES: Record<string, string> = {
   "google-ai-studio": "gemini",
   "google-vertex-ai": "gemini",
@@ -117,10 +92,8 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
   return makeCanonicalUsage({
     input: safeInt(entry.tokens_in),
     output: safeInt(entry.tokens_out),
-    // Gateway's own snake_case first (present in 8 of the 14 captured fixtures),
-    // then its camelCase form, then the providers' own native names — Gemini calls
-    // it `cachedContentTokenCount`, Anthropic `cache_creation_input_tokens`, and the
-    // `reasoningTokens` fixture proves native keys do reach us unnormalized.
+    // Gateway snake_case, then its camelCase, then the provider's own native name.
+    // See `firstNumber` for why all three are required.
     cache_read: firstInt(usageMeta, "input_cached_tokens", "inputCachedTokens", "cachedContentTokenCount"),
     cache_write: firstInt(
       usageMeta,

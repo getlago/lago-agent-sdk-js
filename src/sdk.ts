@@ -88,11 +88,9 @@ export class LagoSDK {
   private pricing: PricingProvider;
 
   constructor(opts: LagoSDKOptions) {
-    // Explicit options win over anything set on `config`, which supplies every field
-    // they don't mention. Spread order is load-bearing: with `config` last, a
-    // `config.apiUrl` would override an explicitly passed `apiUrl` and the same call
-    // would bill a different Lago instance than the Python port. Each explicit field is
-    // applied only when provided, so an unset one leaves the config's value intact.
+    // Explicit options win over `config`. Spread order is load-bearing: with `config`
+    // last, a `config.apiUrl` would beat an explicitly passed `apiUrl` and bill a
+    // different Lago instance than the Python port does.
     this.config = makeConfig({
       ...(opts.config || {}),
       apiKey: opts.apiKey,
@@ -147,14 +145,9 @@ export class LagoSDK {
   }
 
   /**
-   * Best-effort, non-blocking warm-up for the two credential-gated pricing sources,
-   * triggered by `wrap()` — which the customer already calls, so there is no extra
-   * function to remember. `wrap()` normally runs some real time before the first
-   * completion call, so starting the fetch here often lands it warm before that call
-   * rather than only for the ones after it.
-   *
-   * Only when `pricingMode === "price"`. `prime()`/`wake()` are pure in-memory; the HTTP
-   * fetch still happens on the queue's background loop, never here.
+   * Non-blocking warm-up of the credential-gated pricing sources, triggered by `wrap()`
+   * because it usually runs well before the first completion call. Price mode only.
+   * `prime()`/`wake()` are pure in-memory; the HTTP fetch stays on the queue's loop.
    */
   private autoPrimePricingFor(kind: string, client: unknown): void {
     if (this.config.pricingMode !== "price") return;
@@ -167,11 +160,9 @@ export class LagoSDK {
       if (key) this.pricing.learnMistralApiKey(key);
       provider = "mistral";
     } else if (kind === "openai") {
-      // A generic OpenAI-shaped client can point at real OpenAI OR, via
-      // Cloudflare's `.../compat` endpoint, at Workers AI — the client kind
-      // alone can't tell them apart. `baseURL` is the one signal that can,
-      // without waiting for a response to resolve a model string.
-      // Defensive: some client variants may not expose it.
+      // An OpenAI-shaped client can point at real OpenAI or, via Cloudflare's
+      // `.../compat` endpoint, at Workers AI; `baseURL` is the only signal available
+      // before a response arrives. Defensive: some client variants omit it.
       let baseUrl = "";
       try {
         baseUrl = String((client as { baseURL?: unknown })?.baseURL ?? "");
@@ -187,11 +178,9 @@ export class LagoSDK {
   }
 
   /**
-   * The @mistralai/mistralai SDK stores the constructor's `apiKey: ...` at
-   * `client._options.apiKey` (verified against a real client instance).
-   * Defensive: an SDK version change to this internal path degrades to "no
-   * key learned" (falls back to `LagoConfig.mistralApiKey` if set, else the
-   * existing lazy-miss behavior) rather than throwing.
+   * `@mistralai/mistralai` keeps the constructor's key at `client._options.apiKey`. This
+   * is an INTERNAL path: if a version moves it, this must degrade to "no key learned"
+   * (then `LagoConfig.mistralApiKey`, then a lazy miss) rather than throw.
    */
   private static extractMistralApiKey(client: unknown): string | null {
     try {
@@ -207,21 +196,16 @@ export class LagoSDK {
    * for the queue's background loop to pick them up on its next tick (up
    * to `flushIntervalMs` later, by default ~1s).
    *
-   * A call made immediately after construction — a script or one-shot job, rather than
-   * a server where the first real call lands well after that tick — races a still-cold
-   * table. A miss falls back to token events, but with an `llm_cost`-only billing setup
-   * there is nowhere to fall back to and the event is lost. Call this once, right after
-   * constructing with `pricingMode: "price"`, to close that window for OpenRouter —
-   * always warmed, regardless of `providers`.
+   * Matters for a script or one-shot job, where the first call can beat that tick. A
+   * miss falls back to token events — but in an `llm_cost`-only setup there is nowhere
+   * to fall back to and the event is lost. OpenRouter is always warmed here.
    *
-   * Workers AI and Mistral alias resolution are NOT warmed by default: both are
-   * credential-gated and provider-specific, so fetching them for a provider that may
-   * never be called is pure waste. They stay reactive, and `wrap()` already primes them
-   * when it sees a matching client (see `autoPrimePricingFor`). Name them —
-   * `["mistral"]`, `["workers-ai"]` — only when you will call one WITHOUT `wrap()`.
+   * Workers AI and Mistral are credential-gated, so they are NOT warmed by default and
+   * `wrap()` already primes them on a matching client. Name one — `["mistral"]`,
+   * `["workers-ai"]` — only if you will call it WITHOUT `wrap()`.
    *
-   * Resolves once the fetch has been attempted, not once it has succeeded: a failure is
-   * reported through `onError` and leaves the table cold, exactly as a lazy miss would.
+   * Resolves once the fetch was ATTEMPTED, not once it succeeded: a failure reports
+   * through `onError` and leaves the table cold, same as a lazy miss.
    */
   async warmPricing(providers: string[] = []): Promise<void> {
     this.pricing.prime(providers);
@@ -287,13 +271,9 @@ export class LagoSDK {
       const mode = opts.mode ?? this.config.pricingMode;
       if (mode !== "price") {
         if (opts.usdCost !== undefined && opts.usdCost !== null) {
-          // A caller who went to the trouble of supplying a real metered cost gets
-          // told it was dropped, rather than discovering later that a whole backfill
-          // billed token counts only. Reported per occurrence, deliberately not
-          // deduped: the number of discarded costs is exactly what a caller
-          // reconciling on `onError` needs, and the documented backfill pattern
-          // passes an explicit `mode: "price"`, so reaching this at volume means a
-          // real misconfiguration rather than normal operation.
+          // A supplied cost that gets dropped must be reported, or a whole backfill
+          // silently bills token counts only. Per occurrence, NOT deduped: the count of
+          // discarded costs is what a caller reconciling on `onError` needs.
           this.reportError(
             new Error(
               `usdCost=${opts.usdCost} ignored: effective pricing mode is "${mode}", not ` +
@@ -315,11 +295,9 @@ export class LagoSDK {
       }
 
       let breakdown: CostBreakdown;
-      // `!= null` covers BOTH undefined and null. `!== undefined` alone let an
-      // explicit `null` into the precomputed branch, where `parseScaled(null) ?? 0n`
-      // billed the call at $0.00 — while Python's `usd_cost is not None` treated the
-      // same input as "not supplied" and priced it normally. Any nullable-column or
-      // deserialized-payload caller therefore under-billed in JS only.
+      // `!= null` deliberately covers BOTH undefined and null: an explicit null means
+      // "no cost supplied" and must take the normal lookup path, not bill $0.00. Matches
+      // Python's `usd_cost is not None`.
       if (opts.usdCost != null) {
         breakdown = computePrecomputedCost(opts.usdCost, markupScaled);
       } else {
@@ -352,10 +330,8 @@ export class LagoSDK {
       const code = this.config.metricCodes[field];
       if (!code) continue;
       this.queue.push({
-        // `_tok_` namespace: the cost path suffixes with the same field
-        // vocabulary, and both are reachable for one `eventId` (price miss ->
-        // token fallback, then the cost path once the table is warm). See
-        // EmitOpts.eventId for what a shared namespace cost.
+        // `_tok_` namespace — see `WrapOptions.eventId` for why it must differ from
+        // the cost path's.
         transaction_id: eventId ? `${eventId}_tok_${field}` : randomUUID(),
         external_subscription_id: sub,
         code,
@@ -375,20 +351,13 @@ export class LagoSDK {
    * Push one llm_cost event — or several, one per token_type, when a real
    * per-field breakdown exists.
    *
-   * `breakdown.fields` only exists when we priced via our own per-token
-   * table (`computeCost`): the live wrap() path, where an OpenRouter/
-   * Bedrock/Cloudflare unit price is available for input/output/cache/
-   * reasoning separately. There, billing is split one event per field,
-   * each tagged `token_type`, so Lago's `grouped_by: ["model", "token_type"]`
-   * charge can break llm_cost down by both dimensions.
+   * `breakdown.fields` exists only when WE priced per token (`computeCost`), where a
+   * unit price is known per field. Then it is one event per field tagged `token_type`,
+   * so Lago's `grouped_by: ["model", "token_type"]` charge can split both ways.
    *
-   * A precomputed breakdown (`usdCost` — e.g. Cloudflare AI Gateway's own
-   * already-metered `cost` per call) has no such split: the gateway gives
-   * one lump sum, not "$X of this was input tokens" — inventing a
-   * proportional split would substitute our own guess for the real number
-   * we specifically avoided guessing at. That path bills a single event,
-   * grouped by model only; no `token_type` at all rather than a fabricated
-   * one.
+   * A precomputed `usdCost` (e.g. the gateway's own metered cost) is one lump sum, so it
+   * bills ONE event with no `token_type` — splitting it proportionally would substitute
+   * a guess for the real number we took `usdCost` to avoid guessing at.
    */
   private pushCostEvent(
     usage: CanonicalUsage,

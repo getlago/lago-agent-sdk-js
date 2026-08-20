@@ -23,13 +23,12 @@ type Sender = (batch: LagoEvent[]) => Promise<void>;
 // what is wrong: a malformed body, or a transaction_id Lago has already accepted.
 //
 // Deliberately an explicit list, not the 400-499 range. The test is "is this a property
-// of the batch?" — if the fix is an out-of-band change rather than a different payload,
-// the events are still billable and must be held, not dropped. That excludes 429/408
-// (throttling: retrying one batch as N isolated sends aims MORE traffic at a server
-// asking us to slow down) and 401/403 (a rotated or revoked key: permanent here meant a
-// key rotation silently discarded every event for the whole outage). Held instead, a bad
-// key blocks at the 60s ceiling until `maxBufferSize` overflows — bounded, oldest-first,
-// reported, and fully recoverable once the key is fixed.
+// of the batch?" If an out-of-band change fixes it rather than a different payload, the
+// events are still billable and must be HELD, not dropped. So this excludes:
+//   429/408  throttling — fanning a batch into N isolated sends aims more traffic at a
+//            server that just asked us to slow down
+//   401/403  a rotated or revoked key — held, it blocks at the 60s ceiling until
+//            `maxBufferSize` overflows: bounded, oldest-first, reported, recoverable
 const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 422]);
 
 /** True when re-sending this exact batch can never succeed.
@@ -118,11 +117,10 @@ export class EventQueue {
         this.wakeResolvers = this.wakeResolvers.filter((fn) => fn !== once);
         resolve();
       }, timeoutMs);
-      // `unref` so an idle queue does NOT hold the event loop open. Without it the
-      // loop never drains, which means `beforeExit` never fires — so a process that
-      // relied on the shutdown hook instead of calling `shutdown()` neither exited
-      // nor flushed, and its buffered events were lost. Python's daemon thread plus
-      // `atexit` has neither problem.
+      // `unref` so an idle queue never holds the event loop open: `beforeExit` only
+      // fires once the loop drains, and that is what triggers the shutdown hook. A
+      // ref'd timer here means a process that relies on the hook neither exits nor
+      // flushes. Python's daemon thread plus `atexit` has neither problem.
       (id as unknown as { unref?: () => void }).unref?.();
       const once = () => {
         clearTimeout(id);
@@ -132,11 +130,11 @@ export class EventQueue {
     });
   }
 
-  /** Backoff sleep that returns early once shutdown begins — the equivalent of
-   * Python's `self._stopping.wait(timeout=...)`. A plain `sleep` here meant a backoff
-   * at the 60s ceiling outlived the process's shutdown window, so the exit drain never
-   * ran. Deliberately NOT `waitWake`: that is also woken by `flush()` and `push()`,
-   * which would cut short the very pause a 429 asked us to take. */
+  /** Backoff sleep that returns early once shutdown begins — Python's
+   * `self._stopping.wait(timeout=...)`. It must be interruptible, or a backoff at the
+   * 60s ceiling outlives the shutdown window and the exit drain never runs. NOT
+   * `waitWake`: that is also woken by `flush()` and `push()`, which would cut short the
+   * very pause a 429 asked us to take. */
   private sleepUnlessStopping(ms: number): Promise<void> {
     if (this.stopping) return Promise.resolve();
     return new Promise((resolve) => {
@@ -184,11 +182,10 @@ export class EventQueue {
    * Returns the number of events put back on the buffer — the caller needs it to know
    * whether the buffer actually shrank, and so whether draining on can make progress.
    *
-   * `requeueTransient: false` is for the exit drain, where no later retry exists: putting
-   * an event back there means re-taking it on the next drain iteration with no delay, so
-   * a batch that keeps failing is a hot loop for the whole drain budget. Those events are
-   * reported as lost instead, which is what the drain does with a transient failure
-   * anyway. */
+   * `requeueTransient: false` is for the exit drain, where no later retry exists: an
+   * event put back there is re-taken on the next iteration with no delay, so a batch
+   * that keeps failing is a hot loop for the whole drain budget. Reported as lost
+   * instead — which is already what the drain does with a transient batch failure. */
   private async sendIndividually(
     batch: LagoEvent[],
     batchExc: unknown,
@@ -243,10 +240,9 @@ export class EventQueue {
       while (true) {
         const batch = this.takeBatch();
         if (batch.length === 0) break;
-        // Re-checked every iteration, not only when backing off: `break` hands the batch
-        // to the exit drain below, which is what reports whatever it cannot send.
-        // Returning from here instead skipped both the drain and its warning, so a
-        // shutdown landing mid-backoff abandoned the buffer in silence.
+        // Re-checked every iteration, not only when backing off. `break`, never
+        // `return`: the exit drain below is what reports whatever it cannot send, so
+        // returning from here abandons the buffer in silence.
         if (this.stopping) {
           this.replayFailed(batch);
           break;
@@ -274,10 +270,9 @@ export class EventQueue {
               continue;
             }
             // Some isolated sends failed transiently and went back on the buffer.
-            // Looping straight back would re-take those same events with no delay and
-            // re-fail at the speed of the failure — an unbounded spin that never
-            // re-checks `stopping` and starves the event loop. Pace them through the
-            // normal backoff path instead.
+            // `continue` here re-takes them with no delay and re-fails at the speed of
+            // the failure — an unbounded spin that starves the event loop. They must go
+            // through the normal backoff path.
             this.backoffMs = this.nextBackoff();
             break;
           }

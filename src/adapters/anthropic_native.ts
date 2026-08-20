@@ -1,19 +1,15 @@
 /**
- * Anthropic native adapter — verified against real fixtures.
+ * Anthropic native adapter.
  *
- * Field mapping (snake_case in both wire JSON and the npm @anthropic-ai/sdk):
- *   usage.input_tokens                                 → input
- *   usage.output_tokens                                → output
- *   usage.cache_read_input_tokens                      → cache_read
- *   usage.cache_creation_input_tokens                  → cache_write
- *   usage.cache_creation.ephemeral_5m_input_tokens     → cache_write_5m
- *   usage.cache_creation.ephemeral_1h_input_tokens     → cache_write_1h
- *   count of content[].type == "tool_use"              → tool_calls
+ * Billing semantics that are NOT visible from the field names:
+ *   - `cache_read` and `cache_write` are ADDITIVE to `input`, unlike OpenAI/Gemini where
+ *     the cached tokens sit inside it. This is why anthropic is absent from
+ *     `INPUT_INCLUDES_CACHE_READ`.
+ *   - No reasoning count exists; it is folded into `output_tokens` even with extended
+ *     thinking on.
+ *   - `cache_write_5m`/`_1h` are a breakdown OF `cache_write`, not additions to it.
  *
- * Not exposed by Anthropic (folded into output_tokens):
- *   reasoning_tokens — even with extended thinking enabled
- *
- * Unknown usage fields (service_tier, inference_geo, server_tool_use, …) land in extras.
+ * Unrecognized usage fields land in `extras` — see the drift test.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
 import { resolveModel } from "./_common.js";

@@ -7,26 +7,19 @@
  *
  * Instrumentation never breaks the customer's call.
  *
- * APIPromise plumbing: OpenAI's create() returns an APIPromise<T> — a Promise
- * subclass with extra methods (.withResponse(), .asResponse()). To preserve
- * that interface while intercepting the resolved value, we wrap the returned
- * APIPromise in a Proxy. Class-private fields force us to bind methods to the
- * underlying target rather than the Proxy.
+ * `create()` returns an APIPromise, so the return value is a Proxy that preserves that
+ * interface (`.withResponse()`, `.asResponse()`) while intercepting the resolved value.
+ * Class-private fields mean every method must be bound to the target, not the Proxy.
  *
- * Streaming usage: when `stream: true` is passed without
- * `stream_options.include_usage`, we inject it so the final chunk carries the
- * usage payload. Without this, OpenAI's stream returns no usage at all —
- * silent under-billing for the customer.
+ * `stream: true` without `stream_options.include_usage` is injected, because OpenAI's
+ * stream otherwise reports no usage at all — silent under-billing.
  *
- * Gateway cache-hit detection (non-streaming only): peek at the raw response via
- * `.asResponse()` before emitting — same promise, no extra round-trip. A gateway
- * marking `cf-aig-cache-status: HIT` served it from its own cache, so the provider was
- * never called and it must not be billed. Absent header, or a client without
- * `.asResponse()`, degrades to always emitting. Streaming is not covered.
+ * Gateway cache hits (non-streaming only): `cf-aig-cache-status: HIT` means the provider
+ * was never called, so it must not be billed. Read via `.asResponse()` on the same
+ * promise — no extra round-trip. A client without `.asResponse()` always emits.
  *
- * Per-call override: pass `lago: { subscription, dimensions }` in the args object. The
- * wrapper forwards a COPY with `lago` removed, so OpenAI's strict validator doesn't
- * reject it and the caller's own object is left intact for reuse.
+ * Per-call `lago: { subscription, dimensions }` is forwarded as a COPY with the key
+ * removed: the provider's validator rejects it, and the caller may reuse the object.
  */
 import { extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -288,13 +281,9 @@ export function wrapOpenAIClient<T extends OpenAILike>(
  *   `response.completed` event:
  *   `{ type: "response.completed", response: { usage: {...} } }`
  *
- * Carries the chunk's own `model` through alongside the usage. Rebuilding a
- * usage-ONLY payload made `resolveModel` fall back to the requested alias on every
- * streaming call, which is precisely the attribution bug the non-streaming path was
- * fixed for: a streamed `gpt-5-chat-latest` stayed `gpt-5-chat-latest` instead of
- * resolving to the dated snapshot OpenRouter lists, so price mode missed and
- * silently degraded to token events. It matters most on a gateway, where the
- * resolved name is what decides which price table the call is even looked up in.
+ * The chunk's own `model` is carried through with the usage: it is the RESOLVED
+ * snapshot, and the requested alias usually is not in OpenRouter's table, so dropping
+ * it makes price mode miss and degrade to token events.
  */
 function extractStreamUsage(payload: unknown): Record<string, unknown> | null {
   if (!isObject(payload)) return null;
