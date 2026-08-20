@@ -78,7 +78,7 @@
       "optional": true
     }
   },
-  "dependencies": {
+  "optionalDependencies": {
     "undici": "^6.28.0"
   }
 }

@@ -385,8 +385,7 @@ export function moneyStrToCents(usd: string): string {
  * field (per token_type) needs markup applied to each field individually,
  * with the same floor-to-12dp convention as everywhere else, or a markup
  * != 1.0 would silently vanish from every per-field/token_type event.
- */
-/**
+ *
  * Both fallbacks are DEFENCE IN DEPTH, not live behaviour: every `emit()` path runs
  * the customer's markup through `coerceMarkup` first (which falls back to 1.0 and
  * reports under "pricing"), and `CostBreakdown.markup` / `fields[*].cost` are
@@ -956,12 +955,62 @@ export class PricingProvider {
    * than throwing, since this is a hint, not a contract.
    */
   prime(providers: string[] = []): void {
-    this.openrouterStale = true;
+    // Gated on "is this table actually cold?", NOT unconditional. `prime()` is called
+    // from `autoPrimePricingFor` on a matching `wrap()` and from `warmPricing()`, both
+    // of which a server can run per request — and flagging an in-TTL table stale meant
+    // the ~400-model OpenRouter catalogue was re-downloaded on essentially every flush
+    // tick, so `pricingTtlMs` never applied on this path at all. Measured against the
+    // live catalogue with the shipped 1-hour TTL: 4 prime()+maybeRefresh() cycles
+    // produced 4 full downloads where 1 was correct.
+    //
+    // "Cold" is the same test `lookup()` already uses — no table, or past the TTL — so
+    // priming and looking up cannot disagree about what needs fetching.
+    if (this.isCold(this.openrouter, this.openrouterFetched)) this.openrouterStale = true;
     for (const p of providers) {
       const key = (p || "").toLowerCase();
-      if (key === "workers-ai") this.cloudflareStale = true;
-      else if (key === "mistral") this.mistralStale = true;
+      if (key === "workers-ai") {
+        if (this.isCold(this.cloudflareWorkersAi, this.cloudflareFetched)) this.cloudflareStale = true;
+      } else if (key === "mistral") {
+        if (this.isCold(this.mistralAliases, this.mistralFetched)) this.mistralStale = true;
+      }
     }
+  }
+
+  /** True when a table needs fetching: absent, or older than the TTL. */
+  private isCold(table: unknown | null, fetchedAt: number): boolean {
+    return table === null || Date.now() - fetchedAt >= this.ttlMs;
+  }
+
+  /** Per-source failure backoff.
+   *
+   * A failed fetch used to leave its stale flag set and nothing else, so the next tick
+   * retried immediately — every tick, forever, with no delay, each attempt costing up to
+   * the 10s `getJson` timeout, all of it on the queue loop AHEAD of `takeBatch()`.
+   * Measured with a bad Cloudflare token: 4 ticks produced 4 real requests at
+   * 127/84/59/80 ms and 4 `onError` reports, and a fully-broken pricing config could
+   * stall the drain by up to ~40s per tick across the four sources.
+   *
+   * Same 1→2→4→…→60s shape as the queue's own send backoff, tracked per source so one
+   * bad credential cannot delay the three healthy tables. */
+  private failureBackoffUntil = new Map<string, number>();
+  private failureBackoffMs = new Map<string, number>();
+  private static readonly MAX_PRICING_BACKOFF_MS = 60_000;
+
+  private inBackoff(source: string): boolean {
+    const until = this.failureBackoffUntil.get(source) ?? 0;
+    return Date.now() < until;
+  }
+
+  private noteFailure(source: string): void {
+    const prev = this.failureBackoffMs.get(source) ?? 0;
+    const next = prev === 0 ? 1_000 : Math.min(prev * 2, PricingProvider.MAX_PRICING_BACKOFF_MS);
+    this.failureBackoffMs.set(source, next);
+    this.failureBackoffUntil.set(source, Date.now() + next);
+  }
+
+  private noteSuccess(source: string): void {
+    this.failureBackoffMs.delete(source);
+    this.failureBackoffUntil.delete(source);
   }
 
   /**
@@ -1014,7 +1063,14 @@ export class PricingProvider {
     }
   }
 
-  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale. */
+  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale.
+   *
+   * The four sources are INDEPENDENT and now run concurrently via `Promise.allSettled`.
+   * They used to be awaited in series, so with several stale at once the queue's drain
+   * waited on the sum of them — up to ~40s per tick at the 10s `getJson` timeout — and a
+   * single unreachable source delayed three healthy ones. `allSettled` rather than `all`
+   * because one source failing must not abandon the others; each arm already reports its
+   * own error and none of them can reject out of here. */
   async maybeRefresh(): Promise<void> {
     if (
       !this.openrouterStale &&
@@ -1025,63 +1081,95 @@ export class PricingProvider {
       return;
     }
 
-    if (this.openrouterStale && !this.refreshing.has("openrouter")) {
+    const jobs: Array<Promise<void>> = [];
+
+    if (this.openrouterStale && !this.refreshing.has("openrouter") && !this.inBackoff("openrouter")) {
       this.refreshing.add("openrouter");
-      try {
-        const table = await this.fetcher.fetchOpenRouter();
-        this.openrouter = table;
-        this.openrouterFetched = Date.now();
-        this.openrouterStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchOpenRouter");
-      } finally {
-        this.refreshing.delete("openrouter");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchOpenRouter();
+            this.openrouter = table;
+            this.openrouterFetched = Date.now();
+            this.openrouterStale = false;
+            this.noteSuccess("openrouter");
+          } catch (err) {
+            this.noteFailure("openrouter");
+            this.report(err, "pricing.fetchOpenRouter");
+          } finally {
+            this.refreshing.delete("openrouter");
+          }
+        })(),
+      );
     }
 
-    if (this.cloudflareStale && !this.refreshing.has("cloudflare_workers_ai")) {
+    if (
+      this.cloudflareStale &&
+      !this.refreshing.has("cloudflare_workers_ai") &&
+      !this.inBackoff("cloudflare_workers_ai")
+    ) {
       this.refreshing.add("cloudflare_workers_ai");
-      try {
-        const table = await this.fetcher.fetchCloudflareWorkersAi();
-        this.cloudflareWorkersAi = table;
-        this.cloudflareFetched = Date.now();
-        this.cloudflareStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchCloudflareWorkersAi");
-      } finally {
-        this.refreshing.delete("cloudflare_workers_ai");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchCloudflareWorkersAi();
+            this.cloudflareWorkersAi = table;
+            this.cloudflareFetched = Date.now();
+            this.cloudflareStale = false;
+            this.noteSuccess("cloudflare_workers_ai");
+          } catch (err) {
+            this.noteFailure("cloudflare_workers_ai");
+            this.report(err, "pricing.fetchCloudflareWorkersAi");
+          } finally {
+            this.refreshing.delete("cloudflare_workers_ai");
+          }
+        })(),
+      );
     }
 
-    if (this.mistralStale && !this.refreshing.has("mistral_aliases")) {
+    if (this.mistralStale && !this.refreshing.has("mistral_aliases") && !this.inBackoff("mistral_aliases")) {
       this.refreshing.add("mistral_aliases");
-      try {
-        const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
-        this.mistralAliases = aliases;
-        this.mistralFetched = Date.now();
-        this.mistralStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchMistralAliases");
-      } finally {
-        this.refreshing.delete("mistral_aliases");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
+            this.mistralAliases = aliases;
+            this.mistralFetched = Date.now();
+            this.mistralStale = false;
+            this.noteSuccess("mistral_aliases");
+          } catch (err) {
+            this.noteFailure("mistral_aliases");
+            this.report(err, "pricing.fetchMistralAliases");
+          } finally {
+            this.refreshing.delete("mistral_aliases");
+          }
+        })(),
+      );
     }
 
     for (const region of [...this.bedrockStale]) {
       const key = `bedrock:${region}`;
-      if (this.refreshing.has(key)) continue;
+      if (this.refreshing.has(key) || this.inBackoff(key)) continue;
       this.refreshing.add(key);
-      try {
-        const table = await this.fetcher.fetchBedrock(region);
-        this.bedrock.set(region, table);
-        this.bedrockFetched.set(region, Date.now());
-        this.bedrockStale.delete(region);
-      } catch (err) {
-        this.report(err, "pricing.fetchBedrock");
-      } finally {
-        this.refreshing.delete(key);
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchBedrock(region);
+            this.bedrock.set(region, table);
+            this.bedrockFetched.set(region, Date.now());
+            this.bedrockStale.delete(region);
+            this.noteSuccess(key);
+          } catch (err) {
+            this.noteFailure(key);
+            this.report(err, "pricing.fetchBedrock");
+          } finally {
+            this.refreshing.delete(key);
+          }
+        })(),
+      );
     }
+
+    await Promise.allSettled(jobs);
   }
 
   private report(err: unknown, where: string): void {

@@ -109,12 +109,32 @@ export class LagoSDK {
       // which is not a LagoApiError, so the queue classifies it transient, re-prepends
       // the batch and retries at the 60s ceiling forever: all billing stops, nothing
       // is dropped or escalated, and the only symptom is a growing buffer.
+      //
+      // Falling back is right, but it must not be SILENT — see the report below.
       ...(opts.apiUrl ? { apiUrl: opts.apiUrl } : {}),
       ...(opts.defaultSubscriptionId !== undefined
         ? { defaultSubscriptionId: opts.defaultSubscriptionId }
         : {}),
       ...(opts.verifySsl !== undefined ? { verifySsl: opts.verifySsl } : {}),
     });
+    // A caller who passed `apiUrl` explicitly MEANT to point somewhere specific.
+    // Discarding a falsy one is the safe choice for delivery, but doing it silently is
+    // the one outcome that must not happen here: `makeConfig`'s default is PRODUCTION,
+    // so `apiUrl: process.env.LAGO_API_URL ?? ""` with the var unset now resolves to
+    // production Lago and every event is accepted. For a CI job or a developer holding
+    // a real production key that writes live billing data, and ingested events cannot
+    // be un-ingested. `onError` is opt-in, so this reports through the same
+    // log-plus-callback floor as every other drop path rather than trusting a callback
+    // to exist. Reported AFTER config is built, because that is what wires up onError.
+    if (opts.apiUrl !== undefined && !opts.apiUrl) {
+      this.reportError(
+        new Error(
+          `apiUrl was explicitly set to an empty value; falling back to ${this.config.apiUrl}. ` +
+            `Set LAGO_API_URL (or pass config.apiUrl) if you did not intend to send events there.`,
+        ),
+        "config.apiUrl",
+      );
+    }
     this.client = new LagoClient(
       this.config.apiKey,
       this.config.apiUrl,
