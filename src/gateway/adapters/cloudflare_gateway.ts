@@ -15,12 +15,17 @@
  *
  * Cloudflare reports its OWN counter vocabulary here, not the provider's. Across
  * all 14 captured fixtures — Anthropic, Workers AI, Mistral and Gemini, via every
- * ingress method — the only keys that ever appear are `input_tokens`,
- * `output_tokens`, `total_tokens`, `input_cached_tokens`,
- * `input_cache_creation_tokens`, `neurons`, `input_text_tokens` and
- * `reasoningTokens`. Not one provider-native key shows up: no Anthropic
- * `cache_read_input_tokens`, no Gemini `thoughtsTokenCount` or
+ * ingress method — the keys that appear are `input_tokens`, `output_tokens`,
+ * `total_tokens`, `input_cached_tokens`, `input_cache_creation_tokens`, `neurons`,
+ * `input_text_tokens` and `reasoningTokens`. Not one provider-native key shows up:
+ * no Anthropic `cache_read_input_tokens`, no Gemini `thoughtsTokenCount` or
  * `cachedContentTokenCount`.
+ *
+ * That list is a snapshot and has already been overtaken once: a live Logs API pull
+ * also returned `units`, which appears in none of the fixtures. Treat the
+ * enumeration as illustrative, not exhaustive — `MAPPED_USAGE_KEYS` plus the drift
+ * sweep into `extras.usage_metadata` is what actually keeps an unrecognized counter
+ * from being lost, and it needs no re-audit to stay correct.
  *
  * That vocabulary is *mostly* snake_case, with `reasoningTokens` as a camelCase
  * outlier — Cloudflare's own inconsistency, not a provider key leaking through
@@ -85,6 +90,34 @@ function safeStr(v: unknown): string {
  * and the gateway's with one of them zeroed resolved to the zero and lost the real
  * count; Python's `or` chain did not, so the two repos disagreed.
  */
+// Every `usage_metadata` spelling this adapter accounts for: the ones `firstInt`
+// consults below, plus the three that are redundant with the top-level `tokens_in` /
+// `tokens_out` the adapter reads directly. Anything NOT in here is swept into
+// `extras.usage_metadata` rather than dropped — see the drift note on `extras`.
+//
+// Keep this in sync with the `firstInt` calls. It is the mechanism that makes the
+// module docstring's key enumeration self-maintaining instead of a hand-audited
+// snapshot: a spelling nobody has seen shows up in `extras` on its own.
+const MAPPED_USAGE_KEYS: ReadonlySet<string> = new Set([
+  // cache_read
+  "input_cached_tokens",
+  "inputCachedTokens",
+  "cachedContentTokenCount",
+  "cache_read_input_tokens",
+  // cache_write
+  "input_cache_creation_tokens",
+  "inputCacheCreationTokens",
+  "cache_creation_input_tokens",
+  // reasoning
+  "reasoningTokens",
+  "reasoning_tokens",
+  "thoughtsTokenCount",
+  // Read from the top level instead, so not drift when they appear here.
+  "input_tokens",
+  "output_tokens",
+  "total_tokens",
+]);
+
 function firstInt(meta: Record<string, unknown>, ...names: string[]): number {
   for (const name of names) {
     const v = safeInt(meta[name]);
@@ -171,8 +204,36 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
       cached: entry.cached,
       step: entry.step,
       log_id: entry.id,
+      // Drift sweep — the same contract `adapters/openai_native.ts` enforces, and for
+      // the same reason: a counter this adapter does not map must not vanish without
+      // an error or an onError. `extras` used to be exactly the three keys above, so
+      // `usage_metadata` got no sweep at all, and that was not hypothetical — a live
+      // Logs API pull found `neurons` (Cloudflare's Workers AI billing unit) and
+      // `units` (a cost quantity) being dropped on every row, and `units` appears in
+      // NO captured fixture, so the hand-maintained enumeration had already drifted
+      // past what this file claimed to know. A money-relevant counter going missing
+      // this way surfaces first as a reconciliation gap, not as a failure.
+      //
+      // NESTED, not spread flat into `extras`: the poller reads `extras.cached` to
+      // decide whether to skip billing a request Cloudflare served for free, so a
+      // future `usage_metadata` key called `cached` or `step` must not be able to
+      // shadow it. Omitted entirely when there is no drift, to keep the common case
+      // identical to what callers already see.
+      ...unmappedUsage(usageMeta),
     },
   });
+}
+
+/** Any `usage_metadata` key this adapter does not account for, wrapped for `extras`.
+ *
+ * Returns an empty object when everything was recognized, so the key is absent
+ * rather than present-and-empty in the overwhelmingly common case. */
+function unmappedUsage(usageMeta: Record<string, unknown>): { usage_metadata?: Record<string, unknown> } {
+  const unmapped: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(usageMeta)) {
+    if (!MAPPED_USAGE_KEYS.has(k)) unmapped[k] = v;
+  }
+  return Object.keys(unmapped).length > 0 ? { usage_metadata: unmapped } : {};
 }
 
 /**
