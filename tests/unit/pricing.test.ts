@@ -1,5 +1,8 @@
 /** Pricing — matching, money math, provider cache, and SDK price mode. */
 import { readFileSync } from "node:fs";
+import fs from "node:fs";
+import path from "node:path";
+import { WORKERS_AI_COMPAT_PREFIX } from "../../src/canonical.js";
 import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage } from "../../src/index.js";
@@ -347,6 +350,34 @@ describe("OpenRouter moving-alias (~) ids", () => {
     const t = parseOpenRouter(TILDE_RAW);
     expect(lookupOpenRouter(t, "gemini", "gemini-flash-latest-002")).not.toBeNull();
   });
+
+  it.each([
+    ["alias first", true],
+    ["real listing first", false],
+  ])("never overwrites a real listing (%s)", (_label, aliasFirst) => {
+    // Which entry wins must not depend on catalog order. With plain assignment it
+    // did, and the alias's rate (0.009) could replace the real listing's (0.001)
+    // purely by arriving later in the response.
+    const real = { id: "google/gemini-flash-latest", pricing: { prompt: "0.001" } };
+    const alias = { id: "~google/gemini-flash-latest", pricing: { prompt: "0.009" } };
+    const t = parseOpenRouter({ data: aliasFirst ? [alias, real] : [real, alias] });
+    const mp = lookupOpenRouter(t, "gemini", "gemini-flash-latest");
+    expect(mp).not.toBeNull();
+    expect(mp!.input).toBe(parseScaled("0.001"));
+    expect(t.exact.get("~google/gemini-flash-latest")!.input).toBe(parseScaled("0.009"));
+  });
+
+  it("the 3-digit arm is scoped to OpenRouter, not the AWS/Bedrock key builder", () => {
+    // There a shortened key does not merely miss — it collapses two models onto one
+    // key whose per-direction prices are assigned in place, so one silently
+    // overwrites the other's rate.
+    expect(bedrockModelKey("amazon.titan-text-001")).toBe("titantext001");
+    expect(bedrockModelKey("amazon.titan-text-002")).toBe("titantext002");
+    expect(bedrockModelKey("amazon.titan-text-001")).not.toBe(bedrockModelKey("amazon.titan-text-002"));
+    // real dated/versioned ids are unaffected
+    expect(bedrockModelKey("anthropic.claude-haiku-4-5-20251001-v1:0")).toBe("claudehaiku45");
+    expect(bedrockModelKey("eu.anthropic.claude-sonnet-4-6")).toBe("claudesonnet46");
+  });
 });
 
 describe("Cloudflare Workers AI matching", () => {
@@ -454,6 +485,14 @@ describe("de-overlapped token total (precomputed `unit` basis)", () => {
     [{ input: 10, output: 20, tool_calls: 3, provider: "openai" }, 30],
   ])("%o -> %i", (fields, expected) => {
     expect(deoverlappedTokenTotal(makeCanonicalUsage(fields as any))).toBe(expected);
+  });
+
+  it.each(["openai", "workers-ai"])("%s treats reasoning as a subset of output", (provider) => {
+    // workers-ai is reached ONLY through Cloudflare's OpenAI-compatible endpoint, so
+    // reasoning is a subset of output there exactly as for real OpenAI. Omitting it
+    // from OUTPUT_INCLUDES_REASONING counted the subset twice — 1900 against 1100.
+    const u = makeCanonicalUsage({ input: 100, output: 1000, reasoning: 800, provider });
+    expect(deoverlappedTokenTotal(u)).toBe(1100);
   });
 
   it("precomputed unit matches the split path basis", async () => {
@@ -788,6 +827,45 @@ describe("computeCost / money", () => {
     expect(b.totalCents).toBe("0.0000980722");
   });
 
+  it("WORKERS_AI_COMPAT_PREFIX is defined exactly once", () => {
+    // Two unrelated layers must agree on this string: `adapters/openai_native` decides
+    // the PROVIDER from it, `pricing` strips it before a catalog lookup. They must
+    // never import each other, so it lives in `canonical`. A drift between two copies
+    // is a silently unpriced call, not a crash — hence asserted, not left to review.
+    const src = path.resolve(__dirname, "..", "..", "src");
+    const defs: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name.endsWith(".ts")) {
+          fs.readFileSync(p, "utf8")
+            .split("\n")
+            .forEach((line, i) => {
+              if (/^\s*(export\s+)?const\s+WORKERS_AI_COMPAT_PREFIX\s*=/.test(line)) {
+                defs.push(`${path.relative(src, p)}:${i + 1}`);
+              }
+            });
+        }
+      }
+    };
+    walk(src);
+    expect(defs).toHaveLength(1);
+    expect(WORKERS_AI_COMPAT_PREFIX).toBe("workers-ai/");
+  });
+
+  it("an unparseable markup keeps the cost instead of zeroing it", () => {
+    // Defence in depth and cross-port parity — coerceMarkup means neither branch is
+    // reachable through emit(). A bad COST leaves nothing to bill, but a bad MARKUP
+    // only loses the multiplier, and returning 0 for it would discard a good cost.
+    // Python returned "0" here until it was aligned with this.
+    expect(applyMarkup("0.0042", "1.5")).toBe("0.0063");
+    for (const bad of ["abc", "", "1,5", "None"]) {
+      expect(applyMarkup("0.0042", bad)).toBe("0.0042");
+    }
+    expect(applyMarkup("abc", "1.5")).toBe("0");
+  });
+
   it("applyMarkup and moneyStrToCents handle exponential input", () => {
     expect(applyMarkup(String(8.91e-7), "1.5")).toBe("0.0000013365");
     expect(moneyStrToCents(String(8.91e-7))).toBe("0.0000891");
@@ -999,12 +1077,19 @@ async function warmCloudflareProvider(): Promise<PricingProvider> {
   return p;
 }
 
-function priceSdk(provider: PricingProvider, opts: { markup?: number } = {}) {
+function priceSdk(
+  provider: PricingProvider,
+  opts: { markup?: number; onError?: (e: unknown, ctx: string) => void } = {},
+) {
   const received: LagoEvent[] = [];
   const sdk = new LagoSDK({
     apiKey: "x",
     defaultSubscriptionId: "sub_default",
-    config: { pricingMode: "price", markup: opts.markup ?? 1.0 },
+    config: {
+      pricingMode: "price",
+      markup: opts.markup ?? 1.0,
+      ...(opts.onError ? { onError: opts.onError } : {}),
+    },
   });
   sdk._setPricingProvider(provider);
   sdk._setSender(async (b) => {
@@ -1026,6 +1111,41 @@ function byTokenType(received: LagoEvent[]): Record<string, LagoEvent> {
 }
 
 describe("SDK price mode", () => {
+  it("a bad markup is coerced to 1.0, reported, and still bills the cost", async () => {
+    // `markup` is customer input (`lago: { markup }`), so a comma decimal like "1,5"
+    // genuinely arrives. coerceMarkup is the guard that catches it; this pins the
+    // end-to-end consequence, which no test covered: the cost is still billed at
+    // 1.0 rather than zeroed, and the lost markup reaches onError.
+    const seen: Array<[unknown, string]> = [];
+    const { sdk, received } = priceSdk(await warmProvider(), {
+      onError: (e, ctx) => seen.push([e, ctx]),
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 1000,
+        output: 500,
+        model: "claude-opus-4-8",
+        provider: "anthropic",
+        api: "native",
+      }),
+      // annotated number | undefined, but it arrives from untyped customer input
+      { markup: "1,5" as unknown as number },
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const byType = byTokenType(received);
+    expect(Object.keys(byType).length).toBeGreaterThan(0);
+    for (const [tokenType, ev] of Object.entries(byType)) {
+      const props = ev.properties as Record<string, unknown>;
+      expect(props.markup, `${tokenType}: bad markup should coerce to 1.0`).toBe("1");
+      expect(props.value, `${tokenType}: should bill the un-marked-up cost`).toBe(props.base_cost);
+      expect(Number(props.value)).toBeGreaterThan(0);
+    }
+    expect(seen.map(([, ctx]) => ctx)).toContain("pricing");
+    expect(seen.some(([e]) => String(e).includes("markup") && String(e).includes("1,5"))).toBe(true);
+  });
+
   it("emits one llm_cost event per token_type, not one summed event", async () => {
     // A real per-field breakdown (OpenRouter has both input/output prices
     // for this model) splits into one llm_cost event per token_type, so

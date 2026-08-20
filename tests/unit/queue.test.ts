@@ -1,5 +1,5 @@
 /** Event queue — batching, retry, backoff, flush, overflow. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { EventQueue } from "../../src/queue.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -212,6 +212,70 @@ describe("EventQueue — permanent vs transient failures", () => {
 // aimed `maxBatchSize` extra requests at a server that had just asked us to
 // slow down.
 // ----------------------------------------------------------------------
+describe("EventQueue — isolation path ordering and shutdown", () => {
+  it("isolated retries keep their FIFO order", async () => {
+    // `replayFailed` UNSHIFTS, so calling it once per event inside the isolation loop
+    // reversed the survivors: a 413 batch of a,b,c,d,e whose b,c,d fail transiently
+    // while isolated came back as d,c,b. FIFO is the queue's contract — it is what
+    // makes oldest-dropped-first overflow and Lago's own event ordering mean
+    // anything — so a recovery path must not silently invert it.
+    const sender = async (batch: LagoEvent[]) => {
+      if (["b", "c", "d"].includes(batch[0].transaction_id)) {
+        throw new LagoApiError(503, "transient while isolated");
+      }
+    };
+    const q = new EventQueue(sender, 60_000, 10, 100);
+    try {
+      // @ts-expect-error — exercising the private isolation path directly
+      await q.sendIndividually(["a", "b", "c", "d", "e"].map(evId), new LagoApiError(413, "too large"));
+      // @ts-expect-error — reading the private buffer
+      expect(q.buffer.map((e: LagoEvent) => e.transaction_id)).toEqual(["b", "c", "d"]);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it("shutdown leaves no pending timer behind", async () => {
+    // `Promise.race` abandons the loser but does not cancel it, so a plain
+    // `sleep(timeoutMs)` left a live, ref'd timer for the FULL timeout after shutdown
+    // had already returned — a script awaiting `shutdown(15000)` returned in 0.2s and
+    // then sat there ~15s before the process could exit. Same class as the un-unref'd
+    // idle timer, but on the path taken by callers doing the right thing.
+    vi.useFakeTimers();
+    try {
+      const q = new EventQueue(async () => {}, 60_000, 10, 100);
+      await q.shutdown(15_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("EventQueue — batch-only 4xx is split, not head-of-line blocked", () => {
+  it.each([413, 402, 415])("splits a batch that %i-ed as a whole", async (status) => {
+    // For these the SAME batch can never succeed, but its events can individually.
+    // Treating them as transient re-prepended the identical batch at the head of the
+    // FIFO and backed off to 60s forever, blocking everything behind it. Routing them
+    // to sendIndividually splits the batch and delivers what is deliverable.
+    const sentIndividually: string[] = [];
+    const sender = async (batch: LagoEvent[]) => {
+      if (batch.length > 1) throw new LagoApiError(status, "unacceptable as-is");
+      sentIndividually.push(batch[0].transaction_id);
+    };
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      for (const id of ["a", "b", "c", "d"]) q.push(evId(id));
+      expect(await q.flush(3000)).toBe(true);
+      expect(sentIndividually.sort()).toEqual(["a", "b", "c", "d"]);
+      // @ts-expect-error — touch private backoffMs for test
+      expect(q.backoffMs).toBe(0);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+});
+
 describe("EventQueue — throttling 4xx is transient", () => {
   it.each([429, 408])("retries rather than drops a %i", async (status) => {
     // Dropping loses revenue, and isolating one-by-one multiplies the load on

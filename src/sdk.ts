@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
-import { CanonicalUsage, NUMERIC_FIELDS, nonzeroNumeric } from "./canonical.js";
+import { CanonicalUsage, NUMERIC_FIELDS, negativeNumeric, nonzeroNumeric } from "./canonical.js";
 import { LagoConfig, PricingMode, makeConfig } from "./config.js";
 import { detectClientKind } from "./detector.js";
 import { PricingUnavailableError, UnknownClientError } from "./exceptions.js";
@@ -101,7 +101,15 @@ export class LagoSDK {
     this.config = makeConfig({
       ...(opts.config || {}),
       apiKey: opts.apiKey,
-      ...(opts.apiUrl !== undefined ? { apiUrl: opts.apiUrl } : {}),
+      // `apiUrl` is the one field where an EMPTY string must not win either. The bug
+      // this ordering was written for was a config value being clobbered, so
+      // accepting "" swapped one silent misroute for a worse one —
+      // `apiUrl: process.env.LAGO_API_URL ?? ""` with the var unset used to keep the
+      // production URL and instead wrote "". Downstream `fetch("")` throws TypeError,
+      // which is not a LagoApiError, so the queue classifies it transient, re-prepends
+      // the batch and retries at the 60s ceiling forever: all billing stops, nothing
+      // is dropped or escalated, and the only symptom is a growing buffer.
+      ...(opts.apiUrl ? { apiUrl: opts.apiUrl } : {}),
       ...(opts.defaultSubscriptionId !== undefined
         ? { defaultSubscriptionId: opts.defaultSubscriptionId }
         : {}),
@@ -367,6 +375,18 @@ export class LagoSDK {
     eventId?: string,
   ): void {
     const counts = nonzeroNumeric(usage);
+    // A negative count is silently unbillable — Lago would otherwise sum it into a
+    // negative quantity. It was the only drop path in the SDK that never reached
+    // onError, so a caller who built a CanonicalUsage with a bad delta saw nothing
+    // at all. Reported before the loop, because an event whose only fields were
+    // negative produces no events below and would return without a word.
+    const negatives = negativeNumeric(usage);
+    if (Object.keys(negatives).length > 0) {
+      this.reportError(
+        new Error(`dropped negative token counts for model=${usage.model}: ${JSON.stringify(negatives)}`),
+        "negative_tokens",
+      );
+    }
     const now = Math.floor(Date.now() / 1000);
     for (const field of NUMERIC_FIELDS) {
       const value = counts[field];
@@ -494,14 +514,22 @@ export class LagoSDK {
         /* ignore */
       }
     }
+    // Logs as well as calling onError, matching Python's `_report_error`. This port
+    // logged NOTHING here, so a dropped event was invisible to anyone who had not
+    // wired up onError — while Python emitted a line. `onError` is opt-in; the log
+    // is the floor. Uses the same "[lago] " prefix as the queue's own warnings.
+    console.warn(`[lago] ${where} failed:`, err);
   }
 
   flush(timeoutMs: number = 5000): Promise<boolean> {
     return this.queue.flush(timeoutMs);
   }
 
-  shutdown(timeoutMs: number = 5000): Promise<void> {
-    return this.queue.shutdown(timeoutMs);
+  async shutdown(timeoutMs: number = 5000): Promise<void> {
+    // Drain first, then release the client's sockets — closing the agent before the
+    // queue has flushed would abort the very sends shutdown exists to complete.
+    await this.queue.shutdown(timeoutMs);
+    await this.client.close();
   }
 
   /** Tests-only: replace the queue's sender. */

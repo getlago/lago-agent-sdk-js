@@ -33,7 +33,14 @@ type Sender = (batch: LagoEvent[]) => Promise<void>;
 // Treating those as permanent dropped billable events AND fanned one throttled batch
 // out into up to `maxBatchSize` extra requests aimed at the server that had just asked
 // us to slow down.
-const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 401, 403, 404, 409, 422]);
+// 413/402/415 are here for the OPPOSITE reason to 429: re-sending the same batch
+// provably cannot succeed (too large, payment required, wrong media type), so treating
+// them as transient re-prepended the identical batch at the head of the FIFO and backed
+// off to 60s forever, blocking every event behind it until the buffer overflowed. Being
+// "permanent" routes them to `sendIndividually`, which SPLITS the batch and delivers
+// what is deliverable. 405/410 stay transient: they usually indicate a misrouted or
+// retired endpoint, which a deploy can fix.
+const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 401, 402, 403, 404, 409, 413, 415, 422]);
 
 /** True when re-sending this exact batch can never succeed.
  *
@@ -100,8 +107,31 @@ export class EventQueue {
     await this.flush(timeoutMs);
     this.stopping = true;
     this.wake();
-    // Best effort wait for the loop to complete
-    await Promise.race([this.loopPromise, sleep(timeoutMs)]);
+    // Best effort wait for the loop to complete.
+    //
+    // The timeout arm MUST be both unref'd and cleared. `Promise.race` abandons the
+    // loser but does not cancel it, so a plain `sleep(timeoutMs)` left a live, ref'd
+    // timer behind for the FULL timeout after shutdown had already returned: a script
+    // calling `await sdk.shutdown(15000)` returned in 0.2s and then sat there until
+    // ~15s before the process could exit. That is the same class of bug as the
+    // un-unref'd idle timer, but on the path taken by callers doing the right thing,
+    // and it is why closing the undici Agent appeared to change nothing — the Agent
+    // was never what held the loop open.
+    await this.raceWithTimeout(this.loopPromise, timeoutMs);
+  }
+
+  /** `Promise.race` against a timer that cannot outlive the race. */
+  private async raceWithTimeout(p: Promise<void>, ms: number): Promise<void> {
+    let id: ReturnType<typeof setTimeout> | undefined;
+    const timer = new Promise<void>((resolve) => {
+      id = setTimeout(resolve, ms);
+      (id as unknown as { unref?: () => void }).unref?.();
+    });
+    try {
+      await Promise.race([p, timer]);
+    } finally {
+      if (id !== undefined) clearTimeout(id);
+    }
   }
 
   /** Nudge the background loop to run its tick (drain + pricing
@@ -167,6 +197,13 @@ export class EventQueue {
    * what's really one root cause. */
   private async sendIndividually(batch: LagoEvent[], batchExc: unknown): Promise<void> {
     this.reportError(batchExc);
+    // Collected and re-queued ONCE at the end, not per event. `replayFailed`
+    // unshifts, so calling it inside the loop reversed the survivors' relative
+    // order: a 413 batch of a,b,c,d,e whose b,c,d fail transiently while isolated
+    // came back as d,c,b. FIFO is the queue's contract — it is what makes the
+    // oldest-dropped-first overflow policy and Lago's own event ordering
+    // meaningful — so a recovery path must not silently invert it.
+    const retry: LagoEvent[] = [];
     for (const event of batch) {
       try {
         this.httpCalls++;
@@ -179,10 +216,11 @@ export class EventQueue {
           );
         } else {
           console.warn("[lago] send failed for isolated event, will retry:", exc);
-          this.replayFailed([event]);
+          retry.push(event);
         }
       }
     }
+    if (retry.length > 0) this.replayFailed(retry);
   }
 
   private async run(): Promise<void> {

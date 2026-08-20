@@ -36,6 +36,8 @@
  * decimal places — deterministic and identical to the Python implementation.
  */
 
+import { WORKERS_AI_COMPAT_PREFIX } from "./canonical.js";
+
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
 export const AWS_PRICING_HOST = "https://pricing.us-east-1.amazonaws.com";
 export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/AmazonBedrock/current/region_index.json`;
@@ -63,7 +65,16 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // because they were never subtracted, and again at the cache-read rate, which
 // Cloudflare's catalog does publish for some models.
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
-const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
+// "workers-ai" belongs here for the same reason it is in INPUT_INCLUDES_CACHE_READ
+// above: it is only ever reached through Cloudflare's OpenAI-COMPATIBLE endpoint, so its
+// usage payload is the OpenAI shape — and in that shape
+// `completion_tokens_details.reasoning_tokens` is a SUBSET of `completion_tokens`.
+// `extractOpenAINative` fills `reasoning` from that key with no provider gate, so
+// omitting it counted the subset twice: measured, a 100/1000/reasoning-800 call reported
+// unit=1900 against 1100 consumed. `computeCost` would double-BILL the same tokens and
+// does not today only because CLOUDFLARE_UNIT_FIELD_MAP happens to carry no reasoning
+// unit — an accident, not a guard, and Cloudflare hosts reasoning models.
+const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -93,12 +104,6 @@ const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
   "per M output tokens": "output",
   "per M cached input tokens": "cache_read",
 };
-
-// The routing prefix the gateway's OpenAI-compatible `/compat` endpoint requires.
-// Cloudflare's catalog keys models as bare "@cf/...", so this comes off before a
-// lookup. Kept in sync with `adapters/openai_native.WORKERS_AI_COMPAT_PREFIX`, which
-// decides the provider from the same two spellings.
-const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
 
 // Cloudflare's catalog page size, and a hard bound on the paging loop. The loop runs
 // on the queue's flush tick ahead of the drain, so it must terminate even if the
@@ -210,13 +215,26 @@ function alnum(s: string): string {
 /**
  * Strip a trailing version/revision marker OpenRouter usually omits from its ids.
  *
- * Shapes seen live: Anthropic's compact date ("-20250929"), an explicit "-v2", and
- * Gemini's 3-digit revision ("-002", which `model_version` can report where
- * OpenRouter lists only the bare name). Verified safe against the live 415-model
- * catalog: ZERO ids have a model part ending in exactly three digits, so the
- * "-\d{3}" arm cannot shorten a real listing.
+ * Shapes seen live: Anthropic's compact date ("-20250929") and an explicit "-v2".
  */
 function stripVersion(model: string): string {
+  return model.replace(/-(?:\d{8}|v\d+)$/, "");
+}
+
+/**
+ * `stripVersion`, plus Gemini's 3-digit revision ("-002", which `model_version`
+ * can report where OpenRouter lists only the bare name). OpenRouter matching ONLY.
+ *
+ * Deliberately not folded into `stripVersion`: that helper also builds the
+ * AWS/Bedrock price keys, where a shortened key does not merely miss but silently
+ * MIS-prices — `bedrockModelKey` feeds a per-key table whose two directions are
+ * assigned in place, so two distinct models collapsing to one key overwrite each
+ * other's rate. All four live catalogs are currently clean (OpenRouter 415 ids,
+ * Cloudflare 64, AWS offer 77, captured Bedrock 39: zero model parts end in
+ * exactly three digits), but the arm was only ever motivated by OpenRouter, and
+ * scoping it makes that risk structurally zero instead of empirically zero.
+ */
+function stripVersionOpenRouter(model: string): string {
   return model.replace(/-(?:\d{8}|\d{3}|v\d+)$/, "");
 }
 
@@ -368,8 +386,23 @@ export function moneyStrToCents(usd: string): string {
  * with the same floor-to-12dp convention as everywhere else, or a markup
  * != 1.0 would silently vanish from every per-field/token_type event.
  */
+/**
+ * Both fallbacks are DEFENCE IN DEPTH, not live behaviour: every `emit()` path runs
+ * the customer's markup through `coerceMarkup` first (which falls back to 1.0 and
+ * reports under "pricing"), and `CostBreakdown.markup` / `fields[*].cost` are
+ * `fmtMoney` output, so neither argument can actually arrive unparseable here. They
+ * are still not interchangeable, and the two ports disagreed on them:
+ *
+ * - An unparseable `usd` means the cost itself is unusable — nothing to bill: 0.
+ * - An unparseable `markup` means only the MULTIPLIER is unusable. Returning 0
+ *   there would discard a good cost, an under-bill to nothing; 1.0 bills the real
+ *   cost with no markup, the smallest defensible error. This is what JS already
+ *   did; Python returned "0", so identical input produced different bills if
+ *   anything ever did reach it. Now aligned rather than a latent divergence.
+ */
 export function applyMarkup(usd: string, markup: string): string {
-  const usdScaled = parseScaled(usd) ?? 0n;
+  const usdScaled = parseScaled(usd);
+  if (usdScaled === null) return fmtMoney(0n);
   const markupScaled = parseScaled(markup) ?? SCALE;
   return fmtMoney((usdScaled * markupScaled) / SCALE);
 }
@@ -407,14 +440,24 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
     // to token events, billing nothing at all in an llm_cost-only setup. Stripping
     // the marker indexes them under their real vendor. Verified collision-free
     // against the live catalog: no un-prefixed id duplicates a "~"-prefixed one.
+    // Alias-derived keys are written only if absent, rather than assigned: the
+    // collision-freedom above is a property of TODAY's catalog, and with plain
+    // assignment the winner depended purely on iteration order — if OpenRouter ever
+    // ships both "google/gemini-flash-latest" and "~google/gemini-flash-latest", the
+    // moving alias could overwrite the real listing's rate (measured on a synthetic
+    // pair: 0.009 vs 0.001 for the same lookup, decided by nothing but position in
+    // the response). A real listing now always wins, whatever the order. Non-alias
+    // entries keep plain assignment so genuine duplicates behave exactly as before.
     const bare = id.startsWith("~") ? id.slice(1) : id;
+    const isAlias = bare !== id;
     exact.set(id, mp);
-    if (bare !== id) exact.set(bare, mp);
+    if (isAlias && !exact.has(bare)) exact.set(bare, mp);
     const slash = bare.indexOf("/");
     if (slash > 0) {
       const vendor = bare.slice(0, slash).toLowerCase();
       const suffix = bare.slice(slash + 1);
-      normMap.set(`${vendor}\n${norm(suffix)}`, mp);
+      const normKey = `${vendor}\n${norm(suffix)}`;
+      if (!isAlias || !normMap.has(normKey)) normMap.set(normKey, mp);
     }
   }
   return { exact, norm: normMap };
@@ -437,7 +480,7 @@ export function lookupOpenRouter(table: OpenRouterTable, provider: string, model
   return (
     table.exact.get(`${vendor}/${model}`) ??
     table.norm.get(`${vendor}\n${norm(model)}`) ??
-    table.norm.get(`${vendor}\n${norm(stripVersion(model))}`) ??
+    table.norm.get(`${vendor}\n${norm(stripVersionOpenRouter(model))}`) ??
     null
   );
 }

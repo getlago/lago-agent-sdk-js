@@ -43,6 +43,27 @@ export class LagoClient {
     this.insecureAgent = verifySsl ? undefined : new Agent({ connect: { rejectUnauthorized: false } });
   }
 
+  /** Releases the undici Agent created for `verifySsl: false`.
+   *
+   * Resource hygiene, NOT a process-exit fix — measured, not assumed: with the Agent
+   * left open a script still exited immediately, because undici's sockets are not
+   * ref'd handles. (What actually held the loop open for the full shutdown timeout was
+   * the uncancelled race timer in `EventQueue.shutdown`, now fixed there.) What this
+   * does buy is a process that constructs many short-lived `LagoSDK` instances — a
+   * per-request or per-tenant SDK — not accumulating one connection pool per instance
+   * with nothing to release them. Idempotent and best-effort: shutdown must never
+   * throw because a socket pool objected. */
+  async close(): Promise<void> {
+    const agent = this.insecureAgent;
+    if (!agent) return;
+    this.insecureAgent = undefined;
+    try {
+      await agent.close();
+    } catch {
+      /* releasing sockets must never fail shutdown */
+    }
+  }
+
   async sendBatch(events: LagoEvent[]): Promise<void> {
     if (events.length === 0) return;
     const url = `${this.apiUrl}/events/batch`;

@@ -1,5 +1,5 @@
 /** LagoSDK — emit, subscription resolution, error policy. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage, UnknownClientError } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -71,6 +71,61 @@ describe("LagoSDK.emit", () => {
     });
     expect(sdk.config.apiUrl).toBe("http://explicit:3000/api/v1");
     await sdk.shutdown(1000);
+  });
+
+  it.each([
+    ["empty string", ""],
+    ["undefined", undefined],
+  ])("apiUrl as %s keeps the production default", async (_label, value) => {
+    // `apiUrl: process.env.LAGO_API_URL ?? ""` with the var unset must NOT write "".
+    // Downstream `fetch("")` throws TypeError, which is not a LagoApiError, so the
+    // queue treats it as transient and retries at the 60s ceiling forever — all
+    // billing stops with only a growing buffer as the symptom.
+    const sdk = new LagoSDK({ apiKey: "k", apiUrl: value });
+    expect(sdk.config.apiUrl).toBe("https://api.getlago.com/api/v1");
+    await sdk.shutdown(1000);
+  });
+
+  it("negative token counts are reported, not just dropped", async () => {
+    // `CanonicalUsage` is exported and `emit()` takes one directly — the documented
+    // way to backfill usage the SDK did not intercept — so a caller computing a delta
+    // wrongly really can hand us a negative. Dropping it is correct (Lago would sum a
+    // negative billable quantity) but it was the only drop path that never reached
+    // onError.
+    const seen: Array<[unknown, string]> = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "k",
+      defaultSubscriptionId: "sub",
+      config: { onError: (e, c) => seen.push([e, c]) },
+    });
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(makeCanonicalUsage({ input: -100, output: 50, model: "m", provider: "anthropic" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const values = received.map((e) => String((e.properties as Record<string, unknown>).value));
+    expect(values.every((v) => !v.startsWith("-"))).toBe(true);
+    expect(seen.map(([, c]) => c)).toContain("negative_tokens");
+    expect(String(seen.find(([, c]) => c === "negative_tokens")![0])).toContain("input");
+  });
+
+  it("reportError logs as well as calling onError", async () => {
+    // This port logged NOTHING here, so a dropped event was invisible to anyone who
+    // had not wired up onError — while Python emitted a line. onError is opt-in; the
+    // log is the floor.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sdk = new LagoSDK({ apiKey: "k" }); // no subscription -> the drop path
+      sdk.emit(makeCanonicalUsage({ input: 10, output: 5, model: "m", provider: "anthropic" }));
+      await sdk.shutdown(1000);
+      const lines = warn.mock.calls.map((c) => c.map(String).join(" "));
+      expect(lines.some((l) => l.includes("[lago]") && l.includes("subscription"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("default apiUrl is still production when nothing is passed", async () => {
