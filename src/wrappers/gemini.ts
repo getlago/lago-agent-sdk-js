@@ -13,7 +13,8 @@
  * chunk's usage.
  *
  * Per-call override: pass `lago: { subscription, dimensions }` in the request
- * options. The wrapper strips it before forwarding.
+ * options. The wrapper forwards a COPY with `lago` removed, leaving the caller's own
+ * object intact for reuse.
  */
 import { extractGeminiNative } from "../adapters/gemini_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -110,13 +111,20 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
   // ---------- models.generateContent ----------
   if (originalGenerate) {
     const wrappedGenerate = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      // Work on a COPY: the params object belongs to the caller and may be reused
+      // across calls (a retry loop, a request-scoped config). Deleting `lago` from it
+      // made every later call silently fall back to the default subscription,
+      // dimensions, mode and markup. Python pops from its own `**kwargs` and never
+      // touches caller state; this matches.
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
 
-      const response = await originalGenerate(...args);
+      const response = await originalGenerate(...forwarded);
       emitFrom(response, modelId, emitOpts);
       return response;
     };
@@ -126,13 +134,15 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
   // ---------- models.generateContentStream ----------
   if (originalStream) {
     const wrappedStream = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
 
-      const src = (await originalStream(...args)) as AsyncIterable<unknown>;
+      const src = (await originalStream(...forwarded)) as AsyncIterable<unknown>;
 
       async function* iterate(): AsyncIterable<unknown> {
         let lastWithUsage: Record<string, unknown> | null = null;

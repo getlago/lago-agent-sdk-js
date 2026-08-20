@@ -218,3 +218,26 @@ describe("Gemini wrapper", () => {
     await sdk.shutdown(500);
   });
 });
+
+describe("Gemini wrapper — caller params are not consumed", () => {
+  it("a reused params object still bills per-call opts", async () => {
+    // The params object belongs to the caller and may be reused across calls (a retry
+    // loop, a request-scoped config). Deleting `lago` from it made every later call
+    // fall back to the default subscription, dimensions, mode and markup.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeGoogleGenAI() as any);
+    const params: any = {
+      model: "gemini-2.5-flash",
+      contents: "hi",
+      lago: { subscription: "sub_per_call", dimensions: { feature: "X" } },
+    };
+    await client.models.generateContent(params);
+    expect("lago" in params).toBe(true);
+    await client.models.generateContent(params);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(2);
+    expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
+    expect(received.every((e) => e.properties.feature === "X")).toBe(true);
+  });
+});

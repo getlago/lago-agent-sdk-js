@@ -159,8 +159,11 @@ import { extractCloudflareLog, resolveSubscription } from "lago-agent-sdk/gatewa
 
 for (const entry of await fetchGatewayLogs()) {  // GET .../ai-gateway/gateways/{id}/logs
   const usage = extractCloudflareLog(entry);
+  if (usage.extras.cached) continue;  // gateway served it from cache — the provider was never called
   const sub = resolveSubscription(entry) ?? "sub_default"; // from the call's cf-aig-metadata, if set
-  sdk.emit(usage, { subscription: sub, mode: "price", usdCost: entry.cost ?? 0, eventId: `cf_${entry.id}` });
+  // Pass `cost` through as-is. Coercing an absent cost to 0 bills a $0.00 event instead
+  // of falling back to token counts, which is the one outcome that loses revenue silently.
+  sdk.emit(usage, { subscription: sub, mode: "price", usdCost: entry.cost, eventId: `cf_${entry.id}` });
 }
 await sdk.flush();
 ```

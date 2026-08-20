@@ -266,12 +266,15 @@ describe("Anthropic wrapper", () => {
 // ---------------------------------------------------------------------
 function fakeApiPromise(resolvedValue: unknown, cacheStatus?: string) {
   const promise = Promise.resolve(resolvedValue);
+  const headers = cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {};
   return {
     then: promise.then.bind(promise),
     catch: promise.catch.bind(promise),
     finally: promise.finally.bind(promise),
-    asResponse: async () =>
-      new Response(null, cacheStatus ? { headers: { "cf-aig-cache-status": cacheStatus } } : {}),
+    asResponse: async () => new Response(null, headers),
+    // The real APIPromise resolves `withResponse()` via `this.parse()`, so it never
+    // passes through a `then` interceptor — which is what left that path unbilled.
+    withResponse: async () => ({ data: await promise, response: new Response(null, headers) }),
   };
 }
 
@@ -353,5 +356,69 @@ describe("Anthropic wrapper — gateway cache-hit detection", () => {
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
     expect(received).toHaveLength(2);
+  });
+});
+
+describe("Anthropic wrapper — withResponse()", () => {
+  const message = {
+    model: "claude-sonnet-4-6",
+    content: [{ type: "text", text: "hi" }],
+    usage: { input_tokens: 8, output_tokens: 16 },
+  };
+
+  class WrMessages {
+    create(_args: any) {
+      return fakeApiPromise(message);
+    }
+  }
+  class WrAnthropic {
+    messages = new WrMessages();
+  }
+  Object.defineProperty(WrAnthropic, "name", { value: "Anthropic" });
+
+  it("is billed, not silently skipped", async () => {
+    // `withResponse()` calls `this.parse()` on the target, so the Proxy's `then` trap
+    // never fires for it and the call went entirely unbilled. `messages.stream()` uses
+    // this path internally.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new WrAnthropic() as any);
+    const promise: any = client.messages.create({ model: "claude-sonnet-4-6", messages: [] });
+    const result = await promise.withResponse();
+    expect(result.data).toBeDefined();
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(8);
+    expect(map.llm_output_tokens).toBe(16);
+  });
+
+  it("bills once when the caller uses BOTH await and withResponse()", async () => {
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new WrAnthropic() as any);
+    const promise: any = client.messages.create({ model: "claude-sonnet-4-6", messages: [] });
+    await promise;
+    await promise.withResponse();
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.filter((e) => e.code === "llm_input_tokens").length).toBe(1);
+    expect(received.filter((e) => e.code === "llm_output_tokens").length).toBe(1);
+  });
+
+  it("does not consume the caller's params — a reused object still bills per-call opts", async () => {
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new WrAnthropic() as any);
+    const params: any = {
+      model: "claude-sonnet-4-6",
+      messages: [],
+      lago: { subscription: "sub_per_call", dimensions: { feature: "X" } },
+    };
+    await client.messages.create(params);
+    expect("lago" in params).toBe(true);
+    await client.messages.create(params);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(2);
+    expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
+    expect(received.every((e) => e.properties.feature === "X")).toBe(true);
   });
 });

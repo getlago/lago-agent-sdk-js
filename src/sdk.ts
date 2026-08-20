@@ -72,14 +72,11 @@ export interface WrapOptions {
    *   - split cost events `${eventId}_cost_${fieldName}`
    *   - single cost event `eventId` (one event, nothing to disambiguate)
    *
-   * The namespaces are load-bearing. Both paths are reachable for the SAME
-   * `eventId`: a price lookup that misses falls back to token events, and the
-   * same window re-run once the table is warm takes the cost path. Under one
-   * shared namespace the second run re-sent `{eventId}_input` under a different
-   * metric code, Lago rejected it as a duplicate — and because `/events/batch`
-   * is all-or-nothing, that rejection failed every other event in the batch
-   * too. Net effect: the dollar amounts for that window were never billed, only
-   * the raw token counts, and nothing surfaced it.
+   * The namespaces are load-bearing, because both paths are reachable for the SAME
+   * `eventId`: a price lookup that misses falls back to token events, and the same
+   * window re-run once the table is warm takes the cost path. Sharing one namespace
+   * makes the second run a duplicate `transaction_id`, and since `/events/batch` is
+   * all-or-nothing that rejection takes the whole batch with it.
    */
   eventId?: string;
 }
@@ -91,13 +88,11 @@ export class LagoSDK {
   private pricing: PricingProvider;
 
   constructor(opts: LagoSDKOptions) {
-    // Explicit options win over anything set on `config`; `config` supplies every
-    // field they don't mention. The spread order is load-bearing and was inverted:
-    // with `...(opts.config || {})` LAST, a `config.apiUrl` overrode an explicitly
-    // passed `apiUrl`, which is the opposite of what the Python port documents and
-    // does — so the same call billed a different Lago instance depending on which
-    // SDK you used. Each explicit field is applied only when actually provided, so
-    // an unset one leaves the config's value intact.
+    // Explicit options win over anything set on `config`, which supplies every field
+    // they don't mention. Spread order is load-bearing: with `config` last, a
+    // `config.apiUrl` would override an explicitly passed `apiUrl` and the same call
+    // would bill a different Lago instance than the Python port. Each explicit field is
+    // applied only when provided, so an unset one leaves the config's value intact.
     this.config = makeConfig({
       ...(opts.config || {}),
       apiKey: opts.apiKey,
@@ -152,20 +147,14 @@ export class LagoSDK {
   }
 
   /**
-   * Best-effort, automatic, non-blocking warm-up for the two
-   * credential-gated pricing sources — triggered by `wrap()` itself, which
-   * the customer already calls, so there's no separate function to
-   * remember. `wrap()` almost always happens some real time before the
-   * customer's first actual completion call (building the prompt, setting
-   * up messages, etc.), so kicking the fetch off here — instead of waiting
-   * for that first completion call to flag it stale — gives it a real head
-   * start: often enough to be warm before that first call even lands, not
-   * just for every call after it.
+   * Best-effort, non-blocking warm-up for the two credential-gated pricing sources,
+   * triggered by `wrap()` — which the customer already calls, so there is no extra
+   * function to remember. `wrap()` normally runs some real time before the first
+   * completion call, so starting the fetch here often lands it warm before that call
+   * rather than only for the ones after it.
    *
-   * Only runs when `pricingMode === "price"` is the global default —
-   * otherwise there's nothing to warm for. `prime()`/`wake()` are both pure
-   * in-memory (no I/O on this thread); the actual HTTP fetch still happens
-   * on the queue's background loop, never here.
+   * Only when `pricingMode === "price"`. `prime()`/`wake()` are pure in-memory; the HTTP
+   * fetch still happens on the queue's background loop, never here.
    */
   private autoPrimePricingFor(kind: string, client: unknown): void {
     if (this.config.pricingMode !== "price") return;
@@ -218,32 +207,21 @@ export class LagoSDK {
    * for the queue's background loop to pick them up on its next tick (up
    * to `flushIntervalMs` later, by default ~1s).
    *
-   * A call made immediately after construction — the common shape in a
-   * script or one-shot job, as opposed to a long-running server where the
-   * first real call naturally lands well after that first tick — races a
-   * still-cold cache. `emit()` never silently under-bills, so a miss falls
-   * back to token events; but with no token-metric charge configured at
-   * all (a single `llm_cost`-only billing setup), there is nowhere left to
-   * fall back to and the event is lost. Call this once, right after
-   * constructing the SDK with `pricingMode: "price"`, to close that window
-   * deterministically for OpenRouter — the table nearly every native
-   * provider prices against — which is always warmed regardless of
-   * `providers`.
+   * A call made immediately after construction — a script or one-shot job, rather than
+   * a server where the first real call lands well after that tick — races a still-cold
+   * table. A miss falls back to token events, but with an `llm_cost`-only billing setup
+   * there is nowhere to fall back to and the event is lost. Call this once, right after
+   * constructing with `pricingMode: "price"`, to close that window for OpenRouter —
+   * always warmed, regardless of `providers`.
    *
-   * Cloudflare Workers AI and Mistral alias resolution are NOT warmed by
-   * default: both are credential-gated and provider-specific, and eagerly
-   * hitting either's API at construction time regardless of whether that
-   * provider is ever actually called would be pure waste for the common
-   * case. Left alone, they stay reactive — the first real call to that
-   * provider triggers the fetch (and `wrap()` itself already primes both
-   * automatically the moment it sees a matching client — see
-   * `autoPrimePricingFor`), and every call after that is cached — so only a
-   * session's first Workers AI or Mistral call, made without ever calling
-   * `wrap()` for it, can race a cold cache.
+   * Workers AI and Mistral alias resolution are NOT warmed by default: both are
+   * credential-gated and provider-specific, so fetching them for a provider that may
+   * never be called is pure waste. They stay reactive, and `wrap()` already primes them
+   * when it sees a matching client (see `autoPrimePricingFor`). Name them —
+   * `["mistral"]`, `["workers-ai"]` — only when you will call one WITHOUT `wrap()`.
    *
-   * If you already know you're about to call one or both this session
-   * without going through `wrap()`, say so and skip that one-time cost
-   * too: `providers: ["mistral"]` and/or `["workers-ai"]`.
+   * Resolves once the fetch has been attempted, not once it has succeeded: a failure is
+   * reported through `onError` and leaves the table cold, exactly as a lazy miss would.
    */
   async warmPricing(providers: string[] = []): Promise<void> {
     this.pricing.prime(providers);

@@ -9,23 +9,14 @@
  *     (anthropic / openai / mistral / gemini). Prices are USD per token.
  *   - AWS Bedrock Price List Bulk API (public, no credentials) for Bedrock.
  *   - Cloudflare's own model catalog (/accounts/{id}/ai/models/search) for
- *     "workers-ai" — the actual rate the gateway bills at, not a third
- *     party's price for hosting the same open-weight model elsewhere
- *     (verified live: Cloudflare's real charged cost for one call matched
- *     this catalog's rate exactly; OpenRouter's listing for the same
- *     underlying model came out ~3.5x lower — a genuinely different price,
- *     not just a naming mismatch). Needs an account id + API token
- *     (Cloudflare's catalog isn't public/no-auth the way OpenRouter/AWS
- *     are); without both set, this source is simply empty.
- *   - Mistral's own /v1/models for *alias resolution*, not pricing directly.
- *     Mistral has no per-token price table of its own — but a customer
- *     request commonly uses a moving alias ("mistral-small-latest") that
- *     Mistral's response never resolves (unlike Anthropic/OpenAI, which
- *     report the dated snapshot that answered) — so the OpenRouter lookup
- *     below misses even though OpenRouter *does* list the resolved id
- *     (e.g. "mistralai/mistral-small-2603") with real pricing. /v1/models
- *     exposes the resolution directly via each model's `aliases` array;
- *     needs the customer's own Mistral API key.
+ *     "workers-ai" — the rate the gateway actually bills at, which is NOT the same
+ *     number as a third party's price for the same open-weight model. Needs an account
+ *     id + API token; without both, this source is simply empty.
+ *   - Mistral's own /v1/models for *alias resolution*, not pricing. Mistral publishes no
+ *     per-token table, and unlike Anthropic/OpenAI its response never resolves a moving
+ *     alias ("mistral-small-latest"), so the OpenRouter lookup misses even though
+ *     OpenRouter lists the resolved id with real pricing. Each model's `aliases` array
+ *     gives the resolution directly; needs the customer's own Mistral API key.
  *
  * `lookup()` is pure in-memory and never does network I/O, so the customer's
  * call is never blocked on pricing. All HTTP happens in `maybeRefresh()`, which
@@ -306,18 +297,6 @@ function finalizeBreakdown(
 }
 
 /**
- * Build a CostBreakdown from a cost the CALLER already knows.
- *
- * For a gateway that reports its own real, metered price per call (e.g.
- * Cloudflare AI Gateway's `cost` field), computing our own per-token
- * estimate via the OpenRouter/Bedrock tables would be redundant AND less
- * accurate than the number the gateway already gives us. This skips
- * `computeCost` entirely — there's one lump sum, not a per-field
- * breakdown, so `fields` is empty and the invalid/negative case floors to
- * 0 the same way `parseScaled` always has, rather than throwing or
- * silently mis-billing.
- */
-/**
  * Total tokens a call actually consumed, with per-provider overlaps removed.
  *
  * Sums the same PRICED_FIELDS the split cost path emits one event each for, so the
@@ -349,6 +328,15 @@ export function deoverlappedTokenTotal(usage: CanonicalUsageLike): number {
   return Object.values(counts).reduce((a, b) => a + b, 0);
 }
 
+/**
+ * Build a CostBreakdown from a cost the CALLER already knows.
+ *
+ * For a gateway that reports its own real, metered price per call (e.g. Cloudflare AI
+ * Gateway's `cost`), our per-token estimate would be both redundant and less accurate
+ * than the number the gateway already has. Skips `computeCost` entirely: one lump sum,
+ * so `fields` is empty, and an invalid or negative input floors to 0 the way
+ * `parseScaled` always has rather than throwing or mis-billing.
+ */
 export function computePrecomputedCost(usdCost: unknown, markupScaled: bigint): CostBreakdown {
   const baseScaled = parseScaled(usdCost) ?? 0n;
   return finalizeBreakdown(baseScaled, markupScaled, "precomputed", {});

@@ -260,6 +260,31 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
+  it.each([401, 403])("holds rather than drops a %i — credentials are not the batch", async (status) => {
+    // A rotated or revoked key is fixed out-of-band, so the events are still billable.
+    // Dropping them one-by-one discarded every event for the whole outage.
+    let attempts = 0;
+    const delivered: string[] = [];
+    const sender = async (batch: LagoEvent[]) => {
+      attempts++;
+      if (attempts === 1) throw new LagoApiError(status, '{"error":"unauthorized"}');
+      for (const e of batch) delivered.push(e.transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      q.push(evId("a"));
+      q.push(evId("b"));
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && delivered.length === 0) await sleep(50);
+      expect(delivered).toEqual(["a", "b"]);
+      // Retried as one batch — never fanned out into per-event requests.
+      expect(attempts).toBe(2);
+    } finally {
+      await q.shutdown(2000);
+    }
+  });
+
   it("treats an unrecognized 4xx as transient", async () => {
     // Only the enumerated validation statuses are permanent. An unfamiliar 4xx
     // errs toward retrying: a needless delay costs latency, a wrong drop costs
@@ -284,7 +309,7 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
-  it.each([400, 401, 403, 404, 409, 422])("still isolates and drops on a %i", async (status) => {
+  it.each([400, 404, 409, 422])("still isolates and drops on a %i", async (status) => {
     // The statuses that genuinely cannot succeed on a re-send keep the
     // isolate-one-by-one behaviour, so a single bad transaction_id still
     // doesn't take the rest of its batch down with it.
@@ -352,5 +377,119 @@ describe("EventQueue — shutdown drain", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0][1]).toBe("send_batch");
     expect(String(errors[0][0])).toContain("network still down");
+  });
+});
+
+// ----------------------------------------------------------------------
+// A permanent batch failure whose isolated sends fail TRANSIENTLY puts those
+// events back on the buffer. Retrying them with no delay is an unbounded spin
+// at the speed of the failure, which also starves the event loop and never
+// re-checks `stopping`.
+// ----------------------------------------------------------------------
+describe("EventQueue — no unbounded respin after isolating a batch", () => {
+  it("paces re-queued events instead of spinning", async () => {
+    let calls = 0;
+    const sender = async (batch: LagoEvent[]) => {
+      calls++;
+      // Permanent on the batch, transient on every isolated send: the exact pair
+      // that used to loop with zero delay.
+      throw new LagoApiError(batch.length > 1 ? 422 : 429, "x");
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 60_000);
+    try {
+      for (const id of ["a", "b", "c"]) q.push(evId(id));
+      // A plain timer must still get a turn — the spin starved the event loop
+      // entirely, so this never resolved.
+      let timerFired = false;
+      setTimeout(() => (timerFired = true), 300);
+      await sleep(1200);
+      expect(timerFired).toBe(true);
+      // 1 batch + 3 isolated + at most a couple of paced retries. The spin did
+      // hundreds of thousands in this window.
+      expect(calls).toBeLessThan(40);
+      // @ts-expect-error — touch private backoffMs for test
+      expect(q.backoffMs).toBeGreaterThan(0);
+    } finally {
+      await q.shutdown(500);
+    }
+  });
+
+  it("does not respin during the exit drain either", async () => {
+    // The drain has no later retry, so re-queuing a transient sub-failure there means
+    // re-taking it immediately — a hot loop for the whole drain budget. Those events
+    // must be reported as lost instead.
+    let calls = 0;
+    const lost: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => {
+      const s = a.map(String).join(" ");
+      if (s.includes("LOST")) lost.push(s);
+    };
+    const sender = async (batch: LagoEvent[]) => {
+      calls++;
+      throw new LagoApiError(batch.length > 1 ? 422 : 429, "x");
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 60_000);
+    try {
+      for (const id of ["a", "b", "c"]) q.push(evId(id));
+      await sleep(400);
+      const before = calls;
+      await q.shutdown(1500);
+      // 1 batch + 3 isolated sends per pass, not thousands.
+      expect(calls - before).toBeLessThan(20);
+      expect(lost.length).toBeGreaterThan(0);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it("keeps draining when isolation fully resolves the batch", async () => {
+    // The counterpart: nothing re-queued means the buffer shrank, so the loop
+    // should keep going immediately rather than waiting for the next tick.
+    const delivered: string[] = [];
+    const sender = async (batch: LagoEvent[]) => {
+      if (batch.length > 1) throw new LagoApiError(422, "batch rejected");
+      delivered.push(batch[0].transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 2, 10_000, 500);
+    try {
+      for (const id of ["a", "b", "c", "d"]) q.push(evId(id));
+      expect(await q.flush(3000)).toBe(true);
+      expect(new Set(delivered)).toEqual(new Set(["a", "b", "c", "d"]));
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+});
+
+// ----------------------------------------------------------------------
+// Shutting down while the loop sits in its backoff sleep must still reach the
+// exit drain. Returning early skipped both the drain and its warning, so the
+// buffered events were abandoned with nothing logged.
+// ----------------------------------------------------------------------
+describe("EventQueue — shutdown during backoff", () => {
+  it("reports what it could not send instead of abandoning it silently", async () => {
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => void warnings.push(a.map(String).join(" "));
+    const sender = async () => {
+      throw new Error("network down");
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 60_000);
+    try {
+      q.push(evId("a"));
+      // Wait until the loop has actually entered backoff.
+      const deadline = Date.now() + 2000;
+      // @ts-expect-error — touch private backoffMs for test
+      while (Date.now() < deadline && q.backoffMs === 0) await sleep(25);
+      await q.shutdown(300);
+      expect(warnings.some((w) => w.includes("LOST"))).toBe(true);
+    } finally {
+      console.warn = origWarn;
+    }
   });
 });

@@ -1,24 +1,17 @@
 /** Async batched event queue.
  *
- * Async-safe in-memory buffer. Background loop flushes every `flushIntervalMs`
- * or immediately when buffer reaches `maxBatchSize`. On a TRANSIENT send
- * failure (network error, 5xx), re-prepends the batch and applies exponential
- * backoff (1s → 60s cap). Resets on next success.
+ * In-memory buffer; a background loop flushes every `flushIntervalMs`, or at once when
+ * the buffer reaches `maxBatchSize`.
  *
- * A PERMANENT failure (a Lago *validation* 4xx — e.g. a duplicate
- * `transaction_id` from replaying/backfilling the same window twice) is
- * different: retrying it will never succeed, so it is logged and dropped instead
- * of re-queued. Without this distinction, one permanently-doomed batch sits at
- * the front of the FIFO buffer and blocks every event queued behind it —
- * including brand new, perfectly valid ones — for the full backoff ceiling, over
- * and over, since a batch that can never succeed is retried exactly like one
- * that might.
+ * A TRANSIENT failure (network error, 5xx, throttling) re-prepends the batch and backs
+ * off exponentially (1s → 60s cap), resetting on the next success. A PERMANENT failure
+ * is one only a different payload could fix, so retrying it forever would head-of-line
+ * block the whole FIFO; it is isolated one event at a time and the bad events dropped.
+ * "Permanent" is a specific list of statuses, not the whole 4xx range — see
+ * `PERMANENT_STATUSES`.
  *
- * Note that "permanent" is a specific list of statuses, NOT the whole 4xx range —
- * see `PERMANENT_STATUSES`.
- *
- * Drains on `beforeExit` — keeps sending until the buffer is truly empty (not
- * just one batch's worth) or a bounded time budget is exhausted.
+ * Drains on exit until the buffer is empty or a bounded time budget is spent; whatever
+ * is left is reported, never dropped in silence.
  */
 
 import type { LagoEvent } from "./lago_client.js";
@@ -26,22 +19,23 @@ import { LagoApiError } from "./exceptions.js";
 
 type Sender = (batch: LagoEvent[]) => Promise<void>;
 
-// Statuses where re-sending the SAME batch can never succeed: the request itself is
-// the problem (malformed body, bad credentials, a transaction_id Lago has already
-// accepted). Deliberately an explicit list rather than the 400-499 range, because two
-// 4xx statuses mean "try again, later": 429 (rate limited) and 408 (request timeout).
-// Treating those as permanent dropped billable events AND fanned one throttled batch
-// out into up to `maxBatchSize` extra requests aimed at the server that had just asked
-// us to slow down.
-const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 401, 403, 404, 409, 422]);
+// Statuses where re-sending the SAME batch can never succeed, because the BATCH is
+// what is wrong: a malformed body, or a transaction_id Lago has already accepted.
+//
+// Deliberately an explicit list, not the 400-499 range. The test is "is this a property
+// of the batch?" — if the fix is an out-of-band change rather than a different payload,
+// the events are still billable and must be held, not dropped. That excludes 429/408
+// (throttling: retrying one batch as N isolated sends aims MORE traffic at a server
+// asking us to slow down) and 401/403 (a rotated or revoked key: permanent here meant a
+// key rotation silently discarded every event for the whole outage). Held instead, a bad
+// key blocks at the 60s ceiling until `maxBufferSize` overflows — bounded, oldest-first,
+// reported, and fully recoverable once the key is fixed.
+const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 422]);
 
 /** True when re-sending this exact batch can never succeed.
  *
- * A validation 4xx (bad request, duplicate transaction_id, revoked key) will fail
- * identically forever, so it is isolated and dropped. Everything else — 5xx, a
- * network-level exception (timeout, connection error, no LagoApiError at all), and
- * the throttling 4xxs 429/408 — might succeed later and stays retryable. An
- * unrecognized 4xx is treated as transient: waiting on an event that would have been
+ * Anything not on the list — 5xx, a network-level exception with no LagoApiError at
+ * all, an unrecognized 4xx — is transient: waiting on an event that would have been
  * dropped costs a delay, dropping one that would have been accepted costs revenue. */
 function isPermanentFailure(exc: unknown): boolean {
   return exc instanceof LagoApiError && PERMANENT_STATUSES.has(exc.status);
@@ -50,6 +44,7 @@ function isPermanentFailure(exc: unknown): boolean {
 export class EventQueue {
   private buffer: LagoEvent[] = [];
   private wakeResolvers: Array<() => void> = [];
+  private stopResolvers: Array<() => void> = [];
   private stopping = false;
   private backoffMs = 0;
   private loopPromise: Promise<void>;
@@ -100,6 +95,9 @@ export class EventQueue {
     await this.flush(timeoutMs);
     this.stopping = true;
     this.wake();
+    // Release anything parked in a backoff sleep, so shutdown reaches the exit drain
+    // instead of waiting out a backoff that can be a full minute long.
+    for (const fn of this.stopResolvers.splice(0, this.stopResolvers.length)) fn();
     // Best effort wait for the loop to complete
     await Promise.race([this.loopPromise, sleep(timeoutMs)]);
   }
@@ -134,6 +132,26 @@ export class EventQueue {
     });
   }
 
+  /** Backoff sleep that returns early once shutdown begins — the equivalent of
+   * Python's `self._stopping.wait(timeout=...)`. A plain `sleep` here meant a backoff
+   * at the 60s ceiling outlived the process's shutdown window, so the exit drain never
+   * ran. Deliberately NOT `waitWake`: that is also woken by `flush()` and `push()`,
+   * which would cut short the very pause a 429 asked us to take. */
+  private sleepUnlessStopping(ms: number): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(id);
+        this.stopResolvers = this.stopResolvers.filter((fn) => fn !== done);
+        resolve();
+      };
+      const id = setTimeout(done, ms);
+      // Same reasoning as `waitWake`: never hold the event loop open on our own.
+      (id as unknown as { unref?: () => void }).unref?.();
+      this.stopResolvers.push(done);
+    });
+  }
+
   private takeBatch(): LagoEvent[] {
     if (this.buffer.length === 0) return [];
     const n = Math.min(this.maxBatchSize, this.buffer.length);
@@ -156,17 +174,28 @@ export class EventQueue {
     }
   }
 
-  /** Recovery path for a batch that failed with a permanent (4xx) error.
+  /** Recovery path for a batch that failed with a permanent error.
    *
-   * Each event is sent alone: one that individually 4xxs (e.g. its own
-   * transaction_id really is a duplicate) is logged and dropped for good;
-   * one that succeeds alone is done; one that hits a TRANSIENT error while
-   * isolated is re-queued for the normal backoff-and-retry path, same as any
-   * other event. Reports once via onError for the batch as a whole (the
-   * original exception) so a caller isn't flooded with N callbacks for
-   * what's really one root cause. */
-  private async sendIndividually(batch: LagoEvent[], batchExc: unknown): Promise<void> {
+   * Each event is sent alone: one that individually fails permanently is dropped for
+   * good; one that succeeds is done; one that hits a TRANSIENT error is re-queued for
+   * the normal backoff-and-retry path. Reports once via onError for the batch as a
+   * whole, so a caller isn't flooded with N callbacks for one root cause.
+   *
+   * Returns the number of events put back on the buffer — the caller needs it to know
+   * whether the buffer actually shrank, and so whether draining on can make progress.
+   *
+   * `requeueTransient: false` is for the exit drain, where no later retry exists: putting
+   * an event back there means re-taking it on the next drain iteration with no delay, so
+   * a batch that keeps failing is a hot loop for the whole drain budget. Those events are
+   * reported as lost instead, which is what the drain does with a transient failure
+   * anyway. */
+  private async sendIndividually(
+    batch: LagoEvent[],
+    batchExc: unknown,
+    requeueTransient: boolean = true,
+  ): Promise<number> {
     this.reportError(batchExc);
+    let requeued = 0;
     for (const event of batch) {
       try {
         this.httpCalls++;
@@ -177,12 +206,25 @@ export class EventQueue {
             `[lago] dropping event (permanent failure, will not retry): transaction_id=${event.transaction_id}:`,
             exc,
           );
-        } else {
+        } else if (requeueTransient) {
           console.warn("[lago] send failed for isolated event, will retry:", exc);
           this.replayFailed([event]);
+          requeued++;
+        } else {
+          this.reportError(exc, "shutdown_drain");
+          console.warn(
+            `[lago] event LOST on shutdown — no retry left: transaction_id=${event.transaction_id}:`,
+            exc,
+          );
         }
       }
     }
+    return requeued;
+  }
+
+  /** 1s → 2s → 4s → … → `maxRetryMs`. */
+  private nextBackoff(): number {
+    return this.backoffMs === 0 ? 1000 : Math.min(this.backoffMs * 2, this.maxRetryMs);
   }
 
   private async run(): Promise<void> {
@@ -201,11 +243,19 @@ export class EventQueue {
       while (true) {
         const batch = this.takeBatch();
         if (batch.length === 0) break;
+        // Re-checked every iteration, not only when backing off: `break` hands the batch
+        // to the exit drain below, which is what reports whatever it cannot send.
+        // Returning from here instead skipped both the drain and its warning, so a
+        // shutdown landing mid-backoff abandoned the buffer in silence.
+        if (this.stopping) {
+          this.replayFailed(batch);
+          break;
+        }
         if (this.backoffMs > 0) {
-          await sleep(this.backoffMs);
+          await this.sleepUnlessStopping(this.backoffMs);
           if (this.stopping) {
             this.replayFailed(batch);
-            return;
+            break;
           }
         }
         try {
@@ -214,38 +264,37 @@ export class EventQueue {
           this.backoffMs = 0;
         } catch (exc) {
           if (isPermanentFailure(exc)) {
-            // Lago's batch endpoint is all-or-nothing: a single bad
-            // transaction_id fails the WHOLE batch, even if the rest are
-            // perfectly valid — re-queuing the batch as-is would retry (and
-            // re-fail) forever, but dropping it outright would silently
-            // lose those valid events too. Isolate by falling back to
-            // one-by-one for this batch only; only the events that
-            // individually 4xx get dropped.
-            await this.sendIndividually(batch, exc);
-            this.backoffMs = 0;
-            continue;
+            // Lago's batch endpoint is all-or-nothing: one bad transaction_id fails the
+            // WHOLE batch. Re-queuing as-is would re-fail forever; dropping outright
+            // would lose the valid events with it. Isolate one-by-one, this batch only.
+            const requeued = await this.sendIndividually(batch, exc);
+            if (requeued === 0) {
+              // Batch fully resolved — the buffer shrank, so keep draining immediately.
+              this.backoffMs = 0;
+              continue;
+            }
+            // Some isolated sends failed transiently and went back on the buffer.
+            // Looping straight back would re-take those same events with no delay and
+            // re-fail at the speed of the failure — an unbounded spin that never
+            // re-checks `stopping` and starves the event loop. Pace them through the
+            // normal backoff path instead.
+            this.backoffMs = this.nextBackoff();
+            break;
           }
           this.replayFailed(batch);
           this.reportError(exc);
           console.warn("[lago] send_batch failed:", exc);
-          this.backoffMs = this.backoffMs === 0 ? 1000 : Math.min(this.backoffMs * 2, this.maxRetryMs);
+          this.backoffMs = this.nextBackoff();
           break;
         }
       }
     }
-    // Drain on exit — keep sending until the buffer is truly empty, not just
-    // one batch's worth (a buffer holding more than maxBatchSize events at
-    // shutdown previously left the rest never even attempted). No more
-    // retries are possible once this loop exits, so unlike the main loop, a
-    // transient failure here is ALSO final: it must be logged, never
-    // silently swallowed the way a bare `catch { /* ignore */ }` previously
-    // did — that's what actually lost events, not the network blip itself,
-    // which by itself is recoverable if it's just reported. `sendIndividually`
-    // re-queues transient sub-failures for retry — appropriate for the main
-    // loop, which lives on, but during this exit drain that could spin
-    // forever against a persistently-down network. Bound the whole drain by
-    // wall-clock time; whatever's still in the buffer once the budget is
-    // spent is logged as lost, not retried forever in an exiting process.
+    // Drain on exit until the buffer is truly empty, not just one batch's worth. No
+    // retry is possible past this point, so a transient failure here is ALSO final and
+    // must be reported rather than swallowed — an unreported drop is what loses events,
+    // not the network blip. `sendIndividually` re-queues transient sub-failures, which
+    // is right for the main loop but could spin forever in an exiting process, so the
+    // whole drain is bounded by wall-clock time and the remainder reported as lost.
     const drainDeadline = Date.now() + Math.min(this.maxRetryMs, 10_000);
     while (Date.now() < drainDeadline) {
       const batch = this.takeBatch();
@@ -254,7 +303,7 @@ export class EventQueue {
         await this.sender(batch);
       } catch (exc) {
         if (isPermanentFailure(exc)) {
-          await this.sendIndividually(batch, exc);
+          await this.sendIndividually(batch, exc, false);
         } else {
           this.reportError(exc);
           console.warn(

@@ -18,22 +18,15 @@
  * usage payload. Without this, OpenAI's stream returns no usage at all —
  * silent under-billing for the customer.
  *
- * Gateway cache-hit detection (non-streaming only): before emitting, peek at
- * the raw response via `.asResponse()` (an APIPromise method OpenAI's SDK
- * already exposes for exactly this — safe to call alongside `.then()`/await
- * on the same promise, no extra network round-trip). If a gateway in front
- * of the provider (e.g. Cloudflare AI Gateway) marks the response
- * `cf-aig-cache-status: HIT`, the provider served it from cache at zero cost
- * to the customer — we skip billing it. No-op with no gateway in the path
- * (the header is simply absent) or with a simplified/custom client that
- * doesn't expose `.asResponse()` (degrades to the pre-existing behavior:
- * always emit). Streaming is NOT covered — OpenAI recommends
- * `.with_streaming_response`/other handling for that, which behaves
- * differently and hasn't been verified end-to-end.
+ * Gateway cache-hit detection (non-streaming only): peek at the raw response via
+ * `.asResponse()` before emitting — same promise, no extra round-trip. A gateway
+ * marking `cf-aig-cache-status: HIT` served it from its own cache, so the provider was
+ * never called and it must not be billed. Absent header, or a client without
+ * `.asResponse()`, degrades to always emitting. Streaming is not covered.
  *
- * Per-call override: pass `lago: { subscription, dimensions }` in the args
- * object. The wrapper strips it before forwarding so OpenAI's strict validator
- * doesn't reject it.
+ * Per-call override: pass `lago: { subscription, dimensions }` in the args object. The
+ * wrapper forwards a COPY with `lago` removed, so OpenAI's strict validator doesn't
+ * reject it and the caller's own object is left intact for reuse.
  */
 import { extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -194,6 +187,17 @@ export function wrapOpenAIClient<T extends OpenAILike>(
       const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
       const apiPromise = original(...forwarded) as object;
 
+      // ONE emit per call, whichever trap the caller touches. `await p` and
+      // `p.withResponse()` are both instrumented below and both resolve from the SAME
+      // underlying APIPromise, so doing both — a caller reading usage, then reading
+      // rate-limit headers — billed the call twice.
+      let emitted = false;
+      const emitOnce = (payload: unknown) => {
+        if (emitted) return;
+        emitted = true;
+        emitFrom(payload, modelId, emitOpts);
+      };
+
       // APIPromise has class-private fields (#httpResponse). Methods accessed
       // through the Proxy must be bound to the underlying target — not the
       // Proxy — or the engine throws on private-field access.
@@ -213,7 +217,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                     // underlying promise before emitting — see
                     // isCacheHit()'s docstring for why this is safe.
                     if (!(await isCacheHit(target))) {
-                      emitFrom(value, modelId, emitOpts);
+                      emitOnce(value);
                     }
                   } else if (isAsyncIterable(value)) {
                     next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
@@ -224,15 +228,14 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                 return onfulfilled ? onfulfilled(next) : next;
               }, onrejected);
           }
-          // `withResponse()` resolves to `{ data, response }` and is a documented
-          // public API for reading rate-limit headers — but it calls `this.parse()`
-          // on the TARGET, so the `then` trap above never fires and the call was
-          // never billed at all. Bill from its parsed `data`, with the same
-          // cache-hit suppression the `then` path uses.
+          // `withResponse()` resolves to `{ data, response }` and is a documented public
+          // API for reading rate-limit headers, but it calls `this.parse()` on the
+          // TARGET, so the `then` trap never fires for it. Bill from its parsed `data`,
+          // with the same cache-hit suppression and the same once-guard.
           //
           // `asResponse()` is deliberately NOT wrapped: it hands back an unparsed
-          // `Response`, and reading the body to find usage would consume the stream
-          // the caller is about to read. An unbillable call beats a broken one.
+          // `Response`, and reading the body to find usage would consume the stream the
+          // caller is about to read. An unbillable call beats a broken one.
           const rawWithResponse = (target as { withResponse?: unknown }).withResponse;
           if (prop === "withResponse" && typeof rawWithResponse === "function") {
             const orig = (rawWithResponse as () => Promise<unknown>).bind(target);
@@ -240,7 +243,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
               const result = (await orig()) as { data?: unknown };
               try {
                 if (looksLikeResponse(result?.data) && !(await isCacheHit(target))) {
-                  emitFrom(result.data, modelId, emitOpts);
+                  emitOnce(result.data);
                 }
               } catch {
                 /* never break the call */

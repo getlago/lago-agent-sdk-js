@@ -269,6 +269,53 @@ describe("OpenAI wrapper — Chat Completions", () => {
     expect(map.llm_output_tokens).toBe(16);
   });
 
+  it("bills once when the caller uses BOTH await and withResponse()", async () => {
+    // Both traps hang off the SAME APIPromise, so a caller reading usage and then
+    // reading rate-limit headers billed one call twice.
+    const { sdk, received } = newSdk();
+    class WrCompletions {
+      create(_args: any) {
+        return fakeApiPromise({
+          model: "gpt-4o-mini",
+          choices: [{ message: { role: "assistant", content: "hi", tool_calls: null } }],
+          usage: { prompt_tokens: 8, completion_tokens: 16 },
+        });
+      }
+    }
+    class WrClient {
+      chat = { completions: new WrCompletions() };
+    }
+    Object.defineProperty(WrClient, "name", { value: "OpenAI" });
+    const client2 = sdk.wrap(new WrClient() as any);
+    const promise: any = client2.chat.completions.create({ model: "gpt-4o-mini", messages: [] } as any);
+    await promise;
+    await promise.withResponse();
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.filter((e) => e.code === "llm_input_tokens").length).toBe(1);
+    expect(received.filter((e) => e.code === "llm_output_tokens").length).toBe(1);
+  });
+
+  it("does not consume the caller's params — a reused object still bills per-call opts", async () => {
+    // The params object belongs to the caller and may be reused across calls. Deleting
+    // `lago` from it made every later call fall back to the default subscription.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeOpenAI());
+    const params: any = {
+      model: "gpt-4o-mini",
+      messages: [],
+      lago: { subscription: "sub_per_call", dimensions: { feature: "X" } },
+    };
+    await client.chat.completions.create(params);
+    expect("lago" in params).toBe(true);
+    await client.chat.completions.create(params);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(2);
+    expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
+    expect(received.every((e) => e.properties.feature === "X")).toBe(true);
+  });
+
   it("auto-injects stream_options.include_usage when missing", async () => {
     const { sdk } = newSdk();
     const fake = new FakeOpenAI();

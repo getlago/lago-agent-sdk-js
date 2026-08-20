@@ -1,9 +1,6 @@
 /**
  * Cloudflare AI Gateway log adapter — maps a Logs API entry to CanonicalUsage.
  *
- * Verified against a real captured log entry (live account, real Anthropic call
- * routed through a real gateway, real Lago rollup confirmed exact).
- *
  * Field mapping (`GET .../ai-gateway/gateways/{id}/logs` and the single-entry
  * `GET .../logs/{log_id}`):
  *   tokens_in                                       -> input
@@ -13,27 +10,19 @@
  *   usage_metadata.reasoningTokens/reasoning_tokens  -> reasoning
  *   model, provider                                  -> passed straight through
  *
- * `usage_metadata`'s exact key casing is NOT normalized by Cloudflare — it
- * passes through whatever convention the underlying provider's own usage
- * object used (Anthropic/OpenAI: snake_case `input_cached_tokens`; a real
- * captured Gemini entry: camelCase `reasoningTokens`). Both cases are checked
- * for every field we map; this is observed behavior across two providers,
- * not a documented guarantee, so a third provider could use a convention we
- * haven't seen yet.
+ * `usage_metadata` key casing is NOT normalized by Cloudflare: it passes through
+ * whatever the underlying provider used (Anthropic/OpenAI snake_case
+ * `input_cached_tokens`, Gemini camelCase `reasoningTokens`), so both cases are checked
+ * for every mapped field. Observed across two providers, not a documented guarantee.
  *
- * Unlike the provider-native adapters (`adapters/openai_native.ts`,
- * `adapters/anthropic_native.ts`), there is no request-side model kwarg to
- * prefer or fall back on here — a Cloudflare log entry always reports the
- * model that actually served the request. This adapter is immune, by
- * construction, to the alias-vs-resolved-model bug fixed in those two.
+ * There is no request-side model kwarg to reconcile here — a log entry always names the
+ * model that actually served the request.
  *
- * Billing *policy* is deliberately not decided here — this module only
- * extracts. `cached`, `step`, and the log's own `id` land in `extras` because
- * the caller (the poller) needs them: `cached` to decide whether to skip
- * billing a request Cloudflare served for free, `id` as the idempotency key
- * against replays. `resolveSubscription()` is separate from extraction
- * because attribution can be absent, and dropping vs. warning on that is
- * also a caller policy decision.
+ * Billing *policy* is deliberately not decided here; this module only extracts. `cached`,
+ * `step` and the log's own `id` land in `extras` because the caller needs them: `cached`
+ * to skip a request Cloudflare served for free, `id` as the idempotency key against
+ * replays. `resolveSubscription()` is separate because attribution can be absent, and
+ * dropping vs. warning on that is the caller's policy too.
  */
 
 import { CanonicalUsage, makeCanonicalUsage } from "../../canonical.js";
