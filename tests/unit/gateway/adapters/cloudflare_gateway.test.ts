@@ -375,4 +375,41 @@ describe("Cloudflare gateway — cache key casing", () => {
     expect(u.cache_read).toBe(0);
     expect(u.cache_write).toBe(0);
   });
+
+  it("accepts provider-native cache and reasoning spellings", () => {
+    // SYNTHETIC entries — no provider-native key appears in ANY of the 14 captured
+    // fixtures (they carry only Cloudflare's own vocabulary). These pin the
+    // unobserved insurance spellings so the fallthrough list cannot be trimmed by
+    // accident. The direction of the harm differs by provider, which is why both
+    // matter: Anthropic's cache_read is ADDITIVE, so a missed key means those tokens
+    // are never billed (under-bill); Gemini's is SUBTRACTIVE, so a missed key bills
+    // them at the full prompt rate (over-bill).
+    expect(
+      extractCloudflareLog({
+        tokens_in: 100,
+        tokens_out: 10,
+        provider: "anthropic",
+        usage_metadata: { cache_read_input_tokens: 4242 },
+      }).cache_read,
+    ).toBe(4242);
+
+    expect(
+      extractCloudflareLog({
+        tokens_in: 100,
+        tokens_out: 10,
+        provider: "google-ai-studio",
+        usage_metadata: { thoughtsTokenCount: 852 },
+      }).reasoning,
+    ).toBe(852);
+
+    // Cloudflare's own spelling still wins when both are present
+    expect(
+      extractCloudflareLog({
+        tokens_in: 100,
+        tokens_out: 10,
+        provider: "anthropic",
+        usage_metadata: { input_cached_tokens: 11, cache_read_input_tokens: 4242 },
+      }).cache_read,
+    ).toBe(11);
+  });
 });

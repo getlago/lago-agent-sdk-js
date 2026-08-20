@@ -150,6 +150,52 @@ describe("Gemini wrapper", () => {
     expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
   });
 
+  it("remembers the resolved version from an earlier chunk", async () => {
+    // SYNTHETIC: the version arrives early, usage last, with no version on it.
+    // Deliberately NOT what real Gemini does — verified live 2026-08-20 that every
+    // streaming chunk carries BOTH `model_version` and `usage_metadata`, which is
+    // why FakeGoogleGenAI puts it on both and why the hazard is invisible there.
+    // The property under test is that the version is remembered ACROSS chunks
+    // rather than read off whichever chunk happens to carry usage. JS already did
+    // this; Python read it from the usage chunk alone and reverted to the requested
+    // alias on this input, so the two repos priced the same call differently.
+    class FakeGoogleGenAIVersionEarly {
+      models = {
+        generateContentStream: async () =>
+          (async function* () {
+            yield {
+              candidates: [{ content: { parts: [{ text: "hi" }] } }],
+              model_version: RESOLVED_STREAM_MODEL,
+              usage_metadata: null,
+            };
+            yield {
+              candidates: [{ content: { parts: [{ text: "." }] }, finish_reason: "STOP" }],
+              // no model_version here
+              usage_metadata: {
+                prompt_token_count: 9,
+                candidates_token_count: 4,
+                thoughts_token_count: 0,
+                total_token_count: 13,
+              },
+            };
+          })(),
+      };
+    }
+
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeGoogleGenAIVersionEarly() as any);
+    const stream = (await client.models.generateContentStream({
+      model: "gemini-flash-latest",
+      contents: "hi",
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => e.properties.model))).toEqual(new Set([RESOLVED_STREAM_MODEL]));
+  });
+
   it("generateContentStream captures usage from final chunk", async () => {
     const { sdk, received } = newSdk();
     const fake = new FakeGoogleGenAI();
