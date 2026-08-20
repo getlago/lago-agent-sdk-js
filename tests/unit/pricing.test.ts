@@ -1557,3 +1557,47 @@ describe("SDK price mode", () => {
     await sdk.shutdown(1000);
   });
 });
+
+// ----------------------------------------------------------------------
+// prime() must respect the TTL. It runs on the queue's loop ahead of
+// takeBatch(), so a needless catalogue refetch also delays event delivery.
+// ----------------------------------------------------------------------
+describe("PricingProvider — prime() staleness bookkeeping", () => {
+  it("does NOT re-flag a table that is still inside its TTL", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+
+    // Exactly what a server doing `sdk.wrap(new Mistral(...))` per request triggers —
+    // and note it re-primed OpenRouter even though only "mistral" was named.
+    for (let i = 0; i < 3; i++) {
+      p.prime(["mistral"]);
+      await p.maybeRefresh();
+    }
+    expect(fetcher.openrouterCalls).toBe(1);
+  });
+
+  it("DOES re-flag once the TTL has expired", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 0 }); // everything is instantly stale
+    p.prime();
+    await p.maybeRefresh();
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(2);
+  });
+
+  it("still fetches a genuinely cold table", async () => {
+    // The gate must not turn "throttle a warm table" into "never warm a cold one".
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai", "mistral"]);
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    expect(fetcher.mistralAliasesCalls).toBe(1);
+  });
+});

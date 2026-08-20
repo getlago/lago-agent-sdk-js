@@ -870,12 +870,27 @@ export class PricingProvider {
    * than throwing, since this is a hint, not a contract.
    */
   prime(providers: string[] = []): void {
-    this.openrouterStale = true;
+    // Gated on "is this table actually cold?", NOT unconditional. `wrap()` and
+    // `warmPricing()` both reach here and a server can run either per request, so
+    // flagging an in-TTL table stale means re-downloading the ~400-model OpenRouter
+    // catalogue on the next tick — `pricingTtlMs` would never apply on this path.
+    //
+    // "Cold" is the same test `lookup()` uses, so priming and looking up cannot
+    // disagree about what needs fetching.
+    if (this.isCold(this.openrouter, this.openrouterFetched)) this.openrouterStale = true;
     for (const p of providers) {
       const key = (p || "").toLowerCase();
-      if (key === "workers-ai") this.cloudflareStale = true;
-      else if (key === "mistral") this.mistralStale = true;
+      if (key === "workers-ai") {
+        if (this.isCold(this.cloudflareWorkersAi, this.cloudflareFetched)) this.cloudflareStale = true;
+      } else if (key === "mistral") {
+        if (this.isCold(this.mistralAliases, this.mistralFetched)) this.mistralStale = true;
+      }
     }
+  }
+
+  /** True when a table needs fetching: absent, or older than the TTL. */
+  private isCold(table: unknown | null, fetchedAt: number): boolean {
+    return table === null || Date.now() - fetchedAt >= this.ttlMs;
   }
 
   /**
