@@ -493,3 +493,84 @@ describe("EventQueue — shutdown during backoff", () => {
     }
   });
 });
+
+// ----------------------------------------------------------------------
+// FIFO across an isolation walk. `replayFailed` PREPENDS, so re-queuing the
+// transient sub-failures one at a time inverts them and Lago receives descending
+// timestamps for one subscription. Reachable whenever a batch 4xxs on one bad row
+// and then hits throttling partway through the walk.
+// ----------------------------------------------------------------------
+describe("EventQueue — arrival order survives an isolation walk", () => {
+  it("re-queues transient sub-failures in arrival order, not reversed", async () => {
+    const sends: string[][] = [];
+    let isolating = true;
+    const sender = async (batch: LagoEvent[]) => {
+      sends.push(batch.map((e) => e.transaction_id));
+      if (!isolating) return;
+      // Permanent on the batch -> isolate; t1 is the genuinely bad row, the rest are
+      // throttled mid-recovery.
+      if (batch.length > 1) throw new LagoApiError(422, "one bad row");
+      if (batch[0].transaction_id === "t1") throw new LagoApiError(422, "duplicate");
+      throw new LagoApiError(503, "throttled");
+    };
+
+    const q = new EventQueue(sender, 25, 100, 10_000, 60_000, () => {});
+    for (let i = 1; i <= 5; i++) q.push(ev(i));
+
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && sends.length < 6) await sleep(25);
+    isolating = false;
+
+    const requeued = await (async () => {
+      const stop = Date.now() + 4000;
+      while (Date.now() < stop) {
+        const later = sends.slice(6).find((s) => s.length > 1);
+        if (later) return later;
+        await sleep(25);
+      }
+      return undefined;
+    })();
+
+    await q.shutdown(500);
+    expect(requeued).toEqual(["t2", "t3", "t4", "t5"]);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Pricing refresh must not sit in front of the drain. maybeRefresh() does HTTP with a
+// 10s timeout per source; refreshing first made every queued billable event wait
+// behind it on every tick, and a source that kept failing repeated that forever.
+// ----------------------------------------------------------------------
+describe("EventQueue — a slow pricing refresh does not delay event delivery", () => {
+  it("delivers the batch before the refresh completes", async () => {
+    const REFRESH_MS = 600;
+    let refreshDone = false;
+    const pricing = {
+      async maybeRefresh() {
+        await sleep(REFRESH_MS);
+        refreshDone = true;
+        throw new Error("bad credential"); // the failing case, which used to repeat every tick
+      },
+    };
+
+    let deliveredBeforeRefresh: boolean | undefined;
+    const q = new EventQueue(
+      async () => {
+        deliveredBeforeRefresh ??= !refreshDone;
+      },
+      25,
+      100,
+      10_000,
+      60_000,
+      () => {},
+      pricing,
+    );
+
+    q.push(ev(1));
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && deliveredBeforeRefresh === undefined) await sleep(10);
+    await q.shutdown(500);
+
+    expect(deliveredBeforeRefresh).toBe(true);
+  });
+});

@@ -192,7 +192,7 @@ export class EventQueue {
     requeueTransient: boolean = true,
   ): Promise<number> {
     this.reportError(batchExc);
-    let requeued = 0;
+    const retry: LagoEvent[] = [];
     for (const event of batch) {
       try {
         this.httpCalls++;
@@ -205,8 +205,7 @@ export class EventQueue {
           );
         } else if (requeueTransient) {
           console.warn("[lago] send failed for isolated event, will retry:", exc);
-          this.replayFailed([event]);
-          requeued++;
+          retry.push(event);
         } else {
           this.reportError(exc, "shutdown_drain");
           console.warn(
@@ -216,7 +215,12 @@ export class EventQueue {
         }
       }
     }
-    return requeued;
+    // Collected and re-queued in ONE call, never one per event: `replayFailed`
+    // prepends, so N separate calls invert the batch and Lago receives descending
+    // timestamps for the same subscription. Reachable whenever a batch 4xxs on one bad
+    // row and then hits throttling partway through the isolation walk.
+    if (retry.length > 0) this.replayFailed(retry);
+    return retry.length;
   }
 
   /** 1s → 2s → 4s → … → `maxRetryMs`. */
@@ -224,12 +228,74 @@ export class EventQueue {
     return this.backoffMs === 0 ? 1000 : Math.min(this.backoffMs * 2, this.maxRetryMs);
   }
 
+  /** Send everything buffered, one batch at a time, until the buffer is empty or a
+   * failure hands the batch to the retry backoff. Returns rather than looping on a
+   * failure: the caller waits out `flushIntervalMs` and comes back. */
+  private async drainBuffer(): Promise<void> {
+    while (true) {
+      const batch = this.takeBatch();
+      if (batch.length === 0) return;
+      // Re-checked every iteration, not only when backing off. `return`, never a
+      // path that abandons the batch: the exit drain is what reports whatever it
+      // cannot send, so the events must be back on the buffer before leaving.
+      if (this.stopping) {
+        this.replayFailed(batch);
+        return;
+      }
+      if (this.backoffMs > 0) {
+        await this.sleepUnlessStopping(this.backoffMs);
+        if (this.stopping) {
+          this.replayFailed(batch);
+          return;
+        }
+      }
+      try {
+        this.httpCalls++;
+        await this.sender(batch);
+        this.backoffMs = 0;
+      } catch (exc) {
+        if (isPermanentFailure(exc)) {
+          // Lago's batch endpoint is all-or-nothing: one bad transaction_id fails the
+          // WHOLE batch. Re-queuing as-is would re-fail forever; dropping outright
+          // would lose the valid events with it. Isolate one-by-one, this batch only.
+          const requeued = await this.sendIndividually(batch, exc);
+          if (requeued === 0) {
+            // Batch fully resolved — the buffer shrank, so keep draining immediately.
+            this.backoffMs = 0;
+            continue;
+          }
+          // Some isolated sends failed transiently and went back on the buffer.
+          // `continue` here re-takes them with no delay and re-fails at the speed of
+          // the failure — an unbounded spin that starves the event loop. They must go
+          // through the normal backoff path.
+          this.backoffMs = this.nextBackoff();
+          return;
+        }
+        this.replayFailed(batch);
+        this.reportError(exc);
+        console.warn("[lago] send_batch failed:", exc);
+        this.backoffMs = this.nextBackoff();
+        return;
+      }
+    }
+  }
+
   private async run(): Promise<void> {
     while (!this.stopping) {
       await this.waitWake(this.flushIntervalMs);
 
-      // Refresh pricing tables on this background loop (off the hot path).
-      if (this.pricing) {
+      // Drain BEFORE refreshing pricing, not after. `maybeRefresh()` does HTTP — up to
+      // a 10s timeout per source — and refreshing first put that latency in front of
+      // every queued billable event, on every tick; a source that kept failing repeated
+      // it indefinitely. Nothing in the drain depends on it: an event's price was
+      // already resolved at emit() time, so a fresh table only ever matters to the NEXT
+      // call.
+      await this.drainBuffer();
+
+      // Refresh pricing tables on this background loop (off the hot path). Skipped
+      // once shutting down: a fetch here can take the full HTTP timeout, and it would
+      // spend the caller's shutdown budget on a table nothing will ever read.
+      if (this.pricing && !this.stopping) {
         try {
           await this.pricing.maybeRefresh();
         } catch {
@@ -237,52 +303,9 @@ export class EventQueue {
         }
       }
 
-      while (true) {
-        const batch = this.takeBatch();
-        if (batch.length === 0) break;
-        // Re-checked every iteration, not only when backing off. `break`, never
-        // `return`: the exit drain below is what reports whatever it cannot send, so
-        // returning from here abandons the buffer in silence.
-        if (this.stopping) {
-          this.replayFailed(batch);
-          break;
-        }
-        if (this.backoffMs > 0) {
-          await this.sleepUnlessStopping(this.backoffMs);
-          if (this.stopping) {
-            this.replayFailed(batch);
-            break;
-          }
-        }
-        try {
-          this.httpCalls++;
-          await this.sender(batch);
-          this.backoffMs = 0;
-        } catch (exc) {
-          if (isPermanentFailure(exc)) {
-            // Lago's batch endpoint is all-or-nothing: one bad transaction_id fails the
-            // WHOLE batch. Re-queuing as-is would re-fail forever; dropping outright
-            // would lose the valid events with it. Isolate one-by-one, this batch only.
-            const requeued = await this.sendIndividually(batch, exc);
-            if (requeued === 0) {
-              // Batch fully resolved — the buffer shrank, so keep draining immediately.
-              this.backoffMs = 0;
-              continue;
-            }
-            // Some isolated sends failed transiently and went back on the buffer.
-            // `continue` here re-takes them with no delay and re-fails at the speed of
-            // the failure — an unbounded spin that starves the event loop. They must go
-            // through the normal backoff path.
-            this.backoffMs = this.nextBackoff();
-            break;
-          }
-          this.replayFailed(batch);
-          this.reportError(exc);
-          console.warn("[lago] send_batch failed:", exc);
-          this.backoffMs = this.nextBackoff();
-          break;
-        }
-      }
+      // Anything pushed while the refresh was in flight would otherwise wait out a
+      // whole flush interval on top of it.
+      if (!this.stopping) await this.drainBuffer();
     }
     // Drain on exit until the buffer is truly empty, not just one batch's worth. No
     // retry is possible past this point, so a transient failure here is ALSO final and

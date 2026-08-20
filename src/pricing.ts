@@ -31,6 +31,15 @@ export const cloudflareModelsUrl = (accountId: string): string =>
   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
 export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
 
+// A failed pricing fetch must not be retried on every tick. `maybeRefresh()` runs once
+// per queue flush (1s by default) and each attempt can burn the full 10s HTTP timeout,
+// so an unreachable endpoint or a rotated credential would otherwise retry forever at
+// the speed of its own timeout, with nothing to show for it. Per source: 1s, 2s, 4s …
+// to a 60s ceiling — the same shape and ceiling as the event queue's send backoff —
+// cleared on that source's next success.
+const FETCH_RETRY_BASE_MS = 1_000;
+const FETCH_RETRY_MAX_MS = 60_000;
+
 export const PRICED_FIELDS = ["input", "output", "cache_read", "cache_write", "reasoning"] as const;
 export type PricedField = (typeof PRICED_FIELDS)[number];
 
@@ -43,11 +52,21 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 //   anthropic         — cache_read/cache_write are ADDITIVE to input, hence absent
 //   workers-ai        — only ever reached through Cloudflare's OpenAI-COMPATIBLE
 //                       endpoint, so the payload is the OpenAI shape and the OpenAI
-//                       semantics apply. It is a separate provider only because it
+//                       semantics apply on BOTH axes: `cached_tokens` inside
+//                       `prompt_tokens`, and `reasoning_tokens` inside
+//                       `completion_tokens`. It is a separate provider only because it
 //                       prices against Cloudflare's catalog (see inferProvider in
 //                       adapters/openai_native.ts).
+//
+// Workers AI's reasoning membership is latent, not live: measured against the real
+// gateway, `/compat` returns `completion_tokens_details: null` even for reasoning
+// models (gpt-oss-120b, deepseek-r1-distill-qwen-32b, qwq-32b), and Cloudflare's
+// catalog publishes no per-M-reasoning-tokens unit. It is here because the day either
+// changes, the overlap has to already be known — and because the Python port
+// (_OUTPUT_INCLUDES_REASONING) has carried it since the same review, and the two
+// repos reporting different token quantities for one call is its own bug.
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
-const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
+const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -829,6 +848,10 @@ export class PricingProvider {
   // requiring a separate LagoConfig.mistralApiKey.
   private mistralApiKeyOverride: string | null = null;
   private refreshing = new Set<string>();
+  // Post-failure backoff, per source: current delay, and the earliest next attempt.
+  // Absent from both maps == healthy.
+  private retryDelayMs = new Map<string, number>();
+  private retryAfterMs = new Map<string, number>();
 
   constructor(
     opts: {
@@ -943,7 +966,14 @@ export class PricingProvider {
     }
   }
 
-  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale. */
+  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale.
+   *
+   * The four sources are independent: no ordering dependency, no shared state beyond
+   * their own table. They run CONCURRENTLY, so one slow or hanging endpoint delays only
+   * itself rather than everything queued behind it — a sequential walk of four 10s
+   * timeouts is a 40s tick. `allSettled` because `refreshSource` already contains every
+   * failure; it is here so one unexpected rejection can never leave the rest unawaited.
+   */
   async maybeRefresh(): Promise<void> {
     if (
       !this.openrouterStale &&
@@ -954,62 +984,79 @@ export class PricingProvider {
       return;
     }
 
-    if (this.openrouterStale && !this.refreshing.has("openrouter")) {
-      this.refreshing.add("openrouter");
-      try {
-        const table = await this.fetcher.fetchOpenRouter();
-        this.openrouter = table;
-        this.openrouterFetched = Date.now();
-        this.openrouterStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchOpenRouter");
-      } finally {
-        this.refreshing.delete("openrouter");
-      }
+    const jobs: Array<Promise<void>> = [];
+
+    if (this.openrouterStale) {
+      jobs.push(
+        this.refreshSource("openrouter", "pricing.fetchOpenRouter", async () => {
+          const table = await this.fetcher.fetchOpenRouter();
+          this.openrouter = table;
+          this.openrouterFetched = Date.now();
+          this.openrouterStale = false;
+        }),
+      );
     }
 
-    if (this.cloudflareStale && !this.refreshing.has("cloudflare_workers_ai")) {
-      this.refreshing.add("cloudflare_workers_ai");
-      try {
-        const table = await this.fetcher.fetchCloudflareWorkersAi();
-        this.cloudflareWorkersAi = table;
-        this.cloudflareFetched = Date.now();
-        this.cloudflareStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchCloudflareWorkersAi");
-      } finally {
-        this.refreshing.delete("cloudflare_workers_ai");
-      }
+    if (this.cloudflareStale) {
+      jobs.push(
+        this.refreshSource("cloudflare_workers_ai", "pricing.fetchCloudflareWorkersAi", async () => {
+          const table = await this.fetcher.fetchCloudflareWorkersAi();
+          this.cloudflareWorkersAi = table;
+          this.cloudflareFetched = Date.now();
+          this.cloudflareStale = false;
+        }),
+      );
     }
 
-    if (this.mistralStale && !this.refreshing.has("mistral_aliases")) {
-      this.refreshing.add("mistral_aliases");
-      try {
-        const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
-        this.mistralAliases = aliases;
-        this.mistralFetched = Date.now();
-        this.mistralStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchMistralAliases");
-      } finally {
-        this.refreshing.delete("mistral_aliases");
-      }
+    if (this.mistralStale) {
+      jobs.push(
+        this.refreshSource("mistral_aliases", "pricing.fetchMistralAliases", async () => {
+          const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
+          this.mistralAliases = aliases;
+          this.mistralFetched = Date.now();
+          this.mistralStale = false;
+        }),
+      );
     }
 
     for (const region of [...this.bedrockStale]) {
-      const key = `bedrock:${region}`;
-      if (this.refreshing.has(key)) continue;
-      this.refreshing.add(key);
-      try {
-        const table = await this.fetcher.fetchBedrock(region);
-        this.bedrock.set(region, table);
-        this.bedrockFetched.set(region, Date.now());
-        this.bedrockStale.delete(region);
-      } catch (err) {
-        this.report(err, "pricing.fetchBedrock");
-      } finally {
-        this.refreshing.delete(key);
-      }
+      jobs.push(
+        this.refreshSource(`bedrock:${region}`, "pricing.fetchBedrock", async () => {
+          const table = await this.fetcher.fetchBedrock(region);
+          this.bedrock.set(region, table);
+          this.bedrockFetched.set(region, Date.now());
+          this.bedrockStale.delete(region);
+        }),
+      );
+    }
+
+    await Promise.allSettled(jobs);
+  }
+
+  /** Run one source's fetch, guarded by the in-flight set AND its retry backoff.
+   *
+   * A source stays flagged stale on failure — the event is still unpriced, so the
+   * retry must happen; `retryAfterMs` is what decides WHEN, instead of "every tick".
+   */
+  private async refreshSource(source: string, where: string, run: () => Promise<void>): Promise<void> {
+    if (this.refreshing.has(source)) return;
+    const notBefore = this.retryAfterMs.get(source);
+    if (notBefore !== undefined && Date.now() < notBefore) return;
+    this.refreshing.add(source);
+    try {
+      await run();
+      // Healthy again: the next failure starts the backoff over at 1s rather than
+      // inheriting a ceiling reached hours ago.
+      this.retryDelayMs.delete(source);
+      this.retryAfterMs.delete(source);
+    } catch (err) {
+      const prev = this.retryDelayMs.get(source) ?? 0;
+      const delay = prev === 0 ? FETCH_RETRY_BASE_MS : Math.min(prev * 2, FETCH_RETRY_MAX_MS);
+      this.retryDelayMs.set(source, delay);
+      this.retryAfterMs.set(source, Date.now() + delay);
+      this.report(err, where);
+    } finally {
+      this.refreshing.delete(source);
     }
   }
 

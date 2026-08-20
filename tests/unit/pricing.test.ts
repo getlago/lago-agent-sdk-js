@@ -25,6 +25,7 @@ import {
   parseMistralAliases,
   parseOpenRouter,
   parseScaled,
+  type PricingFetcher,
   PricingProvider,
 } from "../../src/pricing.js";
 
@@ -1599,5 +1600,154 @@ describe("PricingProvider — prime() staleness bookkeeping", () => {
     expect(fetcher.openrouterCalls).toBe(1);
     expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
     expect(fetcher.mistralAliasesCalls).toBe(1);
+  });
+});
+
+// ----------------------------------------------------------------------
+// A failing fetch must back off. maybeRefresh() runs once per queue flush (1s) and
+// each attempt can burn the full 10s HTTP timeout, so retrying on every tick means a
+// rotated credential re-attempts forever at the speed of its own timeout.
+// ----------------------------------------------------------------------
+class FailingFetcher {
+  calls = 0;
+  fail = true;
+  async fetchOpenRouter(): Promise<OpenRouterTable> {
+    this.calls++;
+    if (this.fail) throw new Error("401 bad credential");
+    return parseOpenRouter(OPENROUTER_RAW);
+  }
+  async fetchBedrock(): Promise<Map<string, ModelPrice>> {
+    return new Map();
+  }
+  async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+    return new Map();
+  }
+  async fetchMistralAliases(): Promise<Map<string, string>> {
+    return new Map();
+  }
+}
+
+describe("PricingProvider — a failing source backs off instead of retrying every tick", () => {
+  it("attempts once, then holds off across many ticks", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime();
+    for (let i = 0; i < 20; i++) await p.maybeRefresh();
+    // 20 ticks, 1 attempt: the first failure parks the source for 1s.
+    expect(fetcher.calls).toBe(1);
+  });
+
+  it("stays stale, so the retry does happen once the window passes", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.calls).toBe(1);
+    await new Promise((r) => setTimeout(r, 1100)); // first backoff window is 1s
+    fetcher.fail = false;
+    await p.maybeRefresh();
+    expect(fetcher.calls).toBe(2);
+    // Recovered: the table is warm and the price resolves.
+    expect(p.lookup("openai", "gpt-4o", "chat.completions")).not.toBeNull();
+  });
+
+  it("resets the backoff after a success, so the next failure starts at 1s again", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 0 });
+    p.prime();
+    await p.maybeRefresh(); // fails -> 1s window
+    await new Promise((r) => setTimeout(r, 1100));
+    fetcher.fail = false;
+    await p.maybeRefresh(); // succeeds -> window cleared
+    fetcher.fail = true;
+    p.prime();
+    await p.maybeRefresh(); // fails again: allowed immediately, not stuck at 2s
+    expect(fetcher.calls).toBe(3);
+  });
+});
+
+// ----------------------------------------------------------------------
+// The four sources are independent. Walking them sequentially makes one hanging
+// endpoint a delay for all of them — four 10s timeouts is a 40s tick.
+// ----------------------------------------------------------------------
+describe("PricingProvider — independent sources refresh concurrently", () => {
+  it("a slow source does not serialize the others", async () => {
+    const DELAY = 300;
+    const finished: string[] = [];
+    const slow = {
+      async fetchOpenRouter(): Promise<OpenRouterTable> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("openrouter");
+        return parseOpenRouter(OPENROUTER_RAW);
+      },
+      async fetchBedrock(): Promise<Map<string, ModelPrice>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("bedrock");
+        return new Map();
+      },
+      async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("cloudflare");
+        return new Map();
+      },
+      async fetchMistralAliases(): Promise<Map<string, string>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("mistral");
+        return new Map();
+      },
+    };
+    const p = new PricingProvider({ fetcher: slow as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai", "mistral"]);
+    p.lookup("anthropic", "anthropic.claude-3-5-sonnet-20241022-v2:0", "bedrock.converse");
+
+    const t0 = Date.now();
+    await p.maybeRefresh();
+    const elapsed = Date.now() - t0;
+
+    expect(finished.length).toBe(4);
+    // Concurrent: ~1 delay, not 4. Generous ceiling so a loaded CI box cannot flake it,
+    // while still failing outright on a sequential walk (which would be >= 1200ms).
+    expect(elapsed).toBeLessThan(DELAY * 2.5);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Workers AI reaches us only through Cloudflare's OpenAI-COMPATIBLE endpoint, so
+// OpenAI's overlap semantics apply on BOTH axes. Latent today (measured live,
+// `/compat` returns `completion_tokens_details: null` and the catalog publishes no
+// reasoning unit) — but the Python port has carried it since the same review, and the
+// two repos must never report different quantities for one call.
+// ----------------------------------------------------------------------
+describe("workers-ai token semantics match openai on both axes", () => {
+  const usage = (provider: string) =>
+    makeCanonicalUsage({
+      provider,
+      model: "m",
+      api: "chat.completions",
+      input: 78,
+      output: 187,
+      reasoning: 137, // subset of output
+      cache_read: 20, // subset of input
+    });
+
+  it("reports the same de-overlapped total as openai", () => {
+    expect(deoverlappedTokenTotal(usage("workers-ai"))).toBe(deoverlappedTokenTotal(usage("openai")));
+    expect(deoverlappedTokenTotal(usage("workers-ai"))).toBe(78 + 187);
+  });
+
+  it("does not bill reasoning on top of output when a rate exists", () => {
+    // Scaled 1e12 per token, and a reasoning rate Cloudflare does not publish *yet*.
+    const price: ModelPrice = {
+      source: "cloudflare_workers_ai",
+      input: 1n,
+      output: 2n,
+      cache_read: 1n,
+      cache_write: null,
+      reasoning: 2n,
+    };
+    const cf = computeCost(usage("workers-ai"), price, parseScaled("1")!);
+    const oa = computeCost(usage("openai"), price, parseScaled("1")!);
+    expect(cf.total).toBe(oa.total);
+    expect(cf.fields.reasoning).toBeUndefined();
   });
 });

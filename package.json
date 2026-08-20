@@ -68,17 +68,19 @@
     "tsx": "^4.22.3",
     "typescript": "^5.5.0",
     "typescript-eslint": "^8.59.2",
+    "undici": "^6.28.0",
     "vitest": "^3.2.6"
   },
   "peerDependencies": {
-    "@aws-sdk/client-bedrock-runtime": ">=3.500.0"
+    "@aws-sdk/client-bedrock-runtime": ">=3.500.0",
+    "undici": ">=6.0.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-bedrock-runtime": {
       "optional": true
+    },
+    "undici": {
+      "optional": true
     }
-  },
-  "dependencies": {
-    "undici": "^6.28.0"
   }
 }
