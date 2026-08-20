@@ -67,6 +67,21 @@ class StubFetcher {
   }
 }
 
+class FailingFetcher extends StubFetcher {
+  failOpenRouter = true;
+  failCloudflare = true;
+  override async fetchOpenRouter(): Promise<OpenRouterTable> {
+    this.openrouterCalls++;
+    if (this.failOpenRouter) throw new Error("401 Unauthorized");
+    return { exact: new Map(), norm: new Map() };
+  }
+  override async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+    this.cloudflareWorkersAiCalls++;
+    if (this.failCloudflare) throw new Error("401 Unauthorized");
+    return new Map();
+  }
+}
+
 // Real data, captured live from /accounts/{id}/ai/models/search — this
 // exact shape (including the non-token unit types and the no-price model)
 // is what's actually in the catalog, not a synthetic guess at its structure.
@@ -1675,5 +1690,101 @@ describe("SDK price mode", () => {
     expect(fetcher.mistralAliasesCalls).toBe(1);
     expect(provider.lookup("mistral", "mistral-small-latest", "native")).not.toBeNull();
     await sdk.shutdown(1000);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Staleness bookkeeping: prime() must respect the TTL, and a FAILED source
+// must back off instead of retrying on every tick.
+//
+// Both ran on the queue's loop ahead of takeBatch(), so both delayed the drain.
+// Measured against the live catalogue before the fix: 4 prime()+maybeRefresh()
+// cycles produced 4 full ~400-model downloads where 1 was correct; and with a bad
+// Cloudflare token, 4 ticks produced 4 real requests with no delay between them.
+// ----------------------------------------------------------------------
+describe("PricingProvider — staleness bookkeeping", () => {
+  it("prime() does NOT re-flag a table that is still inside its TTL", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+
+    // Exactly what a server doing `sdk.wrap(new Mistral(...))` per request triggers.
+    for (let i = 0; i < 3; i++) {
+      p.prime(["mistral"]);
+      await p.maybeRefresh();
+    }
+    // Still 1: pricingTtlMs actually applies on this path now.
+    expect(fetcher.openrouterCalls).toBe(1);
+  });
+
+  it("prime() DOES re-flag once the TTL has expired", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 0 }); // everything is instantly stale
+    p.prime();
+    await p.maybeRefresh();
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(2);
+  });
+
+  it("prime() still fetches a genuinely cold table", async () => {
+    // The gate must not turn "throttle a warm table" into "never warm a cold one".
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai", "mistral"]);
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    expect(fetcher.mistralAliasesCalls).toBe(1);
+  });
+
+  it("a failed source backs off instead of retrying every tick", async () => {
+    const fetcher = new FailingFetcher();
+    const reports: string[] = [];
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000, onError: (_e, w) => reports.push(w) });
+
+    p.prime(["workers-ai"]);
+    for (let i = 0; i < 5; i++) await p.maybeRefresh();
+
+    // One attempt per source, not five: the stale flag no longer means "retry now".
+    expect(fetcher.openrouterCalls).toBe(1);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    expect(reports).toHaveLength(2);
+  });
+
+  it("the backoff EXPIRES — it throttles, it does not give up", async () => {
+    // Turning "retries forever" into "never retries again" would be a worse bug: a
+    // transient pricing outage has to recover on its own.
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000, onError: () => {} });
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 1100)); // first step is 1s
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(2);
+
+    // And it recovers for real once the source comes back.
+    fetcher.failOpenRouter = false;
+    await new Promise((r) => setTimeout(r, 2100)); // second step is 2s
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(3);
+  });
+
+  it("one broken source does not stop the healthy ones refreshing", async () => {
+    const fetcher = new FailingFetcher();
+    fetcher.failOpenRouter = false; // openrouter healthy, cloudflare broken
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000, onError: () => {} });
+    p.prime(["workers-ai"]);
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    // OpenRouter succeeded, so it is no longer stale and must not be re-fetched.
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
   });
 });

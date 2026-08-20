@@ -86,6 +86,40 @@ describe("LagoSDK.emit", () => {
     await sdk.shutdown(1000);
   });
 
+  it("an explicitly-empty apiUrl is REPORTED, not silently sent to production", async () => {
+    // The fallback above is right, but the default it falls back to is PRODUCTION, so
+    // a caller who meant to point somewhere specific now ships live billing data to
+    // api.getlago.com. Verified against the real constructor: it resolved to production
+    // with zero onError and zero log output. Ingested events cannot be un-ingested, so
+    // silence is the one outcome this path must not have.
+    const reports: Array<[unknown, string]> = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sdk = new LagoSDK({
+      apiKey: "k",
+      apiUrl: "",
+      config: { onError: (e, w) => reports.push([e, w]) },
+    });
+    expect(sdk.config.apiUrl).toBe("https://api.getlago.com/api/v1");
+    expect(reports).toHaveLength(1);
+    expect(reports[0][1]).toBe("config.apiUrl");
+    expect(String(reports[0][0])).toContain("api.getlago.com");
+    // onError is opt-in, so the log is the floor.
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+    await sdk.shutdown(1000);
+  });
+
+  it("does not report when apiUrl was never passed, or is real", async () => {
+    // Only an EXPLICIT falsy value is a discarded intent. Omitting the field is the
+    // normal case and must stay silent, or every default construction warns.
+    for (const opts of [{ apiKey: "k" }, { apiKey: "k", apiUrl: "http://x:3000/api/v1" }]) {
+      const reports: string[] = [];
+      const sdk = new LagoSDK({ ...opts, config: { onError: (_e, w) => reports.push(w) } });
+      expect(reports).not.toContain("config.apiUrl");
+      await sdk.shutdown(1000);
+    }
+  });
+
   it("negative token counts are reported, not just dropped", async () => {
     // `CanonicalUsage` is exported and `emit()` takes one directly — the documented
     // way to backfill usage the SDK did not intercept — so a caller computing a delta

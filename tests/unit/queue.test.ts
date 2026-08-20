@@ -253,7 +253,10 @@ describe("EventQueue — isolation path ordering and shutdown", () => {
 });
 
 describe("EventQueue — batch-only 4xx is split, not head-of-line blocked", () => {
-  it.each([413, 402, 415])("splits a batch that %i-ed as a whole", async (status) => {
+  // 402 is deliberately NOT here — see "a 402 is held, not dropped" below. What makes
+  // a 413/415 batch fail is a property of the batch itself; a 402 is a property of the
+  // account and resolves out-of-band, so splitting it only drops every event faster.
+  it.each([413, 415])("splits a batch that %i-ed as a whole", async (status) => {
     // For these the SAME batch can never succeed, but its events can individually.
     // Treating them as transient re-prepended the identical batch at the head of the
     // FIFO and backed off to 60s forever, blocking everything behind it. Routing them
@@ -277,7 +280,41 @@ describe("EventQueue — batch-only 4xx is split, not head-of-line blocked", () 
 });
 
 describe("EventQueue — throttling 4xx is transient", () => {
-  it.each([429, 408])("retries rather than drops a %i", async (status) => {
+  it("a 402 is held, not dropped — it resolves out-of-band", async () => {
+    // Regression: 402 used to be permanent, which routed the batch to
+    // sendIndividually, where every isolated send 402ed too and was dropped for good.
+    // Measured against a server returning 402: 5 events in, 6 HTTP calls out, 0
+    // recoverable — a lapsed Lago account silently discarded every billable event for
+    // the whole outage. "Payment required" is a property of the ACCOUNT: it stops being
+    // true the moment someone pays, so the events MUST survive to be re-sent.
+    let attempts = 0;
+    const delivered: string[] = [];
+    const perRequestSizes: number[] = [];
+
+    const sender = async (batch: LagoEvent[]) => {
+      attempts++;
+      perRequestSizes.push(batch.length);
+      // Account is lapsed for the first two attempts, then someone pays.
+      if (attempts <= 2) throw new LagoApiError(402, '{"error":"payment required"}');
+      for (const e of batch) delivered.push(e.transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      for (const id of ["a", "b", "c", "d", "e"]) q.push(evId(id));
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && delivered.length === 0) await sleep(50);
+      // Nothing lost: all five arrive once the account is current again.
+      expect(delivered).toEqual(["a", "b", "c", "d", "e"]);
+      // Never fanned out — every request carried the whole batch, so no event was
+      // ever isolated and dropped.
+      expect(perRequestSizes.every((n) => n === 5)).toBe(true);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it.each([429, 408, 402])("retries rather than drops a %i", async (status) => {
     // Dropping loses revenue, and isolating one-by-one multiplies the load on
     // a server that is already shedding it.
     let attempts = 0;
@@ -303,7 +340,7 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
-  it.each([429, 408])("applies backoff on a %i", async (status) => {
+  it.each([429, 408, 402])("applies backoff on a %i", async (status) => {
     // The inverse of "does not apply backoff after a permanent failure": a
     // throttling failure is transient, so it MUST leave a backoff in place —
     // that pause is the whole point of respecting a rate limit.
