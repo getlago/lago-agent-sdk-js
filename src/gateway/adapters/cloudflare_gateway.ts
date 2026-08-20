@@ -10,16 +10,28 @@
  *   tokens_out                                       -> output
  *   usage_metadata.input_cached_tokens               -> cache_read
  *   usage_metadata.input_cache_creation_tokens       -> cache_write
- *   usage_metadata.reasoningTokens/reasoning_tokens  -> reasoning
+ *   usage_metadata.reasoningTokens                   -> reasoning
  *   model, provider                                  -> passed straight through
  *
- * `usage_metadata`'s exact key casing is NOT normalized by Cloudflare — it
- * passes through whatever convention the underlying provider's own usage
- * object used (Anthropic/OpenAI: snake_case `input_cached_tokens`; a real
- * captured Gemini entry: camelCase `reasoningTokens`). Both cases are checked
- * for every field we map; this is observed behavior across two providers,
- * not a documented guarantee, so a third provider could use a convention we
- * haven't seen yet.
+ * Cloudflare reports its OWN counter vocabulary here, not the provider's. Across
+ * all 14 captured fixtures — Anthropic, Workers AI, Mistral and Gemini, via every
+ * ingress method — the keys that appear are `input_tokens`, `output_tokens`,
+ * `total_tokens`, `input_cached_tokens`, `input_cache_creation_tokens`, `neurons`,
+ * `input_text_tokens` and `reasoningTokens`. Not one provider-native key shows up:
+ * no Anthropic `cache_read_input_tokens`, no Gemini `thoughtsTokenCount` or
+ * `cachedContentTokenCount`.
+ *
+ * That list is a snapshot and has already been overtaken once: a live Logs API pull
+ * also returned `units`, which appears in none of the fixtures. Treat the
+ * enumeration as illustrative, not exhaustive — `MAPPED_USAGE_KEYS` plus the drift
+ * sweep into `extras.usage_metadata` is what actually keeps an unrecognized counter
+ * from being lost, and it needs no re-audit to stay correct.
+ *
+ * That vocabulary is *mostly* snake_case, with `reasoningTokens` as a camelCase
+ * outlier — Cloudflare's own inconsistency, not a provider key leaking through
+ * (Gemini's native spelling for the same quantity is `thoughtsTokenCount`, which
+ * appears nowhere). The extra spellings checked below are therefore unobserved
+ * insurance against a convention we have not seen, not handling for a known case.
  *
  * Unlike the provider-native adapters (`adapters/openai_native.ts`,
  * `adapters/anthropic_native.ts`), there is no request-side model kwarg to
@@ -55,26 +67,57 @@ function safeStr(v: unknown): string {
 /**
  * First of `names` present in `meta` with a usable value, as a number.
  *
- * The gateway does NOT normalize every key it forwards. Its own counters are
- * consistently snake_case across every captured fixture (`input_tokens`,
- * `output_tokens`, `total_tokens`, `input_cached_tokens`,
- * `input_cache_creation_tokens`), but a provider's native key can come through
- * untouched: the real Gemini entry carries `reasoningTokens`, camelCase, and an
- * unmapped `input_text_tokens` alongside it. So the spelling of a cache key on a
- * provider we have no cached capture for is genuinely unknown.
+ * Cloudflare's counter names are its own and mostly snake_case, but not reliably
+ * so — `reasoningTokens` is camelCase in the real Gemini entry, right next to
+ * snake_case `input_tokens` in the same object. Since the vocabulary is internally
+ * inconsistent, the spelling it will use for a provider we have no capture for is
+ * genuinely unknown.
  *
- * Checking every plausible spelling is close to free and the downside is lopsided.
- * A silent 0 here does not merely lose a field — `gemini` is in
- * INPUT_INCLUDES_CACHE_READ, so `computeCost` relies on `cache_read` being
- * populated in order to SUBTRACT the cached portion out of `input`. A missed cache
- * key therefore bills those tokens at the full prompt rate instead of the cache
- * rate: an over-bill, not an omission.
+ * Checking every plausible spelling costs nothing and the downside is lopsided —
+ * though it is lopsided in OPPOSITE DIRECTIONS depending on the provider, so
+ * neither "over-bill" nor "under-bill" describes it alone:
+ *
+ * - For a SUBTRACTIVE provider (`gemini`, `openai`, `workers-ai` — in
+ *   INPUT_INCLUDES_CACHE_READ), `computeCost` subtracts `cache_read` out of
+ *   `input`. A missed cache key leaves those tokens billed at the full prompt rate
+ *   instead of the cache rate: an OVER-bill.
+ * - For an ADDITIVE provider (`anthropic`), `cache_read` is billed as its own line
+ *   on top of `input`. A missed key means those tokens are not billed at all: an
+ *   UNDER-bill, which is the direction this SDK treats as worse.
  *
  * Falls through on a zero as well as on a missing key — deliberately NOT `??`,
  * which only skips null/undefined. With `??`, a provider sending both its own name
  * and the gateway's with one of them zeroed resolved to the zero and lost the real
  * count; Python's `or` chain did not, so the two repos disagreed.
  */
+// Every `usage_metadata` spelling this adapter accounts for: the ones `firstInt`
+// consults below, plus the three that are redundant with the top-level `tokens_in` /
+// `tokens_out` the adapter reads directly. Anything NOT in here is swept into
+// `extras.usage_metadata` rather than dropped — see the drift note on `extras`.
+//
+// Keep this in sync with the `firstInt` calls. It is the mechanism that makes the
+// module docstring's key enumeration self-maintaining instead of a hand-audited
+// snapshot: a spelling nobody has seen shows up in `extras` on its own.
+const MAPPED_USAGE_KEYS: ReadonlySet<string> = new Set([
+  // cache_read
+  "input_cached_tokens",
+  "inputCachedTokens",
+  "cachedContentTokenCount",
+  "cache_read_input_tokens",
+  // cache_write
+  "input_cache_creation_tokens",
+  "inputCacheCreationTokens",
+  "cache_creation_input_tokens",
+  // reasoning
+  "reasoningTokens",
+  "reasoning_tokens",
+  "thoughtsTokenCount",
+  // Read from the top level instead, so not drift when they appear here.
+  "input_tokens",
+  "output_tokens",
+  "total_tokens",
+]);
+
 function firstInt(meta: Record<string, unknown>, ...names: string[]): number {
   for (const name of names) {
     const v = safeInt(meta[name]);
@@ -130,16 +173,30 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
     output: safeInt(entry.tokens_out),
     // Gateway's own snake_case first (present in 8 of the 14 captured fixtures),
     // then its camelCase form, then the providers' own native names — Gemini calls
-    // it `cachedContentTokenCount`, Anthropic `cache_creation_input_tokens`, and the
-    // `reasoningTokens` fixture proves native keys do reach us unnormalized.
-    cache_read: firstInt(usageMeta, "input_cached_tokens", "inputCachedTokens", "cachedContentTokenCount"),
+    // it `cachedContentTokenCount`, Anthropic `cache_read_input_tokens`. Everything
+    // after Cloudflare's own key is unobserved insurance — see the module docstring:
+    // no provider-native key appears in any captured fixture. Kept because firstInt
+    // fallthrough is free and a missed cache key mis-bills in one direction or the
+    // other for EVERY provider, but this is belt-and-braces, not a known case.
+    cache_read: firstInt(
+      usageMeta,
+      "input_cached_tokens",
+      "inputCachedTokens",
+      "cachedContentTokenCount", // Gemini native
+      "cache_read_input_tokens", // Anthropic native
+    ),
     cache_write: firstInt(
       usageMeta,
       "input_cache_creation_tokens",
       "inputCacheCreationTokens",
       "cache_creation_input_tokens",
     ),
-    reasoning: firstInt(usageMeta, "reasoningTokens", "reasoning_tokens"),
+    reasoning: firstInt(
+      usageMeta,
+      "reasoningTokens", // Cloudflare's own camelCase outlier — the observed one
+      "reasoning_tokens",
+      "thoughtsTokenCount", // Gemini native
+    ),
     model: safeStr(entry.model),
     provider: normalizeProvider(entry.provider),
     api: "cloudflare_gateway",
@@ -147,8 +204,36 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
       cached: entry.cached,
       step: entry.step,
       log_id: entry.id,
+      // Drift sweep — the same contract `adapters/openai_native.ts` enforces, and for
+      // the same reason: a counter this adapter does not map must not vanish without
+      // an error or an onError. `extras` used to be exactly the three keys above, so
+      // `usage_metadata` got no sweep at all, and that was not hypothetical — a live
+      // Logs API pull found `neurons` (Cloudflare's Workers AI billing unit) and
+      // `units` (a cost quantity) being dropped on every row, and `units` appears in
+      // NO captured fixture, so the hand-maintained enumeration had already drifted
+      // past what this file claimed to know. A money-relevant counter going missing
+      // this way surfaces first as a reconciliation gap, not as a failure.
+      //
+      // NESTED, not spread flat into `extras`: the poller reads `extras.cached` to
+      // decide whether to skip billing a request Cloudflare served for free, so a
+      // future `usage_metadata` key called `cached` or `step` must not be able to
+      // shadow it. Omitted entirely when there is no drift, to keep the common case
+      // identical to what callers already see.
+      ...unmappedUsage(usageMeta),
     },
   });
+}
+
+/** Any `usage_metadata` key this adapter does not account for, wrapped for `extras`.
+ *
+ * Returns an empty object when everything was recognized, so the key is absent
+ * rather than present-and-empty in the overwhelmingly common case. */
+function unmappedUsage(usageMeta: Record<string, unknown>): { usage_metadata?: Record<string, unknown> } {
+  const unmapped: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(usageMeta)) {
+    if (!MAPPED_USAGE_KEYS.has(k)) unmapped[k] = v;
+  }
+  return Object.keys(unmapped).length > 0 ? { usage_metadata: unmapped } : {};
 }
 
 /**

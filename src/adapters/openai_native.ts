@@ -33,7 +33,7 @@
  *     extra cost beyond completion_tokens. Skipped for v1 — customers using
  *     the feature can access via the openai response object directly.
  */
-import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { CanonicalUsage, WORKERS_AI_COMPAT_PREFIX, makeCanonicalUsage } from "../canonical.js";
 import { resolveModel } from "./_common.js";
 
 // Cloudflare Workers AI names every model "@cf/<vendor>/<model>". Reaching one
@@ -43,7 +43,6 @@ import { resolveModel } from "./_common.js";
 // strips the routing prefix before matching, because Cloudflare's own catalog lists
 // only the bare form.
 const WORKERS_AI_MODEL_PREFIX = "@cf/";
-const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   // chat completions

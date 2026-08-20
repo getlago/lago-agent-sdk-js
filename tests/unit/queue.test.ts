@@ -1,5 +1,5 @@
 /** Event queue — batching, retry, backoff, flush, overflow. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { EventQueue } from "../../src/queue.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -212,8 +212,109 @@ describe("EventQueue — permanent vs transient failures", () => {
 // aimed `maxBatchSize` extra requests at a server that had just asked us to
 // slow down.
 // ----------------------------------------------------------------------
+describe("EventQueue — isolation path ordering and shutdown", () => {
+  it("isolated retries keep their FIFO order", async () => {
+    // `replayFailed` UNSHIFTS, so calling it once per event inside the isolation loop
+    // reversed the survivors: a 413 batch of a,b,c,d,e whose b,c,d fail transiently
+    // while isolated came back as d,c,b. FIFO is the queue's contract — it is what
+    // makes oldest-dropped-first overflow and Lago's own event ordering mean
+    // anything — so a recovery path must not silently invert it.
+    const sender = async (batch: LagoEvent[]) => {
+      if (["b", "c", "d"].includes(batch[0].transaction_id)) {
+        throw new LagoApiError(503, "transient while isolated");
+      }
+    };
+    const q = new EventQueue(sender, 60_000, 10, 100);
+    try {
+      // @ts-expect-error — exercising the private isolation path directly
+      await q.sendIndividually(["a", "b", "c", "d", "e"].map(evId), new LagoApiError(413, "too large"));
+      // @ts-expect-error — reading the private buffer
+      expect(q.buffer.map((e: LagoEvent) => e.transaction_id)).toEqual(["b", "c", "d"]);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it("shutdown leaves no pending timer behind", async () => {
+    // `Promise.race` abandons the loser but does not cancel it, so a plain
+    // `sleep(timeoutMs)` left a live, ref'd timer for the FULL timeout after shutdown
+    // had already returned — a script awaiting `shutdown(15000)` returned in 0.2s and
+    // then sat there ~15s before the process could exit. Same class as the un-unref'd
+    // idle timer, but on the path taken by callers doing the right thing.
+    vi.useFakeTimers();
+    try {
+      const q = new EventQueue(async () => {}, 60_000, 10, 100);
+      await q.shutdown(15_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("EventQueue — batch-only 4xx is split, not head-of-line blocked", () => {
+  // 402 is deliberately NOT here — see "a 402 is held, not dropped" below. What makes
+  // a 413/415 batch fail is a property of the batch itself; a 402 is a property of the
+  // account and resolves out-of-band, so splitting it only drops every event faster.
+  it.each([413, 415])("splits a batch that %i-ed as a whole", async (status) => {
+    // For these the SAME batch can never succeed, but its events can individually.
+    // Treating them as transient re-prepended the identical batch at the head of the
+    // FIFO and backed off to 60s forever, blocking everything behind it. Routing them
+    // to sendIndividually splits the batch and delivers what is deliverable.
+    const sentIndividually: string[] = [];
+    const sender = async (batch: LagoEvent[]) => {
+      if (batch.length > 1) throw new LagoApiError(status, "unacceptable as-is");
+      sentIndividually.push(batch[0].transaction_id);
+    };
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      for (const id of ["a", "b", "c", "d"]) q.push(evId(id));
+      expect(await q.flush(3000)).toBe(true);
+      expect(sentIndividually.sort()).toEqual(["a", "b", "c", "d"]);
+      // @ts-expect-error — touch private backoffMs for test
+      expect(q.backoffMs).toBe(0);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+});
+
 describe("EventQueue — throttling 4xx is transient", () => {
-  it.each([429, 408])("retries rather than drops a %i", async (status) => {
+  it("a 402 is held, not dropped — it resolves out-of-band", async () => {
+    // Regression: 402 used to be permanent, which routed the batch to
+    // sendIndividually, where every isolated send 402ed too and was dropped for good.
+    // Measured against a server returning 402: 5 events in, 6 HTTP calls out, 0
+    // recoverable — a lapsed Lago account silently discarded every billable event for
+    // the whole outage. "Payment required" is a property of the ACCOUNT: it stops being
+    // true the moment someone pays, so the events MUST survive to be re-sent.
+    let attempts = 0;
+    const delivered: string[] = [];
+    const perRequestSizes: number[] = [];
+
+    const sender = async (batch: LagoEvent[]) => {
+      attempts++;
+      perRequestSizes.push(batch.length);
+      // Account is lapsed for the first two attempts, then someone pays.
+      if (attempts <= 2) throw new LagoApiError(402, '{"error":"payment required"}');
+      for (const e of batch) delivered.push(e.transaction_id);
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      for (const id of ["a", "b", "c", "d", "e"]) q.push(evId(id));
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && delivered.length === 0) await sleep(50);
+      // Nothing lost: all five arrive once the account is current again.
+      expect(delivered).toEqual(["a", "b", "c", "d", "e"]);
+      // Never fanned out — every request carried the whole batch, so no event was
+      // ever isolated and dropped.
+      expect(perRequestSizes.every((n) => n === 5)).toBe(true);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it.each([429, 408, 402])("retries rather than drops a %i", async (status) => {
     // Dropping loses revenue, and isolating one-by-one multiplies the load on
     // a server that is already shedding it.
     let attempts = 0;
@@ -239,7 +340,7 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
-  it.each([429, 408])("applies backoff on a %i", async (status) => {
+  it.each([429, 408, 402])("applies backoff on a %i", async (status) => {
     // The inverse of "does not apply backoff after a permanent failure": a
     // throttling failure is transient, so it MUST leave a backoff in place —
     // that pause is the whole point of respecting a rate limit.

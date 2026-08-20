@@ -36,6 +36,8 @@
  * decimal places — deterministic and identical to the Python implementation.
  */
 
+import { WORKERS_AI_COMPAT_PREFIX } from "./canonical.js";
+
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
 export const AWS_PRICING_HOST = "https://pricing.us-east-1.amazonaws.com";
 export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/AmazonBedrock/current/region_index.json`;
@@ -63,7 +65,16 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // because they were never subtracted, and again at the cache-read rate, which
 // Cloudflare's catalog does publish for some models.
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
-const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
+// "workers-ai" belongs here for the same reason it is in INPUT_INCLUDES_CACHE_READ
+// above: it is only ever reached through Cloudflare's OpenAI-COMPATIBLE endpoint, so its
+// usage payload is the OpenAI shape — and in that shape
+// `completion_tokens_details.reasoning_tokens` is a SUBSET of `completion_tokens`.
+// `extractOpenAINative` fills `reasoning` from that key with no provider gate, so
+// omitting it counted the subset twice: measured, a 100/1000/reasoning-800 call reported
+// unit=1900 against 1100 consumed. `computeCost` would double-BILL the same tokens and
+// does not today only because CLOUDFLARE_UNIT_FIELD_MAP happens to carry no reasoning
+// unit — an accident, not a guard, and Cloudflare hosts reasoning models.
+const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -93,12 +104,6 @@ const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
   "per M output tokens": "output",
   "per M cached input tokens": "cache_read",
 };
-
-// The routing prefix the gateway's OpenAI-compatible `/compat` endpoint requires.
-// Cloudflare's catalog keys models as bare "@cf/...", so this comes off before a
-// lookup. Kept in sync with `adapters/openai_native.WORKERS_AI_COMPAT_PREFIX`, which
-// decides the provider from the same two spellings.
-const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
 
 // Cloudflare's catalog page size, and a hard bound on the paging loop. The loop runs
 // on the queue's flush tick ahead of the drain, so it must terminate even if the
@@ -210,13 +215,26 @@ function alnum(s: string): string {
 /**
  * Strip a trailing version/revision marker OpenRouter usually omits from its ids.
  *
- * Shapes seen live: Anthropic's compact date ("-20250929"), an explicit "-v2", and
- * Gemini's 3-digit revision ("-002", which `model_version` can report where
- * OpenRouter lists only the bare name). Verified safe against the live 415-model
- * catalog: ZERO ids have a model part ending in exactly three digits, so the
- * "-\d{3}" arm cannot shorten a real listing.
+ * Shapes seen live: Anthropic's compact date ("-20250929") and an explicit "-v2".
  */
 function stripVersion(model: string): string {
+  return model.replace(/-(?:\d{8}|v\d+)$/, "");
+}
+
+/**
+ * `stripVersion`, plus Gemini's 3-digit revision ("-002", which `model_version`
+ * can report where OpenRouter lists only the bare name). OpenRouter matching ONLY.
+ *
+ * Deliberately not folded into `stripVersion`: that helper also builds the
+ * AWS/Bedrock price keys, where a shortened key does not merely miss but silently
+ * MIS-prices — `bedrockModelKey` feeds a per-key table whose two directions are
+ * assigned in place, so two distinct models collapsing to one key overwrite each
+ * other's rate. All four live catalogs are currently clean (OpenRouter 415 ids,
+ * Cloudflare 64, AWS offer 77, captured Bedrock 39: zero model parts end in
+ * exactly three digits), but the arm was only ever motivated by OpenRouter, and
+ * scoping it makes that risk structurally zero instead of empirically zero.
+ */
+function stripVersionOpenRouter(model: string): string {
   return model.replace(/-(?:\d{8}|\d{3}|v\d+)$/, "");
 }
 
@@ -367,9 +385,23 @@ export function moneyStrToCents(usd: string): string {
  * field (per token_type) needs markup applied to each field individually,
  * with the same floor-to-12dp convention as everywhere else, or a markup
  * != 1.0 would silently vanish from every per-field/token_type event.
+ *
+ * Both fallbacks are DEFENCE IN DEPTH, not live behaviour: every `emit()` path runs
+ * the customer's markup through `coerceMarkup` first (which falls back to 1.0 and
+ * reports under "pricing"), and `CostBreakdown.markup` / `fields[*].cost` are
+ * `fmtMoney` output, so neither argument can actually arrive unparseable here. They
+ * are still not interchangeable, and the two ports disagreed on them:
+ *
+ * - An unparseable `usd` means the cost itself is unusable — nothing to bill: 0.
+ * - An unparseable `markup` means only the MULTIPLIER is unusable. Returning 0
+ *   there would discard a good cost, an under-bill to nothing; 1.0 bills the real
+ *   cost with no markup, the smallest defensible error. This is what JS already
+ *   did; Python returned "0", so identical input produced different bills if
+ *   anything ever did reach it. Now aligned rather than a latent divergence.
  */
 export function applyMarkup(usd: string, markup: string): string {
-  const usdScaled = parseScaled(usd) ?? 0n;
+  const usdScaled = parseScaled(usd);
+  if (usdScaled === null) return fmtMoney(0n);
   const markupScaled = parseScaled(markup) ?? SCALE;
   return fmtMoney((usdScaled * markupScaled) / SCALE);
 }
@@ -407,14 +439,24 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
     // to token events, billing nothing at all in an llm_cost-only setup. Stripping
     // the marker indexes them under their real vendor. Verified collision-free
     // against the live catalog: no un-prefixed id duplicates a "~"-prefixed one.
+    // Alias-derived keys are written only if absent, rather than assigned: the
+    // collision-freedom above is a property of TODAY's catalog, and with plain
+    // assignment the winner depended purely on iteration order — if OpenRouter ever
+    // ships both "google/gemini-flash-latest" and "~google/gemini-flash-latest", the
+    // moving alias could overwrite the real listing's rate (measured on a synthetic
+    // pair: 0.009 vs 0.001 for the same lookup, decided by nothing but position in
+    // the response). A real listing now always wins, whatever the order. Non-alias
+    // entries keep plain assignment so genuine duplicates behave exactly as before.
     const bare = id.startsWith("~") ? id.slice(1) : id;
+    const isAlias = bare !== id;
     exact.set(id, mp);
-    if (bare !== id) exact.set(bare, mp);
+    if (isAlias && !exact.has(bare)) exact.set(bare, mp);
     const slash = bare.indexOf("/");
     if (slash > 0) {
       const vendor = bare.slice(0, slash).toLowerCase();
       const suffix = bare.slice(slash + 1);
-      normMap.set(`${vendor}\n${norm(suffix)}`, mp);
+      const normKey = `${vendor}\n${norm(suffix)}`;
+      if (!isAlias || !normMap.has(normKey)) normMap.set(normKey, mp);
     }
   }
   return { exact, norm: normMap };
@@ -437,7 +479,7 @@ export function lookupOpenRouter(table: OpenRouterTable, provider: string, model
   return (
     table.exact.get(`${vendor}/${model}`) ??
     table.norm.get(`${vendor}\n${norm(model)}`) ??
-    table.norm.get(`${vendor}\n${norm(stripVersion(model))}`) ??
+    table.norm.get(`${vendor}\n${norm(stripVersionOpenRouter(model))}`) ??
     null
   );
 }
@@ -913,12 +955,62 @@ export class PricingProvider {
    * than throwing, since this is a hint, not a contract.
    */
   prime(providers: string[] = []): void {
-    this.openrouterStale = true;
+    // Gated on "is this table actually cold?", NOT unconditional. `prime()` is called
+    // from `autoPrimePricingFor` on a matching `wrap()` and from `warmPricing()`, both
+    // of which a server can run per request — and flagging an in-TTL table stale meant
+    // the ~400-model OpenRouter catalogue was re-downloaded on essentially every flush
+    // tick, so `pricingTtlMs` never applied on this path at all. Measured against the
+    // live catalogue with the shipped 1-hour TTL: 4 prime()+maybeRefresh() cycles
+    // produced 4 full downloads where 1 was correct.
+    //
+    // "Cold" is the same test `lookup()` already uses — no table, or past the TTL — so
+    // priming and looking up cannot disagree about what needs fetching.
+    if (this.isCold(this.openrouter, this.openrouterFetched)) this.openrouterStale = true;
     for (const p of providers) {
       const key = (p || "").toLowerCase();
-      if (key === "workers-ai") this.cloudflareStale = true;
-      else if (key === "mistral") this.mistralStale = true;
+      if (key === "workers-ai") {
+        if (this.isCold(this.cloudflareWorkersAi, this.cloudflareFetched)) this.cloudflareStale = true;
+      } else if (key === "mistral") {
+        if (this.isCold(this.mistralAliases, this.mistralFetched)) this.mistralStale = true;
+      }
     }
+  }
+
+  /** True when a table needs fetching: absent, or older than the TTL. */
+  private isCold(table: unknown | null, fetchedAt: number): boolean {
+    return table === null || Date.now() - fetchedAt >= this.ttlMs;
+  }
+
+  /** Per-source failure backoff.
+   *
+   * A failed fetch used to leave its stale flag set and nothing else, so the next tick
+   * retried immediately — every tick, forever, with no delay, each attempt costing up to
+   * the 10s `getJson` timeout, all of it on the queue loop AHEAD of `takeBatch()`.
+   * Measured with a bad Cloudflare token: 4 ticks produced 4 real requests at
+   * 127/84/59/80 ms and 4 `onError` reports, and a fully-broken pricing config could
+   * stall the drain by up to ~40s per tick across the four sources.
+   *
+   * Same 1→2→4→…→60s shape as the queue's own send backoff, tracked per source so one
+   * bad credential cannot delay the three healthy tables. */
+  private failureBackoffUntil = new Map<string, number>();
+  private failureBackoffMs = new Map<string, number>();
+  private static readonly MAX_PRICING_BACKOFF_MS = 60_000;
+
+  private inBackoff(source: string): boolean {
+    const until = this.failureBackoffUntil.get(source) ?? 0;
+    return Date.now() < until;
+  }
+
+  private noteFailure(source: string): void {
+    const prev = this.failureBackoffMs.get(source) ?? 0;
+    const next = prev === 0 ? 1_000 : Math.min(prev * 2, PricingProvider.MAX_PRICING_BACKOFF_MS);
+    this.failureBackoffMs.set(source, next);
+    this.failureBackoffUntil.set(source, Date.now() + next);
+  }
+
+  private noteSuccess(source: string): void {
+    this.failureBackoffMs.delete(source);
+    this.failureBackoffUntil.delete(source);
   }
 
   /**
@@ -971,7 +1063,14 @@ export class PricingProvider {
     }
   }
 
-  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale. */
+  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale.
+   *
+   * The four sources are INDEPENDENT and now run concurrently via `Promise.allSettled`.
+   * They used to be awaited in series, so with several stale at once the queue's drain
+   * waited on the sum of them — up to ~40s per tick at the 10s `getJson` timeout — and a
+   * single unreachable source delayed three healthy ones. `allSettled` rather than `all`
+   * because one source failing must not abandon the others; each arm already reports its
+   * own error and none of them can reject out of here. */
   async maybeRefresh(): Promise<void> {
     if (
       !this.openrouterStale &&
@@ -982,63 +1081,95 @@ export class PricingProvider {
       return;
     }
 
-    if (this.openrouterStale && !this.refreshing.has("openrouter")) {
+    const jobs: Array<Promise<void>> = [];
+
+    if (this.openrouterStale && !this.refreshing.has("openrouter") && !this.inBackoff("openrouter")) {
       this.refreshing.add("openrouter");
-      try {
-        const table = await this.fetcher.fetchOpenRouter();
-        this.openrouter = table;
-        this.openrouterFetched = Date.now();
-        this.openrouterStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchOpenRouter");
-      } finally {
-        this.refreshing.delete("openrouter");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchOpenRouter();
+            this.openrouter = table;
+            this.openrouterFetched = Date.now();
+            this.openrouterStale = false;
+            this.noteSuccess("openrouter");
+          } catch (err) {
+            this.noteFailure("openrouter");
+            this.report(err, "pricing.fetchOpenRouter");
+          } finally {
+            this.refreshing.delete("openrouter");
+          }
+        })(),
+      );
     }
 
-    if (this.cloudflareStale && !this.refreshing.has("cloudflare_workers_ai")) {
+    if (
+      this.cloudflareStale &&
+      !this.refreshing.has("cloudflare_workers_ai") &&
+      !this.inBackoff("cloudflare_workers_ai")
+    ) {
       this.refreshing.add("cloudflare_workers_ai");
-      try {
-        const table = await this.fetcher.fetchCloudflareWorkersAi();
-        this.cloudflareWorkersAi = table;
-        this.cloudflareFetched = Date.now();
-        this.cloudflareStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchCloudflareWorkersAi");
-      } finally {
-        this.refreshing.delete("cloudflare_workers_ai");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchCloudflareWorkersAi();
+            this.cloudflareWorkersAi = table;
+            this.cloudflareFetched = Date.now();
+            this.cloudflareStale = false;
+            this.noteSuccess("cloudflare_workers_ai");
+          } catch (err) {
+            this.noteFailure("cloudflare_workers_ai");
+            this.report(err, "pricing.fetchCloudflareWorkersAi");
+          } finally {
+            this.refreshing.delete("cloudflare_workers_ai");
+          }
+        })(),
+      );
     }
 
-    if (this.mistralStale && !this.refreshing.has("mistral_aliases")) {
+    if (this.mistralStale && !this.refreshing.has("mistral_aliases") && !this.inBackoff("mistral_aliases")) {
       this.refreshing.add("mistral_aliases");
-      try {
-        const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
-        this.mistralAliases = aliases;
-        this.mistralFetched = Date.now();
-        this.mistralStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchMistralAliases");
-      } finally {
-        this.refreshing.delete("mistral_aliases");
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
+            this.mistralAliases = aliases;
+            this.mistralFetched = Date.now();
+            this.mistralStale = false;
+            this.noteSuccess("mistral_aliases");
+          } catch (err) {
+            this.noteFailure("mistral_aliases");
+            this.report(err, "pricing.fetchMistralAliases");
+          } finally {
+            this.refreshing.delete("mistral_aliases");
+          }
+        })(),
+      );
     }
 
     for (const region of [...this.bedrockStale]) {
       const key = `bedrock:${region}`;
-      if (this.refreshing.has(key)) continue;
+      if (this.refreshing.has(key) || this.inBackoff(key)) continue;
       this.refreshing.add(key);
-      try {
-        const table = await this.fetcher.fetchBedrock(region);
-        this.bedrock.set(region, table);
-        this.bedrockFetched.set(region, Date.now());
-        this.bedrockStale.delete(region);
-      } catch (err) {
-        this.report(err, "pricing.fetchBedrock");
-      } finally {
-        this.refreshing.delete(key);
-      }
+      jobs.push(
+        (async () => {
+          try {
+            const table = await this.fetcher.fetchBedrock(region);
+            this.bedrock.set(region, table);
+            this.bedrockFetched.set(region, Date.now());
+            this.bedrockStale.delete(region);
+            this.noteSuccess(key);
+          } catch (err) {
+            this.noteFailure(key);
+            this.report(err, "pricing.fetchBedrock");
+          } finally {
+            this.refreshing.delete(key);
+          }
+        })(),
+      );
     }
+
+    await Promise.allSettled(jobs);
   }
 
   private report(err: unknown, where: string): void {
