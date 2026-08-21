@@ -19,23 +19,64 @@ import { LagoApiError } from "./exceptions.js";
 
 type Sender = (batch: LagoEvent[]) => Promise<void>;
 
-// Statuses where re-sending the SAME batch can never succeed, because the BATCH is
-// what is wrong: a malformed body, or a transaction_id Lago has already accepted.
+// Statuses where re-sending the SAME batch can never succeed, because the BATCH is what
+// is wrong. Deliberately an explicit list, not the 400-499 range.
 //
-// Deliberately an explicit list, not the 400-499 range. The test is "is this a property
-// of the batch?" If an out-of-band change fixes it rather than a different payload, the
-// events are still billable and must be HELD, not dropped. So this excludes:
+// The test is: **is what makes this fail a property of the batch?** If a DIFFERENT
+// PAYLOAD is what it takes to succeed, the batch is doomed and belongs here, where
+// `sendIndividually` splits it and delivers whatever is deliverable. If an OUT-OF-BAND
+// change fixes it — someone rotates a key back, pays an invoice, corrects a URL, fixes a
+// proxy — the events are still perfectly billable and must be HELD, because dropping
+// them is unrecoverable while holding them is bounded (`maxBufferSize`, oldest-first,
+// reported through `onError`).
+//
+// Every line below was measured by driving this queue over a real socket at a server
+// returning that status, counting events actually delivered (`probes/t11_status_matrix`):
+//
+//   400  malformed body — a different payload is the only fix. PERMANENT.
+//   413  too large — the size IS the batch. Isolating it is a real recovery, not a
+//        formality: against an nginx-style server answering 413 over a byte limit and
+//        200 under it, the split path delivered 5 of 5. Held instead, it delivered 0 and
+//        stalled at the backoff ceiling forever. Not reachable from Lago itself — an
+//        oversized batch there answers 422 `too_many_events` (probed live, 20k events /
+//        3.5 MiB) — so this exists for `client_max_body_size` in front of Lago.
+//   409  a conflicting id. Lago answers 422 for a replayed `transaction_id`, not 409
+//        (probed live); 409 stays as defence against an intermediary that uses it.
+//   422  Lago's real answer for a duplicate id, an oversized batch and a bad
+//        content-type. PERMANENT — but note it reaches `sendIndividually`, which is
+//        what lets the valid events in a batch survive one bad transaction_id.
+//
+// Everything else is transient, including these, which used to be here and lost money:
+//
+//   401/403  a rotated or revoked key. Measured with a server that healed after 3s —
+//            i.e. the key put back — classified permanent this destroyed all 5 events
+//            inside the first second, and none of them ever reached Lago. Held, all 5
+//            were delivered when it healed.
+//   402      payment required — a property of the ACCOUNT; it stops being true the
+//            moment someone pays. Measured against a 402 server: 5 events in, 6 HTTP
+//            calls out, 0 recoverable, one `onError` for the lot.
+//   404      the endpoint, not the events: Lago answers 404 `resource_not_found` for a
+//            wrong PATH (probed live), which is a mistyped `apiUrl` — fixed out-of-band
+//            like a rotated key, and the same class as the 405/410 that were already
+//            transient here for exactly that reason. It was destroying every event.
+//   415      a wrong media type comes from a proxy, and splitting cannot help: this
+//            client always sends `application/json`, so every isolated send fails the
+//            same way — measured, all 5 dropped. Held, they survive the proxy being
+//            fixed. (Lago itself answers 422 to a bad content-type, probed live.)
 //   429/408  throttling — fanning a batch into N isolated sends aims more traffic at a
-//            server that just asked us to slow down
-//   401/403  a rotated or revoked key — held, it blocks at the 60s ceiling until
-//            `maxBufferSize` overflows: bounded, oldest-first, reported, recoverable
-const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 422]);
+//            server that just asked us to slow down.
+//
+// An unrecognized 4xx is transient too: waiting on an event that would have been dropped
+// costs a delay, dropping one that would have been accepted costs revenue.
+const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 409, 413, 422]);
 
 /** True when re-sending this exact batch can never succeed.
  *
- * Anything not on the list — 5xx, a network-level exception with no LagoApiError at
- * all, an unrecognized 4xx — is transient: waiting on an event that would have been
- * dropped costs a delay, dropping one that would have been accepted costs revenue. */
+ * Only a malformed or unacceptable BATCH qualifies — see `PERMANENT_STATUSES` for the
+ * test and for what each status cost when it was on the wrong side of it. Everything
+ * else (5xx, a network-level exception with no LagoApiError at all, a credential or
+ * account or endpoint 4xx, an unrecognized 4xx) might succeed later and stays
+ * retryable. */
 function isPermanentFailure(exc: unknown): boolean {
   return exc instanceof LagoApiError && PERMANENT_STATUSES.has(exc.status);
 }
