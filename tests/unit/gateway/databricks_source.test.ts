@@ -11,6 +11,7 @@ import { LagoSDK } from "../../../src/sdk.js";
 import {
   DatabricksSource,
   DatabricksUsageRow,
+  USAGE_COLUMNS,
   floorHour,
   timestampSql,
   windowBounds,
@@ -219,6 +220,72 @@ describe("Databricks reader — the window", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// --------------------------------------------------------------------------
+// The projection
+// --------------------------------------------------------------------------
+/** The column names one of this module's statements actually selects. */
+function projectionOf(sql: string): string[] {
+  const body = sql.split("SELECT")[1].split("FROM")[0];
+  return body
+    .split(",")
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0);
+}
+
+describe("Databricks reader — the projection", () => {
+  it("projects only the columns the adapter uses", async () => {
+    // `system.ai_gateway.usage` is 36 columns wide and the caller is told to read one
+    // wide window per run, but the API's default `disposition=INLINE` FAILS a statement
+    // whose response exceeds 25 MiB rather than paginating. Live, over 247 real rows:
+    // 1,411 bytes/row for `SELECT *` against 435 for these — ~18k readable rows instead
+    // of ~60k, for byte-identical billing output.
+    const src = source([], [HOSTED]);
+    await src.readUsage("3 days");
+    const usage = src.queries[1];
+    expect(usage).not.toContain("*");
+    expect(projectionOf(usage)).toEqual([...USAGE_COLUMNS]);
+    // Nothing reads the row order, so the sort is pure warehouse cost on the widest read
+    // this module makes.
+    expect(usage).not.toContain("ORDER BY");
+  });
+
+  it("covers every column the extraction reads", async () => {
+    // The other direction of the same coupling, and the reason the narrowing needs a test
+    // at all: a column missing from the projection does NOT throw — the adapter degrades
+    // every absent field to zero/empty — so it would land as a silently under-billed
+    // event. Here the canned rows are projected THROUGH the statement, so dropping a
+    // needed column fails this rather than shipping.
+    const projected = source([BYOK_SPEND], [HOSTED, BYOK_USAGE]);
+    const inner = projected.query.bind(projected);
+    projected.query = async (sql: string) => {
+      const rows = await inner(sql);
+      if (sql.includes("external_model_spend")) return rows;
+      const keep = new Set(projectionOf(sql));
+      return rows.map((row) =>
+        Object.fromEntries(Object.entries(row).filter(([k]) => keep.has(k))),
+      ) as Record<string, unknown>[];
+    };
+    const throughProjection = await projected.readUsage("3 days");
+    const everyColumn = await source([BYOK_SPEND], [HOSTED, BYOK_USAGE]).readUsage("3 days");
+
+    const shape = (rows: DatabricksUsageRow[]) =>
+      rows.map((r) => [r.usage, r.subscription, r.rowId, r.kind, r.usdCost]);
+    expect(shape(throughProjection)).toEqual(shape(everyColumn));
+    // Spelled out, because the equality above would also hold if BOTH sides were empty.
+    const hosted = throughProjection.find((r) => r.kind === "usage")!;
+    expect([hosted.usage.model, hosted.usage.input, hosted.usage.output]).toEqual([
+      "llama-4-maverick",
+      11,
+      4,
+    ]);
+    expect(hosted.subscription).toBe("sub_hosted");
+    const byok = throughProjection.find((r) => r.kind === "spend")!;
+    expect(byok.usage.cache_read).toBe(1812);
+    expect(byok.subscription).toBe("sub_byok");
+    expect(byok.usdCost).toBeCloseTo(0.0011187, 10);
   });
 });
 
