@@ -227,10 +227,11 @@ describe("Databricks reader — query", () => {
     };
     const fetched: string[] = [];
     vi.stubGlobal("fetch", (url: string, init?: { method?: string }) => {
-      if (init?.method === "POST") return Promise.resolve({ json: () => Promise.resolve(first) });
+      if (init?.method === "POST")
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(first) });
       fetched.push(url);
       const index = url.split("/").pop() as string;
-      return Promise.resolve({ json: () => Promise.resolve(chunks[index]) });
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(chunks[index]) });
     });
 
     const rows = await new DatabricksSource("https://x/", "t", "w").query("SELECT 1");
@@ -245,11 +246,103 @@ describe("Databricks reader — query", () => {
     }
   });
 
+  it("raises when a chunk fetch fails", async () => {
+    // A failed chunk fetch must NOT be swallowed into a short row set. The error body
+    // carries no data_array, so `?? []` would push nothing, the loop would move to the
+    // next index, and query() would return a partial window reporting success. Measured
+    // against a live warehouse: a 403 on chunk 1 of 2 returned 6,750 of 9,000 rows with
+    // no exception — 25% of the window billed as if it were all of it.
+    const first = {
+      statement_id: "stmt-1",
+      status: { state: "SUCCEEDED" },
+      manifest: {
+        schema: { columns: [{ name: "invocation_id" }, { name: "input_tokens" }] },
+        total_chunk_count: 2,
+      },
+      result: { data_array: [["a", "1"]] },
+    };
+    // exactly what the API returns for an expired statement / revoked token mid-read
+    const denied = { error_code: "PERMISSION_DENIED", message: "does not have required scopes: sql" };
+    vi.stubGlobal("fetch", (_url: string, init?: { method?: string }) => {
+      if (init?.method === "POST")
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(first) });
+      return Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve(denied) });
+    });
+
+    const src = new DatabricksSource("https://x/", "t", "w");
+    await expect(src.query("SELECT 1")).rejects.toThrow(/result chunk 1 of 2/);
+    // the operator must see the API's own cause, not just a status line
+    await expect(src.query("SELECT 1")).rejects.toThrow(/does not have required scopes: sql/);
+  });
+
+  it("raises when the row count misses the manifest", async () => {
+    // A chunk that returns HTTP 200 with fewer rows than promised is still truncation.
+    // No per-request status check can catch that, so the assembled count is compared
+    // with manifest.total_row_count before any of it is billed.
+    const first = {
+      statement_id: "stmt-1",
+      status: { state: "SUCCEEDED" },
+      manifest: {
+        schema: { columns: [{ name: "invocation_id" }] },
+        total_chunk_count: 2,
+        total_row_count: 3,
+      },
+      result: { data_array: [["a"]] },
+    };
+    vi.stubGlobal("fetch", (_url: string, init?: { method?: string }) => {
+      if (init?.method === "POST")
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(first) });
+      // HTTP 200, but one row short of the promised three
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data_array: [["b"]] }) });
+    });
+
+    await expect(new DatabricksSource("https://x/", "t", "w").query("SELECT 1")).rejects.toThrow(
+      /returned 2 row\(s\) but the manifest promised 3/,
+    );
+  });
+
+  it("raises when rows arrive with no columns", async () => {
+    // Rows with no column names decode to {} each, which every layer downstream degrades
+    // cleanly and wrongly on — all-zero usage and a confident {cost: 0, tokens: 0} for a
+    // window that had real traffic. Not observed on this API; guards the decode.
+    const first = {
+      statement_id: "stmt-1",
+      status: { state: "SUCCEEDED" },
+      manifest: { total_chunk_count: 1 },
+      result: { data_array: [["a"], ["b"]] },
+    };
+    vi.stubGlobal("fetch", () =>
+      Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(first) }),
+    );
+    await expect(new DatabricksSource("https://x/", "t", "w").query("SELECT 1")).rejects.toThrow(
+      /no `manifest\.schema\.columns`/,
+    );
+  });
+
+  it("error carries the api error code", async () => {
+    // A non-OK submission used to surface as `Databricks statement undefined: {...}` —
+    // the state was absent, so the poll loop's own guard threw with a misleading prefix.
+    // The cause was in the body all along; name it.
+    vi.stubGlobal("fetch", () =>
+      Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({ error_code: "NOT_FOUND", message: "The warehouse w was not found." }),
+      }),
+    );
+    const src = new DatabricksSource("https://x", "t", "w");
+    await expect(src.query("SELECT 1")).rejects.toThrow(/statement submission failed: HTTP 404/);
+    await expect(src.query("SELECT 1")).rejects.toThrow(/The warehouse w was not found\./);
+    await expect(src.query("SELECT 1")).rejects.not.toThrow(/statement undefined/);
+  });
+
   it("raises on a failed statement", async () => {
     // A FAILED statement returns 200 with the failure in the body. Reading rows from it
     // would report an empty window as "no usage" and bill nothing.
     vi.stubGlobal("fetch", () =>
       Promise.resolve({
+        ok: true,
+        status: 200,
         json: () => Promise.resolve({ status: { state: "FAILED", error: { message: "boom" } } }),
       }),
     );
@@ -576,9 +669,14 @@ describe("Databricks reader — review fixes", () => {
     };
     let gets = 0;
     vi.stubGlobal("fetch", (_url: string, init?: { method?: string }) => {
-      if (init?.method === "POST") return Promise.resolve({ json: () => Promise.resolve(pending) });
+      if (init?.method === "POST")
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(pending) });
       gets += 1;
-      return Promise.resolve({ json: () => Promise.resolve(gets === 1 ? pending : done) });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(gets === 1 ? pending : done),
+      });
     });
     const src = new DatabricksSource("https://x", "t", "w", { timeoutMs: 30_000 });
     await expect(src.query("SELECT 1")).resolves.toEqual([{ a: "1" }]);

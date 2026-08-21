@@ -44,6 +44,28 @@ const STATEMENTS_PATH = "/api/2.0/sql/statements";
 const INTERVAL_RE = /^\s*(\d{1,5})\s+(second|minute|hour|day|week)s?\s*$/i;
 
 /**
+ * Throw with the API's own error text when a Statement Execution call is not OK.
+ *
+ * Deliberately reads the BODY rather than just `resp.status`: Databricks puts the useful
+ * part there (`{"error_code": "PERMISSION_DENIED", "message": "... does not have required
+ * scopes: sql"}`). The `403 does not have required scopes: sql` that this class's docstring
+ * warns operators about is the error most likely to hit a first-time setup, so it is the
+ * one that must read clearly.
+ *
+ * Truncated because these bodies can carry a multi-KB `details` array.
+ */
+async function raiseForApiError(resp: Response, what: string): Promise<void> {
+  if (resp.ok) return;
+  let detail: string;
+  try {
+    detail = JSON.stringify(await resp.json());
+  } catch {
+    detail = "<no body>";
+  }
+  throw new Error(`Databricks ${what} failed: HTTP ${resp.status}: ${detail.slice(0, 500)}`);
+}
+
+/**
  * One billable row, already shaped for `emit()`.
  *
  * `usdCost` is set only for BYOK rows, where Databricks meters the provider cost
@@ -198,6 +220,7 @@ export class DatabricksSource {
       }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+    await raiseForApiError(resp, "statement submission");
     const body = await this.awaitStatement((await resp.json()) as any, headers);
 
     const columns: string[] = (body?.manifest?.schema?.columns ?? []).map((c: any) => String(c.name));
@@ -210,8 +233,39 @@ export class DatabricksSource {
         headers,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
+      // THE check this whole method exists for. A failed chunk fetch returns a JSON error
+      // body with no `data_array`, so `?? []` would push zero rows, the loop would
+      // continue, and `query()` would return a PARTIAL result reporting success —
+      // measured live: a 403/404/503 on chunk 1 of 2 silently dropped 25% of the window.
+      // Billing a fraction of a window with no error is the single worst outcome this
+      // reader can produce, so it must throw.
+      await raiseForApiError(chunkResp, `result chunk ${index} of ${totalChunks}`);
       const chunk = (await chunkResp.json()) as any;
       arrays.push(...(chunk?.data_array ?? []));
+    }
+
+    // End-to-end truncation check, independent of cause: catches a short read that no
+    // per-request status could reveal (a chunk that returns HTTP 200 with fewer rows than
+    // promised, a manifest/chunk disagreement). `total_row_count` is absent on some
+    // statement kinds, so only assert when Databricks actually stated a count.
+    const promised = body?.manifest?.total_row_count;
+    if (promised !== undefined && promised !== null && Number(promised) !== arrays.length) {
+      throw new Error(
+        `Databricks returned ${arrays.length} row(s) but the manifest promised ${Number(promised)} ` +
+          `across ${totalChunks} chunk(s) — refusing to bill a partial window ` +
+          `(statement_id=${statementId})`,
+      );
+    }
+    // A row set with no column names decodes to `{}` per row, which every layer
+    // downstream degrades cleanly and wrongly on: all-zero usage, and a confident
+    // `{cost: 0, tokens: 0}` for a window that had real traffic. Not observed on this API
+    // (every SELECT returns a full schema, zero-row reads included) — this guards the
+    // decode, not a known bug.
+    if (arrays.length > 0 && columns.length === 0) {
+      throw new Error(
+        `Databricks returned rows with no \`manifest.schema.columns\` — cannot decode ` +
+          `${arrays.length} row(s) (statement_id=${statementId})`,
+      );
     }
 
     return arrays.map((row) => {
@@ -252,6 +306,11 @@ export class DatabricksSource {
         headers,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
+      // This path already failed loudly without a status check — a non-OK body has no
+      // `status.state`, so the branch above threw. Checking here only changes WHAT the
+      // operator reads: the real cause ("Invalid access token", "statement expired")
+      // instead of `Databricks statement undefined: {...}`.
+      await raiseForApiError(next, "statement poll");
       body = (await next.json()) as any;
     }
   }
