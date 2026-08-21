@@ -163,15 +163,41 @@ export class LagoSDK {
     // Explicit options win over `config`. Spread order is load-bearing: with `config`
     // last, a `config.apiUrl` would beat an explicitly passed `apiUrl` and bill a
     // different Lago instance than the Python port does.
+    //
+    // `apiUrl` is guarded on TRUTHINESS, not on `!== undefined` like its neighbours —
+    // an empty string must not win either. This used to be `!== undefined`, which meant
+    // the ports diverged on the same input: `apiUrl: process.env.LAGO_API_URL ?? ""`
+    // with the var unset wrote `""` here while Python kept its default. Downstream that
+    // is unrecoverable — `fetch("" + "/events/batch")` throws a plain TypeError, not a
+    // `LagoApiError`, so `isPermanentFailure` calls it transient, the batch is
+    // re-prepended and retried at the 60s ceiling forever. All billing stops, nothing is
+    // dropped or escalated, and the only symptom is a growing buffer. Falling back is
+    // right, but it must not be SILENT — see the report below.
     this.config = makeConfig({
       ...(opts.config || {}),
       apiKey: opts.apiKey,
-      ...(opts.apiUrl !== undefined ? { apiUrl: opts.apiUrl } : {}),
+      ...(opts.apiUrl ? { apiUrl: opts.apiUrl } : {}),
       ...(opts.defaultSubscriptionId !== undefined
         ? { defaultSubscriptionId: opts.defaultSubscriptionId }
         : {}),
       ...(opts.verifySsl !== undefined ? { verifySsl: opts.verifySsl } : {}),
     });
+    // A caller who passed `apiUrl` explicitly MEANT to point somewhere specific.
+    // Discarding a falsy one is the safe choice for delivery, but doing it silently is
+    // the one outcome that must not happen here: the default is PRODUCTION, so the
+    // fallback above now points a CI job or a developer holding a real production key at
+    // production Lago, which accepts every event — and ingested events cannot be
+    // un-ingested. Reported through the same log-plus-callback floor as every other drop
+    // path rather than trusting an opt-in callback to exist.
+    if (opts.apiUrl !== undefined && !opts.apiUrl) {
+      this.reportError(
+        new Error(
+          `apiUrl was explicitly set to an empty value; falling back to ${this.config.apiUrl}. ` +
+            `Set LAGO_API_URL (or pass config.apiUrl) if you did not intend to send events there.`,
+        ),
+        "config.apiUrl",
+      );
+    }
     this.client = new LagoClient(
       this.config.apiKey,
       this.config.apiUrl,
@@ -566,6 +592,11 @@ export class LagoSDK {
         /* ignore */
       }
     }
+    // The LOG is the floor, not the callback: `onError` is opt-in, so a customer who
+    // never set one used to get literally nothing for a dropped event here while the
+    // Python port logged a warning for the same one — the two repos reported 0 lines
+    // vs 1 for an identical billing gap. Mirrors `_report_error`'s `logger.warning`.
+    console.warn(`[lago] ${where} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   /**

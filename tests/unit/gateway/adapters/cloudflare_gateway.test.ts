@@ -1,10 +1,13 @@
 /** Cloudflare AI Gateway log adapter — verified against real captured log entries. */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { makeCanonicalUsage, nonzeroNumeric } from "../../../../src/canonical.js";
 import { extractCloudflareLog, resolveSubscription } from "../../../../src/gateway/adapters/index.js";
+// Imported from the module rather than the package index: the mapped-key set is an
+// internal invariant this test pins, not part of the public API.
+import { MAPPED_USAGE_KEYS } from "../../../../src/gateway/adapters/cloudflare_gateway.js";
 import { computeCost, lookupOpenRouter, parseOpenRouter, parseScaled } from "../../../../src/pricing.js";
 
 const FIX = join(__dirname, "fixtures", "cloudflare_gateway");
@@ -374,5 +377,143 @@ describe("Cloudflare gateway — cache key casing", () => {
     });
     expect(u.cache_read).toBe(0);
     expect(u.cache_write).toBe(0);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Drift contract for `usage_metadata`.
+//
+// `extras` used to be a fixed three-key object, so any counter this adapter does not map
+// was silently dropped. Not hypothetical: replaying the captured fixtures dropped
+// `neurons` in 4 entries and `input_text_tokens` in 1, and a live Logs API pull also
+// returns `units`, present in no fixture at all — the hand-maintained key list had
+// already drifted past reality. Same contract `drift.test.ts` pins for the native
+// adapters.
+// ----------------------------------------------------------------------
+describe("Cloudflare gateway log adapter — usage_metadata drift", () => {
+  it("keeps an unmapped counter instead of dropping it", () => {
+    // Exactly the shape seen live (entry 01M0FEZ2Y7QMQR1HT11GVT2HCE).
+    const u = extractCloudflareLog({
+      id: "log_1",
+      cached: false,
+      step: 0,
+      tokens_in: 37,
+      tokens_out: 2,
+      provider: "workers-ai",
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      usage_metadata: {
+        input_tokens: 37,
+        output_tokens: 2,
+        total_tokens: 39,
+        input_cached_tokens: 0,
+        neurons: 1.396314412355423,
+        units: 0.00001535945853590965,
+      },
+    });
+    // Cloudflare's Workers AI billing unit, and a cost quantity — both money-relevant.
+    expect(u.extras.usage_metadata).toEqual({
+      neurons: 1.396314412355423,
+      units: 0.00001535945853590965,
+    });
+  });
+
+  it("sweeps a counter nobody has ever seen", () => {
+    const u = extractCloudflareLog({
+      tokens_in: 10,
+      tokens_out: 1,
+      provider: "anthropic",
+      usage_metadata: { input_tokens: 10, audio_input_tokens: 512 },
+    });
+    expect(u.extras.usage_metadata).toEqual({ audio_input_tokens: 512 });
+  });
+
+  it("never shadows the poller's own billing inputs", () => {
+    // `extras.cached` decides whether to skip billing a request Cloudflare served for
+    // free. A usage_metadata key of the same name must not be able to overwrite it —
+    // which is why the sweep is nested rather than merged flat into extras.
+    const u = extractCloudflareLog({
+      id: "log_2",
+      cached: true,
+      step: 3,
+      tokens_in: 5,
+      tokens_out: 1,
+      provider: "anthropic",
+      usage_metadata: { cached: false, step: 99, log_id: "spoofed" },
+    });
+    expect(u.extras.cached).toBe(true);
+    expect(u.extras.step).toBe(3);
+    expect(u.extras.log_id).toBe("log_2");
+    expect(u.extras.usage_metadata).toEqual({ cached: false, step: 99, log_id: "spoofed" });
+  });
+
+  it("omits the key entirely when there is no drift", () => {
+    // The common case must look exactly as it did before the sweep existed.
+    const u = extractCloudflareLog({
+      id: "log_3",
+      cached: false,
+      step: 0,
+      tokens_in: 9,
+      tokens_out: 21,
+      provider: "anthropic",
+      usage_metadata: {
+        input_tokens: 9,
+        output_tokens: 21,
+        total_tokens: 30,
+        input_cached_tokens: 4,
+      },
+    });
+    expect(u.extras).toEqual({ cached: false, step: 0, log_id: "log_3" });
+    expect("usage_metadata" in u.extras).toBe(false);
+  });
+
+  it.each([
+    "input_cached_tokens",
+    "inputCachedTokens",
+    "cachedContentTokenCount",
+    "cache_read_input_tokens",
+    "input_cache_creation_tokens",
+    "inputCacheCreationTokens",
+    "cache_creation_input_tokens",
+    "reasoningTokens",
+    "reasoning_tokens",
+    "thoughtsTokenCount",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+  ])("every mapped spelling stays out of the sweep: %s", (key) => {
+    // A key that IS consumed must not also show up as drift — that would read as an
+    // unhandled counter in reconciliation and invite double-counting.
+    const u = extractCloudflareLog({
+      tokens_in: 100,
+      tokens_out: 10,
+      provider: "anthropic",
+      usage_metadata: { [key]: 7 },
+    });
+    expect("usage_metadata" in u.extras).toBe(false);
+  });
+
+  it("no captured fixture loses a counter", () => {
+    // The sweep against real data, not constructed entries. Iterating the fixture
+    // directory rather than asserting a fixed key list is what makes this survive a
+    // recapture: a new counter Cloudflare starts sending is caught by the next capture
+    // run, with no test edit and no re-audit of the module docstring.
+    const files = readdirSync(FIX)
+      .filter((f) => f.endsWith(".json"))
+      .sort();
+    // Absent fixtures read as "not covered", never as a pass — same rule as the sweeps.
+    expect(files.length).toBeGreaterThan(0);
+    for (const name of files) {
+      const entry = load(name);
+      const meta = entry.usage_metadata;
+      if (meta === null || typeof meta !== "object" || Array.isArray(meta)) continue;
+      const u = extractCloudflareLog(entry);
+      const swept = (u.extras.usage_metadata ?? {}) as Record<string, unknown>;
+      for (const key of Object.keys(meta as Record<string, unknown>)) {
+        expect(
+          MAPPED_USAGE_KEYS.has(key) || key in swept,
+          `${name}: ${key} is neither mapped nor swept into extras`,
+        ).toBe(true);
+      }
+    }
   });
 });

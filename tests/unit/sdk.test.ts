@@ -1,5 +1,5 @@
 /** LagoSDK — emit, subscription resolution, error policy. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage, UnknownClientError } from "../../src/index.js";
 import { makeConfig } from "../../src/config.js";
@@ -77,6 +77,55 @@ describe("LagoSDK.emit", () => {
   it("default apiUrl is still production when nothing is passed", async () => {
     const sdk = new LagoSDK({ apiKey: "k" });
     expect(sdk.config.apiUrl).toBe("https://api.getlago.com/api/v1");
+    await sdk.shutdown(1000);
+  });
+
+  // An explicitly-passed EMPTY apiUrl. The guard used to be `!== undefined` like its
+  // neighbours, so `""` won and was written — while Python's truthiness guard kept its
+  // default. The same call billed differently depending on which port you used, and the
+  // JS side had the worse half: `fetch("" + "/events/batch")` throws a plain TypeError,
+  // not a LagoApiError, so the queue calls it transient and retries at the 60s ceiling
+  // forever with a growing buffer as the only symptom.
+  it("an empty apiUrl is discarded rather than written", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sdk = new LagoSDK({ apiKey: "k", apiUrl: "" });
+    expect(sdk.config.apiUrl).toBe("https://api.getlago.com/api/v1");
+    spy.mockRestore();
+    await sdk.shutdown(1000);
+  });
+
+  it("a discarded empty apiUrl is reported, not swallowed", async () => {
+    // Falling back is right; falling back SILENTLY is the dangerous part — the default
+    // is PRODUCTION, which accepts every event, and ingested events cannot be
+    // un-ingested.
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errors: Array<[unknown, string]> = [];
+    const sdk = new LagoSDK({
+      apiKey: "k",
+      apiUrl: "",
+      config: { onError: (e, w) => errors.push([e, w]) },
+    });
+    expect(errors.map(([, w]) => w)).toEqual(["config.apiUrl"]);
+    // The message must name where events are actually going, or it tells the reader
+    // nothing they can act on.
+    expect(String(errors[0][0])).toContain("api.getlago.com");
+    // The log is the floor: onError is opt-in, so a customer without one still sees it.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(String(spy.mock.calls[0][0])).toContain("config.apiUrl");
+    spy.mockRestore();
+    await sdk.shutdown(1000);
+  });
+
+  it("an unpassed apiUrl is not reported", async () => {
+    // `undefined` means the caller never mentioned apiUrl — the overwhelmingly common
+    // case and not a mistake. Reporting it would train customers to ignore `onError`,
+    // the channel the empty-string case above depends on.
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errors: Array<[unknown, string]> = [];
+    const sdk = new LagoSDK({ apiKey: "k", config: { onError: (e, w) => errors.push([e, w]) } });
+    expect(errors).toEqual([]);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
     await sdk.shutdown(1000);
   });
 
