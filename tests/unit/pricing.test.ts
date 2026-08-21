@@ -453,6 +453,26 @@ describe("de-overlapped token total (precomputed `unit` basis)", () => {
     [{ input: 10, output: 100, reasoning: 80, provider: "openai" }, 110],
     // tool_calls is a CALL COUNT, not tokens, so it must never land in a token total.
     [{ input: 10, output: 20, tool_calls: 3, provider: "openai" }, 30],
+    // --- gateway SURFACES that re-shape every vendor (OPENAI_SHAPED_APIS) ---
+    // Real shape from system.ai_gateway.usage: input CONTAINS cache_read even for
+    // Anthropic, whose own API reports it additively. Keying on the vendor billed
+    // 48,798 tokens against 31,091 consumed on a real backfill (1.570x). The honest
+    // total is the table's own total_tokens, i.e. input + output.
+    [{ input: 1822, output: 4, cache_read: 1812, provider: "anthropic", api: "databricks_gateway" }, 1826],
+    // The write half of the same shape — the overlap no provider-keyed set covers,
+    // because no vendor's native API reports cache_write inside input.
+    [{ input: 1825, output: 4, cache_write: 1812, provider: "anthropic", api: "databricks_gateway" }, 1829],
+    // Hosted Databricks models bill as TOKEN COUNTS (TOKEN_BILLED_PROVIDERS), so this
+    // path IS the bill. Latent today (0 of 96 hosted rows carry cache) and a direct
+    // 1.991x over-bill the day one does.
+    [{ input: 1825, output: 4, cache_read: 1812, provider: "databricks", api: "databricks_gateway" }, 1829],
+    // A vendor the surface set must NOT reach: reasoning is inside output here even
+    // though gemini reports thoughts additively on its own API.
+    [{ input: 500, output: 200, reasoning: 50, provider: "gemini", api: "databricks_gateway" }, 700],
+    // Cloudflare is deliberately NOT in OPENAI_SHAPED_APIS: measured on real logs, an
+    // anthropic entry reads input=10, output=4, total=14 with cache OUTSIDE that total.
+    // Adding it to the set would UNDER-bill by the cached portion.
+    [{ input: 10, output: 4, cache_read: 3429, provider: "anthropic", api: "cloudflare_gateway" }, 3443],
   ])("%o -> %i", (fields, expected) => {
     expect(deoverlappedTokenTotal(makeCanonicalUsage(fields as any))).toBe(expected);
   });
@@ -700,8 +720,14 @@ describe("computeCost / money", () => {
       const price = modelPrice(c.prices);
       // `provider` is optional and defaults to a name in no INCLUDES_ set, so
       // the pre-existing cases keep their original semantics; cases that pin
-      // per-provider token semantics set it explicitly.
-      const usage = makeCanonicalUsage({ ...c.counts, provider: c.provider ?? "p" });
+      // per-provider token semantics set it explicitly. `api` defaults to
+      // "native" for the same reason — only the cases pinning a gateway
+      // surface's own token shape (OPENAI_SHAPED_APIS) set it.
+      const usage = makeCanonicalUsage({
+        ...c.counts,
+        provider: c.provider ?? "p",
+        api: c.api ?? "native",
+      });
       const b = computeCost(usage, price, parseScaled(c.markup)!);
       expect(b.base, `${c.name}: base`).toBe(c.base);
       expect(b.total, `${c.name}: total`).toBe(c.total);
