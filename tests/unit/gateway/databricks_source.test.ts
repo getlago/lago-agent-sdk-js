@@ -525,9 +525,13 @@ describe("Databricks reader — event ids", () => {
 // --------------------------------------------------------------------------
 // The one-liner
 // --------------------------------------------------------------------------
-function sdkWithRecorder(): [LagoSDK, { events: Record<string, any>[] }] {
+function sdkWithRecorder(errors?: [string, string][]): [LagoSDK, { events: Record<string, any>[] }] {
   const rec: { events: Record<string, any>[] } = { events: [] };
-  const sdk = new LagoSDK({ apiKey: "dummy" });
+  // `onError` lives on the config, not the top-level options — same as the Python port.
+  const sdk = new LagoSDK({
+    apiKey: "dummy",
+    config: errors ? { onError: (err, where) => errors.push([where, String(err)]) } : undefined,
+  });
   sdk._setSender(async (batch) => {
     rec.events.push(...(batch as unknown as Record<string, any>[]));
   });
@@ -546,7 +550,7 @@ describe("backfillDatabricks", () => {
     const counts = await sdk.backfillDatabricks(src, "1 day");
     await drain(sdk);
     // The untagged row has no subscription and no default to fall back on.
-    expect(counts).toEqual({ cost: 1, tokens: 1, skipped: 1 });
+    expect(counts).toEqual({ cost: 1, tokens: 1, skipped: 1, deferred: 0 });
     expect(new Set(rec.events.map((e) => e.external_subscription_id))).toEqual(
       new Set(["sub_byok", "sub_hosted"]),
     );
@@ -619,6 +623,59 @@ describe("backfillDatabricks", () => {
 // --------------------------------------------------------------------------
 // Reconciliation dimensions — the whole point of the connector being checkable
 // --------------------------------------------------------------------------
+describe("billing gaps must reach the caller, not just the log", () => {
+  it("reports a deferred bucket through onError", async () => {
+    // A BYOK bucket whose spend row has not landed is billed by neither loop. Measured
+    // live with one hour's spend withheld, the return value was
+    // `{cost: 12, tokens: 54, skipped: 0}` — indistinguishable from a clean run — while
+    // 54 buckets went unbilled and `onError` fired zero times. Only a log line said so,
+    // which no caller can reconcile against.
+    const errors: [string, string][] = [];
+    const [sdk, rec] = sdkWithRecorder(errors);
+    // BYOK usage with NO matching spend row, plus one hosted row that bills normally.
+    const counts = await sdk.backfillDatabricks(source([], [HOSTED, BYOK_USAGE]), "1 day");
+    await drain(sdk);
+    expect(counts).toEqual({ cost: 0, tokens: 1, skipped: 0, deferred: 1 });
+    const backfill = errors.filter(([where]) => where === "backfill").map(([, msg]) => msg);
+    expect(backfill).toHaveLength(1);
+    // Names the hour to re-run and the model, so the report is actionable on its own.
+    expect(backfill[0]).toContain("no external_model_spend row yet");
+    // The hour key is the source column truncated, so it keeps that column's own form.
+    expect(backfill[0]).toContain("hour=2026-08-07 14");
+    expect(backfill[0]).toContain("model=claude-sonnet-4-5");
+    // The gap is a deferral, not a drop: the hosted row still billed.
+    expect(rec.events.length).toBeGreaterThan(0);
+  });
+
+  it("reports an unattributed row through onError", async () => {
+    // `skipped` was counted and returned but never routed anywhere, so a run that
+    // attributed nothing looked like a run with nothing to attribute. It never reaches
+    // `emit()`, which is where every other dropped event is reported from.
+    const errors: [string, string][] = [];
+    const [sdk] = sdkWithRecorder(errors);
+    const counts = await sdk.backfillDatabricks(source([], [{ ...HOSTED, request_tags: "{}" }]), "1 day");
+    await drain(sdk);
+    expect(counts.skipped).toBe(1);
+    expect(counts.deferred).toBe(0);
+    const backfill = errors.filter(([where]) => where === "backfill").map(([, msg]) => msg);
+    expect(backfill).toHaveLength(1);
+    expect(backfill[0]).toContain("no resolvable subscription");
+  });
+
+  it("clears the previous read's deferred buckets on a second read", async () => {
+    // The gap belongs to one read, so it is rewritten per read rather than appended to.
+    // Left accumulating, a healthy window read after a lagging one would report the older
+    // window's buckets — the phantom-warning shape the zero-usage guard just removed,
+    // reintroduced through a different door.
+    const src = source([], [BYOK_USAGE]);
+    await src.readUsage("1 day");
+    expect(src.deferredBuckets).toHaveLength(1);
+    src.query = async (sql: string) => (sql.includes("external_model_spend") ? [BYOK_SPEND] : [BYOK_USAGE]);
+    await src.readUsage("1 day");
+    expect(src.deferredBuckets).toEqual([]);
+  });
+});
+
 describe("reconciliation dimensions", () => {
   it("put the gateway page's own endpoint on hosted events", async () => {
     // Our `model` is normalized (`llama-4-maverick`) where the AI Gateway usage page
@@ -841,7 +898,7 @@ describe("Databricks reader — review fixes", () => {
     const [sdk, rec] = sdkWithRecorder();
     const counts = await sdk.backfillDatabricks(rows, undefined, { defaultSubscription: "sub_x" });
     await drain(sdk);
-    expect(counts).toEqual({ cost: 1, tokens: 1, skipped: 0 });
+    expect(counts).toEqual({ cost: 1, tokens: 1, skipped: 0, deferred: 0 });
     expect(src.queries.length).toBe(queriesAfterRead);
     expect(rec.events.length).toBeGreaterThanOrEqual(3);
   });

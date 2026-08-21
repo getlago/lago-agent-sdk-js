@@ -263,6 +263,14 @@ export class DatabricksSource {
   readonly host: string;
   readonly timeoutMs: number;
   readonly waitTimeout: string;
+  /**
+   * Buckets the most recent `readUsage` could not bill, in the shape its warning names
+   * them. A log line is not something a caller can act on: `backfillDatabricks` turns
+   * this into a count in its return value and an `onError` report, and a caller reading
+   * the window itself can re-run exactly these hours. See `readUsage` for why they go
+   * unbilled.
+   */
+  deferredBuckets: { hour: string; provider: string; model: string; requestTags: string }[] = [];
 
   constructor(
     host: string,
@@ -436,6 +444,10 @@ export class DatabricksSource {
     opts: { eventIdPrefix?: string } = {},
   ): Promise<DatabricksUsageRow[]> {
     const prefix = opts.eventIdPrefix ?? "dbx";
+    // Rewritten per read rather than appended to, so a later read of a healthy window
+    // cannot leave an earlier read's gap standing as if it were current. Cleared here,
+    // ahead of the empty-window return below, so that path clears it too.
+    this.deferredBuckets = [];
     const [lower, upper] = windowBounds(since);
     if (lower >= upper) {
       // Not an error, but it must not read as success either: the caller asked for a
@@ -541,6 +553,12 @@ export class DatabricksSource {
     // once Databricks has aggregated picks them up — but only if the operator knows to,
     // which is what this warning is for.
     const unbilled = [...tokens.keys()].filter((k) => !billedKeys.has(k)).sort();
+    // Same facts as the warning, in a shape a caller can act on rather than grep for —
+    // `backfillDatabricks` reports the count through `onError`.
+    this.deferredBuckets = unbilled.map((k) => {
+      const [hour, provider, model, requestTags] = JSON.parse(k) as string[];
+      return { hour, provider, model, requestTags };
+    });
     if (unbilled.length) {
       const [hour, provider, model] = JSON.parse(unbilled[0]) as string[];
       console.warn(

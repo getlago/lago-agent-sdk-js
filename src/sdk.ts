@@ -535,8 +535,16 @@ export class LagoSDK {
   /**
    * Read a window of Databricks AI Gateway usage and bill all of it.
    *
-   * The one-call entrypoint: give it a window, it does the rest. Returns counts of
-   * what it emitted, e.g. `{cost: 56, tokens: 45, skipped: 0}`.
+   * The one-call entrypoint: give it a window, it does the rest. Returns counts of what
+   * it handed to `emit()`, e.g. `{cost: 56, tokens: 45, skipped: 0, deferred: 0}`.
+   *
+   * The last two are billing GAPS, and both are also reported through `config.onError`
+   * (`where: "backfill"`) — the hook every other gap in this SDK uses — so a caller does
+   * not have to inspect the return value to notice one. They fail differently: `skipped`
+   * rows had no resolvable subscription and stay lost until they are tagged or a default
+   * is set, while `deferred` buckets are billable revenue that the NEXT run of the same
+   * window collects once Databricks has aggregated their spend row. A run with both at 0
+   * is the only one that billed the whole window.
    *
    * Billing follows the rule the connector establishes rather than re-deriving it: a
    * BYOK row carries Databricks' own metered USD and bills as a dollar cost; a
@@ -573,11 +581,12 @@ export class LagoSDK {
       dimensions?: Record<string, unknown>;
       eventIdPrefix?: string;
     } = {},
-  ): Promise<{ cost: number; tokens: number; skipped: number }> {
-    const counts = { cost: 0, tokens: 0, skipped: 0 };
-    const rows = Array.isArray(source)
-      ? source
-      : await source.readUsage(since, { eventIdPrefix: opts.eventIdPrefix ?? "dbx" });
+  ): Promise<{ cost: number; tokens: number; skipped: number; deferred: number }> {
+    const counts = { cost: 0, tokens: 0, skipped: 0, deferred: 0 };
+    const reader = Array.isArray(source) ? undefined : source;
+    const rows = reader
+      ? await reader.readUsage(since, { eventIdPrefix: opts.eventIdPrefix ?? "dbx" })
+      : (source as any[]);
     for (const row of rows) {
       const sub = opts.unified ? opts.defaultSubscription : row.subscription || opts.defaultSubscription;
       if (!sub) {
@@ -615,6 +624,45 @@ export class LagoSDK {
         });
         counts.tokens += 1;
       }
+    }
+
+    // Both gaps below were counted but never reported: measured live over a window with
+    // one hour's spend rows withheld — the shape of real spend-table lag — this returned
+    // `{cost: 12, tokens: 54, skipped: 0}` while 54 BYOK buckets went unbilled and
+    // `onError` fired zero times. `cost` alone dropping from 66 to 12 is not something an
+    // automated caller can read as a gap, so route both through the hook that already
+    // means "billing gap".
+    if (counts.skipped) {
+      this.reportError(
+        new Error(
+          `${counts.skipped} Databricks row(s) had no resolvable subscription and were NOT ` +
+            `billed. Pass defaultSubscription, set LagoConfig.defaultSubscriptionId, or tag ` +
+            `the calls.`,
+        ),
+        "backfill",
+      );
+    }
+    // Only the reader knows about a bucket it never yielded, so a caller who passed an
+    // already-read array gets 0 here — they hold the source and can read
+    // `deferredBuckets` off it directly. Optional because `source` is duck-typed: a
+    // caller's own reader need not carry the property.
+    const deferred = reader ? ((reader as any).deferredBuckets ?? []) : [];
+    counts.deferred = deferred.length;
+    if (deferred.length) {
+      const first = deferred[0];
+      // `readUsage` logs this too. That is deliberate, not a stutter: a caller who reads
+      // the window itself never reaches this line, and one who ran the backfill needs it on
+      // the channel they reconcile against. Worded from the RUN's side so the two read as
+      // one gap seen from two layers rather than as two gaps.
+      this.reportError(
+        new Error(
+          `this run left ${deferred.length} Databricks BYOK bucket(s) unbilled: no ` +
+            `external_model_spend row yet (e.g. hour=${first.hour} ` +
+            `provider=${first.provider} model=${first.model}). The spend table lags; ` +
+            `re-run this window later to bill them.`,
+        ),
+        "backfill",
+      );
     }
     return counts;
   }
