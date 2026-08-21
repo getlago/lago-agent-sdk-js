@@ -120,6 +120,45 @@ class FakeOpenAI {
 // Detector keys on the constructor name; "OpenAI" matches.
 Object.defineProperty(FakeOpenAI, "name", { value: "OpenAI" });
 
+/**
+ * Minimal fake reproducing Databricks' streaming convention, which differs from
+ * OpenAI's in two measured ways: usage is on EVERY frame and is CUMULATIVE, and there
+ * is no final usage-only frame — the last frame is an ordinary delta.
+ */
+class DbxStreamCompletions {
+  constructor(private cumulative: number[]) {}
+
+  async create(args: any) {
+    expect(args?.stream).toBe(true);
+    const frames = this.cumulative;
+    return (async function* () {
+      for (const n of frames) {
+        yield {
+          model: "meta-llama-4-maverick-040225",
+          choices: [
+            {
+              index: 0,
+              delta: { content: "a" },
+              finish_reason: n === frames[frames.length - 1] ? "stop" : null,
+            },
+          ],
+          usage: { prompt_tokens: 14, completion_tokens: n, total_tokens: 14 + n },
+        };
+      }
+    })();
+  }
+}
+
+class DbxStreamOpenAI {
+  chat: { completions: DbxStreamCompletions };
+  baseURL = "https://dbc-0223ef70-2638.cloud.databricks.com/ai-gateway/mlflow/v1";
+
+  constructor(cumulative: number[]) {
+    this.chat = { completions: new DbxStreamCompletions(cumulative) };
+  }
+}
+Object.defineProperty(DbxStreamOpenAI, "name", { value: "OpenAI" });
+
 function newSdk(defaultSub = "sub_test") {
   const received: LagoEvent[] = [];
   const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: defaultSub });
@@ -606,5 +645,87 @@ describe("Databricks: baseURL decides the provider", () => {
         }),
       ),
     ).toBe("");
+  });
+
+  it("stamps a hosted call databricks end to end", async () => {
+    // Through the real wrapper: a hosted model must come out as provider="databricks"
+    // so the price lookup cannot hit. OpenRouter lists bare `openai/gpt-oss-20b` at
+    // ~0.4x of Databricks' own DBU rate, so being stamped "openai" would silently
+    // under-bill 2.5-5x the moment a served-entity rename let stripVersion match it.
+    const { sdk, received } = newSdk();
+    const fake = new FakeOpenAI() as any;
+    fake.baseURL = `${DBX}/ai-gateway/mlflow/v1`;
+    const client = sdk.wrap(fake);
+    await client.chat.completions.create({ model: "system.ai.llama-4-maverick", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(0);
+    expect(received.every((e) => e.properties.provider === "databricks")).toBe(true);
+  });
+
+  it("keeps its vendor provider on a BYOK call", async () => {
+    // The mirror: the same client class against the OpenAI BYOK surface must stay
+    // "openai", because that path IS priceable and was verified exact against
+    // Databricks' own metered spend on 38 of 38 buckets.
+    const { sdk, received } = newSdk();
+    const fake = new FakeOpenAI() as any;
+    fake.baseURL = `${DBX}/ai-gateway/openai/v1`;
+    const client = sdk.wrap(fake);
+    await client.chat.completions.create({ model: "gpt-4o", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.every((e) => e.properties.provider === "openai")).toBe(true);
+  });
+
+  it("takes the last frame of a cumulative usage stream", async () => {
+    // last-usage-wins lands on the correct total by construction. This pins it,
+    // because a "sum the frames" implementation would bill 1+7+15=23 instead of 15,
+    // and a "first frame wins" one would bill 1.
+    //
+    // It also pins the STREAMING half of the provider stamp. The hint reaches the
+    // non-streaming path through a closure but the stream path through an argument,
+    // so the two can disagree — and only this assertion would notice.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new DbxStreamOpenAI([1, 7, 15]) as any);
+    const stream = (await client.chat.completions.create({
+      model: "system.ai.llama-4-maverick",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_input_tokens).toBe(14); // cumulative input must not be summed
+    expect(map.llm_output_tokens).toBe(15); // final cumulative value, not 1+7+15
+    expect(received.every((e) => e.properties.provider === "databricks")).toBe(true);
+  });
+
+  it("bills the partial total of an abandoned stream", async () => {
+    // A behavioral divergence worth pinning rather than discovering later.
+    //
+    // Against real OpenAI, abandoning a stream yields no usage at all — it only
+    // arrives on a final usage-only chunk — so nothing is billed. Databricks puts a
+    // cumulative usage on every frame, so the generator's `finally` emit bills whatever
+    // had been generated when the consumer walked away. Arguably better (it bills real
+    // work), but NOT what the OpenAI path does.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new DbxStreamOpenAI([1, 7, 15]) as any);
+    const stream = (await client.chat.completions.create({
+      model: "system.ai.llama-4-maverick",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    let i = 0;
+    for await (const _ of stream) {
+      if (i++ === 1) break; // abandon after the second frame
+    }
+    // `break` runs the generator's return path, which is where the emit lives.
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map.llm_output_tokens).toBe(7); // partial cumulative count at abandonment
   });
 });

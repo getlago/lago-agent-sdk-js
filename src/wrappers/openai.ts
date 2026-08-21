@@ -340,7 +340,16 @@ async function* wrapAsyncIterableStream(
   sdk: SDKLike,
   modelId: string,
   opts: EmitOpts,
-  providerHint: string = "",
+  // Deliberately NOT defaulted. "" is a legitimate value here — it is what every
+  // non-Databricks client resolves to — so a forgotten argument is indistinguishable
+  // at runtime from a real answer: the stream silently emits provider="openai" for a
+  // Databricks-HOSTED model, which drops it out of TOKEN_BILLED_PROVIDERS and lets a
+  // served-entity rename strip into OpenRouter's price for the same open-weight model
+  // (measured at 0.2-0.4x of the DBU rate). Requiring it makes a second stream surface
+  // a compile error instead of a wrong invoice. The Python port gets the same guarantee
+  // for free: its stream wrapper is nested inside `wrap_openai_client` and closes over
+  // `provider_hint`, so there is no argument to forget.
+  providerHint: string,
 ): AsyncIterable<unknown> {
   let lastUsage: Record<string, unknown> | null = null;
   try {
