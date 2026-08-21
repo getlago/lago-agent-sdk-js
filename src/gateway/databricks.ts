@@ -546,10 +546,31 @@ export class DatabricksSource {
     const billedKeys = new Set<string>();
 
     for (const row of spend) {
-      // NaN from an unparseable decimal(38,18) falls through the `!usd` guard and skips
-      // the row, which is what Python's `_safe_float` does rather than raising.
+      // NaN from an unparseable decimal(38,18) falls through this guard and skips the
+      // row, which is what Python's `_safe_float` does rather than raising.
       const usd = Number(row.usage_quantity ?? 0);
-      if (!usd || !Number.isFinite(usd)) continue;
+      if (!Number.isFinite(usd) || usd <= 0) {
+        // `!usd` skipped 0 but let a NEGATIVE straight through, and a negative is far
+        // worse than a zero. `parsePrice` rejects it, so `computePrecomputedCost`
+        // floors the event to $0 — and that $0 event still CONSUMES the `record_id`
+        // derived `transactionId`, which Lago enforces unique account-wide. Measured
+        // against real Lago on a real spend row: a $0.015245 row restated negative
+        // billed as `value: "0"`, and re-running the window once Databricks had
+        // corrected it came back `422 value_already_exist` — the same figure billed
+        // fine only under a fresh prefix. Skipping leaves the id unburnt, so a
+        // restatement bills normally on the next run. The bucket then appears in the
+        // deferred report below, which is the honest reading: its tokens went unbilled.
+        if (usd < 0) {
+          console.warn(
+            `[lago] skipping Databricks spend row with a NEGATIVE usage_quantity ` +
+              `(${row.usage_quantity}, model=${safeStr(row.model)}, ` +
+              `hour=${truncateHour(stamp(row.bucket))}). A credit or restatement cannot ` +
+              `be billed as an event, and billing it at $0 would burn the row's ` +
+              `transaction_id so the corrected figure could never land.`,
+          );
+        }
+        continue;
+      }
       const key = JSON.stringify([
         truncateHour(stamp(row.bucket)),
         safeStr(row.provider),

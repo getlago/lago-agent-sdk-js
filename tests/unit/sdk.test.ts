@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage, UnknownClientError } from "../../src/index.js";
+import { makeConfig } from "../../src/config.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 
 function newSdk(defaultSub: string | null = "sub_default") {
@@ -92,6 +93,25 @@ describe("LagoSDK.emit", () => {
     const sdk = new LagoSDK({ apiKey: "k", verifySsl: true, config: { verifySsl: false } });
     expect(sdk.config.verifySsl).toBe(true);
     await sdk.shutdown(1000);
+  });
+
+  it("throws when a LagoConfig is passed where options are expected", async () => {
+    // `new LagoSDK(config)` TYPECHECKS — a LagoConfig is structurally assignable to
+    // LagoSDKOptions, both starting with a required `apiKey` — and silently drops every
+    // field only `config` can carry. Measured: pricingMode reverted "price" -> "tokens"
+    // and the caller's onError was never wired, against the right instance with the
+    // right key, so the bill was simply wrong and nothing said so. Python's twin of the
+    // mistake is positional and 401s every event instead.
+    const config = makeConfig({
+      apiKey: "k",
+      apiUrl: "https://api.lago.dev/api/v1",
+      pricingMode: "price",
+      onError: () => {},
+    });
+    expect(() => new LagoSDK(config)).toThrow(TypeError);
+    // The message has to name what was being dropped and carry the fix.
+    expect(() => new LagoSDK(config)).toThrow(/pricingMode/);
+    expect(() => new LagoSDK(config)).toThrow(/new LagoSDK\(\{ apiKey: config.apiKey, config \}\)/);
   });
 
   it("an ignored usdCost is reported, not silently dropped", async () => {

@@ -365,6 +365,50 @@ describe("Databricks reader — BYOK/hosted split", () => {
     expect(rows).toEqual([]);
   });
 
+  it("skips negative spend rows rather than billing them at zero", async () => {
+    // A Databricks credit or restatement arrives as a negative `usage_quantity`. `!usd`
+    // skipped 0 but passed a negative, which `parsePrice` then rejects, so the event
+    // billed at $0 while still consuming the `record_id`-derived `transactionId`.
+    // Verified against real Lago: the corrected positive figure came back
+    // `422 value_already_exist` and could only be billed under a different prefix.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const rows = await source([{ ...BYOK_SPEND, usage_quantity: "-0.0011187" }], [BYOK_USAGE]).readUsage(
+        "1 day",
+      );
+      expect(rows.filter((r) => r.kind === "spend")).toEqual([]);
+      const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(said).toContain("NEGATIVE usage_quantity");
+      // The operator needs the figure, not just the fact.
+      expect(said).toContain("-0.0011187");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("bills a restated spend row under the id the negative would have burnt", async () => {
+    // The whole point of skipping, as one scenario: read the negative, then read the
+    // same row once Databricks has corrected it. Anything emitted for the negative —
+    // even at $0 — consumes that `transaction_id` account-wide, and Lago then rejects
+    // the correction as a duplicate, so the id the second read needs must still be free.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let burnt: Set<string>;
+    try {
+      const negative = await source(
+        [{ ...BYOK_SPEND, usage_quantity: "-0.0011187" }],
+        [BYOK_USAGE],
+      ).readUsage("1 day");
+      burnt = new Set(negative.map((r) => r.eventIdFor("sub_byok")));
+    } finally {
+      warn.mockRestore();
+    }
+    const corrected = await source([BYOK_SPEND], [BYOK_USAGE]).readUsage("1 day");
+    const spendRows = corrected.filter((r) => r.kind === "spend");
+    expect(spendRows).toHaveLength(1);
+    expect(burnt.has(spendRows[0].eventIdFor("sub_byok"))).toBe(false);
+    expect(spendRows[0].usdCost).toBeCloseTo(0.0011187);
+  });
+
   it("yields nothing for failed calls", async () => {
     // 403/404s are recorded with NULL token counts. Emitting them would bill an empty
     // event for a call that never reached a provider.

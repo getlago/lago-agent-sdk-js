@@ -41,6 +41,27 @@ export interface LagoSDKOptions {
   config?: Partial<LagoConfig>;
 }
 
+/**
+ * `LagoConfig` fields that `LagoSDKOptions` has no equivalent for. Presence of any of
+ * them means a config object was handed in where options were expected — see the
+ * constructor. `apiKey` / `apiUrl` / `defaultSubscriptionId` / `verifySsl` are
+ * deliberately absent: those exist on BOTH, so they are not evidence of the mistake.
+ */
+const CONFIG_ONLY_KEYS = [
+  "metricCodes",
+  "flushIntervalMs",
+  "maxBatchSize",
+  "maxBufferSize",
+  "requestTimeoutMs",
+  "maxRetryMs",
+  "onError",
+  "pricingMode",
+  "markup",
+  "costMetricCode",
+  "pricingTtlMs",
+  "bedrockDefaultRegion",
+] as const;
+
 export interface WrapOptions {
   dimensions?: Record<string, unknown>;
   subscription?: string;
@@ -124,6 +145,21 @@ export class LagoSDK {
   private tokenBilledNoted = new Set<string>();
 
   constructor(opts: LagoSDKOptions) {
+    // `new LagoSDK(config)` is the natural-looking call, it TYPECHECKS — a `LagoConfig`
+    // is structurally assignable to `LagoSDKOptions`, both starting with a required
+    // `apiKey` — and it silently drops every field that only `config` can carry.
+    // Measured: a config with `pricingMode: "price"` and an `onError` hook built an SDK
+    // billing in TOKENS mode with no error hook wired and no warning anywhere, i.e. the
+    // wrong bill, delivered successfully. Python's twin of this mistake is positional
+    // (`LagoSDK(cfg)`) and 401s every event instead; both are silent, so both throw.
+    const misplaced = CONFIG_ONLY_KEYS.filter((k) => k in opts);
+    if (misplaced.length) {
+      throw new TypeError(
+        `LagoSDK takes { apiKey, config }, not a LagoConfig. These belong under ` +
+          `\`config\` and were being ignored: ${misplaced.join(", ")}. ` +
+          `Use new LagoSDK({ apiKey: config.apiKey, config }).`,
+      );
+    }
     // Explicit options win over `config`. Spread order is load-bearing: with `config`
     // last, a `config.apiUrl` would beat an explicitly passed `apiUrl` and bill a
     // different Lago instance than the Python port does.
