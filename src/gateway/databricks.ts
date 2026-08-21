@@ -124,6 +124,29 @@ export class DatabricksUsageRow {
   }
 
   /**
+   * When this row's usage actually happened, as unix seconds for `emit()`.
+   *
+   * The whole point of a backfill is that it runs long after the usage it bills, so
+   * the run's own clock is never the right answer: a window reaching back a week must
+   * bill into the periods those calls fell in, not into the period the script happens
+   * to run in.
+   *
+   * Each kind reports the time its OWN surface is keyed by:
+   *
+   *   * usage — `event_time`, the request's own instant.
+   *   * spend — `bucket`, the START of the hour it aggregates. An hourly total covers
+   *     [bucket, bucket + 1h), so the start is the only instant certain to sit inside
+   *     the row's own coverage; the hour's end would push a bucket closing exactly on
+   *     a period boundary into the following period.
+   *
+   * undefined when the column is absent or unreadable, which leaves `emit()` to stamp
+   * `now` — the pre-existing behaviour, and better than dropping the event.
+   */
+  get occurredAt(): number | undefined {
+    return epochOf(this.kind === "spend" ? this.raw.bucket : this.raw.event_time);
+  }
+
+  /**
    * The same key, scoped to whichever subscription is actually billed.
    *
    * Scoping is not cosmetic: Lago's `transaction_id` is unique account-wide, so an id
@@ -475,6 +498,38 @@ function stamp(value: unknown): string {
   // ISO-8601 in UTC truncates to the correct hour and is stable everywhere.
   if (value instanceof Date) return value.toISOString();
   return String(value);
+}
+
+/**
+ * A timestamp column as unix seconds, from either access path.
+ *
+ * The Statement Execution API returns TIMESTAMPs as ISO-8601 strings ending in "Z";
+ * `databricks-sql-connector` returns real `Date` objects. Both are supported input
+ * paths and both have to yield the same instant.
+ *
+ * A stamp carrying no offset is normalised to UTC BEFORE parsing, because `new Date()`
+ * reads a space-separated offset-less string as LOCAL time where the Python port reads
+ * it as UTC — so without this the two repos bill the same row hours apart on any
+ * machine that is not itself on UTC.
+ *
+ * Unparseable returns undefined rather than throwing: a bad timestamp column must not
+ * cost the caller the whole row.
+ */
+function epochOf(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? Math.trunc(ms / 1000) : undefined;
+  }
+  let text = String(value).trim();
+  if (!text) return undefined;
+  // Only the FIRST space, which is the date/time separator — mirrors the Python port
+  // handing the same string to `fromisoformat`, which accepts either separator.
+  text = text.replace(" ", "T");
+  if (!/(Z|z|[+-]\d\d:?\d\d)$/.test(text)) text += "Z";
+  const ms = Date.parse(text);
+  // `trunc`, not `floor`, so a pre-epoch stamp rounds the same way Python's `int()` does.
+  return Number.isFinite(ms) ? Math.trunc(ms / 1000) : undefined;
 }
 
 function bucketOf(value: unknown): string {

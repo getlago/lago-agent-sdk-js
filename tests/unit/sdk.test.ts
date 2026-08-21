@@ -269,3 +269,117 @@ describe("LagoSDK async-isolation", () => {
     for (const e of received) expect(e.properties.model).toBe(e.external_subscription_id);
   });
 });
+
+// --------------------------------------------------------------------------
+// Event time — a backfill must bill into the period the usage happened in
+// --------------------------------------------------------------------------
+describe("LagoSDK.emit — event time", () => {
+  it("stamps the given instant on every event, not now", async () => {
+    // Without this, a replay of last week's logs billed every call into the period
+    // the script happened to run in, and nothing in Lago could tell afterwards.
+    const { sdk, received } = newSdk("sub");
+    const when = new Date(Date.UTC(2026, 7, 7, 14, 22, 3));
+    sdk.emit(makeCanonicalUsage({ input: 10, output: 20, model: "m", provider: "p", api: "x" }), {
+      timestamp: when,
+    });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBe(2);
+    // One instant for the whole call: Lago sums these into a period, so a call must
+    // never straddle two of them because two clock reads disagreed.
+    expect(new Set(received.map((e) => e.timestamp))).toEqual(new Set([when.getTime() / 1000]));
+  });
+
+  it("stamps a cost event too", async () => {
+    // The cost path reads its own clock, so it needed threading separately from the
+    // token path — and a backfill of BYOK spend goes down this one.
+    const { sdk, received } = newSdk("sub");
+    const when = new Date(Date.UTC(2026, 7, 7, 14, 0, 0));
+    sdk.emit(
+      makeCanonicalUsage({ input: 10, output: 20, model: "m", provider: "anthropic", api: "native" }),
+      {
+        mode: "price",
+        usdCost: 0.0011187,
+        timestamp: when,
+      },
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code)).toEqual(["llm_cost"]);
+    expect(received[0].timestamp).toBe(when.getTime() / 1000);
+  });
+
+  it("accepts epoch seconds", async () => {
+    const { sdk, received } = newSdk("sub");
+    const u = makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" });
+    sdk.emit(u, { timestamp: 1786112523 });
+    // A fractional value is what dividing a millisecond clock hands back, so it must
+    // not be refused.
+    sdk.emit(u, { timestamp: 1786112523.987 });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => e.timestamp))).toEqual(new Set([1786112523]));
+  });
+
+  it("reports an unreadable timestamp and still bills", async () => {
+    // Never silently under-bill: a bad timestamp is a reconciliation problem the
+    // operator can see and fix, while dropping the event is revenue that never
+    // appears. An ISO string is the likely mistake, and is deliberately not accepted
+    // — the Python port's `fromisoformat` rejects the trailing "Z" on 3.10, so a
+    // string would parse in one repo and fail in the other.
+    const errors: Array<[string, string]> = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub",
+      config: { onError: (e: unknown, where: string) => errors.push([String(e), where]) },
+    });
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    const before = Math.floor(Date.now() / 1000);
+    sdk.emit(makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" }), {
+      timestamp: "2026-08-07Z" as unknown as Date,
+    });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors[0][0]).toContain("2026-08-07Z");
+    expect(errors[0][1]).toBe("timestamp");
+    // ...and the call is still billed, at now.
+    expect(received.length).toBe(1);
+    expect(received[0].timestamp).toBeGreaterThanOrEqual(before);
+    expect(received[0].timestamp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000));
+  });
+
+  it("refuses a numeric string rather than coercing it", async () => {
+    // `Number("1786112523")` would sail through where the Python port's `isinstance`
+    // check rejects it — the same input must not bill in one repo and report in the
+    // other.
+    const errors: Array<[string, string]> = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub",
+      config: { onError: (e: unknown, where: string) => errors.push([String(e), where]) },
+    });
+    sdk._setSender(async () => {});
+    sdk.emit(makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" }), {
+      timestamp: "1786112523" as unknown as number,
+    });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(errors.map(([, where]) => where)).toEqual(["timestamp"]);
+  });
+
+  it("stamps now when no timestamp is given", async () => {
+    // The live `wrap()` path passes nothing and must be unchanged by all of this.
+    const { sdk, received } = newSdk("sub");
+    const before = Math.floor(Date.now() / 1000);
+    sdk.emit(makeCanonicalUsage({ input: 1, model: "m", provider: "p", api: "x" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received[0].timestamp).toBeGreaterThanOrEqual(before);
+    expect(received[0].timestamp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000));
+  });
+});

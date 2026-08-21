@@ -698,3 +698,82 @@ describe("Databricks reader — review fixes", () => {
     expect(rec.events.length).toBeGreaterThanOrEqual(3);
   });
 });
+
+// --------------------------------------------------------------------------
+// Event time — a backfill runs long after the usage it bills
+// --------------------------------------------------------------------------
+function utc(...parts: number[]): number {
+  return Date.UTC(parts[0], parts[1], parts[2], parts[3] ?? 0, parts[4] ?? 0, parts[5] ?? 0) / 1000;
+}
+
+describe("Databricks reader — event time", () => {
+  it("reads each kind's own time column", async () => {
+    // A usage row's own instant; a spend row's hour START — the only instant certain
+    // to sit inside the hour that row aggregates.
+    const [spendRow, usageRow] = await source([BYOK_SPEND], [HOSTED]).readUsage("1 day");
+    expect([spendRow.kind, usageRow.kind]).toEqual(["spend", "usage"]);
+    expect(spendRow.occurredAt).toBe(utc(2026, 7, 7, 14, 0, 0));
+    expect(usageRow.occurredAt).toBe(utc(2026, 7, 7, 14, 22, 3));
+  });
+
+  it("reads a Date column the same way", async () => {
+    // `databricks-sql-connector` returns TIMESTAMPs as `Date`, the REST API as
+    // ISO-8601 strings ending in "Z". Both are supported access paths, so both must
+    // resolve to the same instant.
+    const rows = await source(
+      [{ ...BYOK_SPEND, bucket: new Date(Date.UTC(2026, 7, 7, 14, 0, 0)) }],
+      [{ ...HOSTED, event_time: "2026-08-07T14:22:03.123Z" }],
+    ).readUsage("1 day");
+    expect(new Set(rows.map((r) => r.occurredAt))).toEqual(
+      new Set([utc(2026, 7, 7, 14, 0, 0), utc(2026, 7, 7, 14, 22, 3)]),
+    );
+  });
+
+  it("reads an offset-less stamp as UTC, not as local time", async () => {
+    // `new Date("2026-08-07 14:22:03")` is LOCAL time in V8 where the Python port's
+    // `fromisoformat` result is read as UTC — so without normalising first, the two
+    // repos bill the same row hours apart on any machine that is not on UTC.
+    const [row] = await source([], [HOSTED]).readUsage("1 day");
+    expect(row.occurredAt).toBe(utc(2026, 7, 7, 14, 22, 3));
+  });
+
+  it("has no occurredAt for a row with no readable time", () => {
+    // undefined leaves `emit()` stamping `now`, which is wrong but billed — better
+    // than losing the row over a bad column.
+    const rowWith = (eventTime: unknown) =>
+      new DatabricksUsageRow(
+        makeCanonicalUsage({ model: "m", provider: "databricks", api: "databricks_gateway" }),
+        "sub",
+        "r",
+        "usage",
+        undefined,
+        "dbx",
+        { event_time: eventTime },
+      );
+    for (const bad of [null, undefined, "", "not a timestamp"]) {
+      expect(rowWith(bad).occurredAt).toBeUndefined();
+    }
+    // A readable column on the same shape of row must still resolve, so this cannot
+    // pass merely because the property is absent.
+    expect(rowWith("2026-08-07 14:22:03").occurredAt).toBe(utc(2026, 7, 7, 14, 22, 3));
+  });
+
+  it("backfill events carry the source row's time, not the run time", async () => {
+    // Live-proven before the fix: 128 events off one window spanning 2026-08-06 to
+    // 2026-08-11 all carried the run's own clock, billing historical usage into the
+    // current period.
+    const [sdk, rec] = sdkWithRecorder();
+    await sdk.backfillDatabricks(source([BYOK_SPEND], [HOSTED, BYOK_USAGE]), "1 day");
+    await drain(sdk);
+
+    const cost = rec.events.filter((e) => e.code === "llm_cost");
+    const tokens = rec.events.filter((e) => e.code !== "llm_cost");
+    expect(cost.length).toBeGreaterThan(0);
+    expect(tokens.length).toBeGreaterThan(0);
+    // The spend row's hour, and the hosted request's own second.
+    expect(new Set(cost.map((e) => e.timestamp))).toEqual(new Set([utc(2026, 7, 7, 14, 0, 0)]));
+    expect(new Set(tokens.map((e) => e.timestamp))).toEqual(new Set([utc(2026, 7, 7, 14, 22, 3)]));
+    const dayAgo = Math.floor(Date.now() / 1000) - 86400;
+    expect(rec.events.every((e) => e.timestamp < dayAgo)).toBe(true);
+  });
+});

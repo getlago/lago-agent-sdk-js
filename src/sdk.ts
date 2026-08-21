@@ -80,6 +80,39 @@ export interface WrapOptions {
    * all-or-nothing that rejection takes the whole batch with it.
    */
   eventId?: string;
+  /**
+   * Bill the events at this instant instead of at now — pass the source row's own
+   * time when replaying/backfilling from a gateway's logs, or a window reaching
+   * back a week bills every one of its calls into the period the script happens
+   * to run in. Accepts a `Date` or epoch seconds.
+   *
+   * Deliberately NOT an ISO-8601 string: `new Date()` accepts the trailing "Z"
+   * that gateway APIs emit while the Python port's `fromisoformat` rejects it on
+   * 3.10, which is still supported there — so a string would parse in one repo
+   * and fail in the other. Connectors parse their own source column instead,
+   * where the shapes that column really returns are known and tested (see
+   * `DatabricksUsageRow.occurredAt`). A live call has no source time and should
+   * leave this unset.
+   */
+  timestamp?: number | Date;
+}
+
+/** A caller-supplied event time as the unix seconds Lago's `timestamp` wants. */
+function toEpochSeconds(value: number | Date): number {
+  // A numeric STRING is refused, not coerced: `Number("1786112523")` would sail
+  // through here while the Python port's `isinstance` check rejects it, so the same
+  // input would bill in one repo and report an error in the other.
+  const ms = value instanceof Date ? value.getTime() : typeof value === "number" ? value * 1000 : NaN;
+  // An Invalid Date and a NaN both arrive here as NaN, as does anything that is
+  // neither a Date nor a number — the three cases the Python port raises on.
+  if (!Number.isFinite(ms)) {
+    throw new TypeError(
+      `timestamp=${JSON.stringify(value)} not understood — pass a Date or ` +
+        `epoch seconds (an ISO-8601 string is deliberately not accepted; see emit())`,
+    );
+  }
+  // `trunc`, not `floor`, so a pre-epoch stamp rounds the same way Python's `int()` does.
+  return Math.trunc(ms / 1000);
 }
 
 export class LagoSDK {
@@ -266,6 +299,11 @@ export class LagoSDK {
    */
   emit(usage: CanonicalUsage, opts: WrapOptions = {}): void {
     try {
+      // Resolved ONCE, ahead of every branch: a price-lookup miss falls through to
+      // the token path, so one usage row can reach two of the push paths below. Two
+      // separate `Date.now()` reads there let a call that straddles a billing-period
+      // boundary land half in each period.
+      const at = this.eventTime(opts.timestamp);
       const sub = this.resolveSubscription(opts.subscription);
       if (!sub) {
         this.reportError(new Error(`no subscription resolved for model=${usage.model}`), "emit");
@@ -286,7 +324,7 @@ export class LagoSDK {
             "pricing",
           );
         }
-        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
         return;
       }
       const [markupScaled, ok] = coerceMarkup(opts.markup ?? this.config.markup);
@@ -309,22 +347,41 @@ export class LagoSDK {
         // rather than a fallback. Said once per model instead of once per call. See
         // TOKEN_BILLED_PROVIDERS for the reasoning.
         this.noteTokenBilled(usage);
-        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
         return;
       } else {
         const price = this.pricing.lookup(usage.provider, usage.model, usage.api);
         if (price === null) {
           // Don't silently under-bill: fall back to token events + report.
           this.reportError(new PricingUnavailableError(usage.provider, usage.model, usage.api), "pricing");
-          this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+          this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
           return;
         }
         breakdown = computeCost(usage, price, markupScaled);
       }
-      this.pushCostEvent(usage, breakdown, sub, opts.dimensions, opts.eventId);
+      this.pushCostEvent(usage, breakdown, sub, opts.dimensions, opts.eventId, at);
     } catch (err) {
       this.reportError(err, "emit");
     }
+  }
+
+  /**
+   * The instant to stamp this call's events with — the caller's, or now.
+   *
+   * A value we cannot read is reported and falls back to `now` rather than dropping
+   * the call. Stamping the wrong period is a reconciliation problem the operator can
+   * see and fix; losing the event is revenue that never appears at all. Same
+   * trade-off as a missed price lookup.
+   */
+  private eventTime(timestamp?: number | Date): number {
+    if (timestamp !== undefined && timestamp !== null) {
+      try {
+        return toEpochSeconds(timestamp);
+      } catch (err) {
+        this.reportError(err, "timestamp");
+      }
+    }
+    return Math.floor(Date.now() / 1000);
   }
 
   private emitTokenEvents(
@@ -332,9 +389,12 @@ export class LagoSDK {
     sub: string,
     dimensions?: Record<string, unknown>,
     eventId?: string,
+    at?: number,
   ): void {
     const counts = nonzeroNumeric(usage);
-    const now = Math.floor(Date.now() / 1000);
+    // `emit` already resolved the instant; the fallback covers nothing today and is
+    // kept only so this stays callable on its own without stamping the epoch.
+    const now = at ?? Math.floor(Date.now() / 1000);
     for (const field of NUMERIC_FIELDS) {
       const value = counts[field];
       if (!value) continue;
@@ -376,8 +436,10 @@ export class LagoSDK {
     sub: string,
     dimensions: Record<string, unknown> | undefined,
     eventId: string | undefined,
+    at?: number,
   ): void {
-    const now = Math.floor(Date.now() / 1000);
+    // See the note in `emitTokenEvents` — `emit` is the one authority on this.
+    const now = at ?? Math.floor(Date.now() / 1000);
     // Caller dimensions are spread LAST in each `properties` below, not here — they
     // must win over every SDK-computed key, exactly as they already do in
     // `emitTokenEvents`. Spreading them into `baseProperties` put them *before*
@@ -537,6 +599,10 @@ export class LagoSDK {
           // untagged row billed to the default must not carry an id that blocks it
           // from a different default on a later run.
           eventId: row.eventIdFor(sub),
+          // The row's own time, not the run's — see `occurredAt`. A backfill that
+          // stamps `now` bills last week's usage into this week's period, and
+          // nothing in Lago can tell afterwards.
+          timestamp: row.occurredAt,
         });
         counts.cost += 1;
       } else {
@@ -545,6 +611,7 @@ export class LagoSDK {
           dimensions: dims,
           mode: "tokens",
           eventId: row.eventIdFor(sub),
+          timestamp: row.occurredAt,
         });
         counts.tokens += 1;
       }
