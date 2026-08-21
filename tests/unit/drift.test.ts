@@ -8,6 +8,7 @@ import {
   extractOpenAINative,
 } from "../../src/adapters/index.js";
 import { nonzeroNumeric } from "../../src/canonical.js";
+import { extractDatabricksLog } from "../../src/gateway/adapters/index.js";
 
 describe("Drift detection — Converse", () => {
   it("unknown top-level usage field goes to extras", () => {
@@ -203,5 +204,69 @@ describe("openai native — post-review drift holes", () => {
     });
     expect(u.output).toBe(47 + 1149);
     expect(u.extras.unaccounted_output_tokens).toBe(1149);
+  });
+});
+
+describe("Drift detection — Databricks gateway, inside `token_details`", () => {
+  it("token_details drift reaches extras", () => {
+    // `token_details` is a STRUCT read by name, so an added field is invisible.
+    // Measured against the live table with the struct evolved by two fields: 119 real
+    // tokens reached neither a numeric field nor `extras`. The column is the one place
+    // this table publishes per-token-kind counts, so drift there is money-relevant by
+    // construction — a new cache tier or modality lands nowhere else.
+    const row = {
+      destination_type: "EXTERNAL_FOUNDATION_MODEL",
+      api_type: "anthropic/v1/messages",
+      destination_model: "claude-sonnet-4-5",
+      input_tokens: 1825,
+      output_tokens: 4,
+      token_details: {
+        cache_read_input_tokens: 1812,
+        cache_read_5m_input_tokens: 77,
+        output_audio_tokens: 42,
+      },
+    };
+    const u = extractDatabricksLog(row);
+    expect(u.extras["token_details.cache_read_5m_input_tokens"]).toBe(77);
+    expect(u.extras["token_details.output_audio_tokens"]).toBe(42);
+    // Never MISCOUNTED as a metric we do map — that would bill an unclassified count
+    // at a rate nobody chose for it.
+    expect([u.cache_read, u.cache_write, u.reasoning]).toEqual([1812, 0, 0]);
+  });
+
+  it("mapped token_details do not pollute extras", () => {
+    // The mirror: a nested key we DO map must not also appear in extras, or every
+    // event carries a duplicate of a count already billed.
+    const u = extractDatabricksLog({
+      destination_type: "EXTERNAL_FOUNDATION_MODEL",
+      api_type: "openai/v1/chat/completions",
+      destination_model: "gpt-4o",
+      input_tokens: 100,
+      output_tokens: 50,
+      token_details: {
+        cache_read_input_tokens: 40,
+        cache_creation_input_tokens: 0,
+        output_reasoning_tokens: 20,
+      },
+    });
+    expect(u.cache_read).toBe(40);
+    expect(u.reasoning).toBe(20);
+    expect(Object.keys(u.extras).filter((k) => k.startsWith("token_details."))).toEqual([]);
+  });
+
+  it("token_details drift survives the JSON-string path", () => {
+    // Schema evolution arrives over the REST path as a longer JSON STRING, which is how
+    // `DatabricksSource.query` reads every STRUCT column — measured on the live
+    // warehouse, `token_details` is a string there, never an object. A sweep that only
+    // worked on driver-native objects would miss the exact path the backfill uses.
+    const u = extractDatabricksLog({
+      destination_type: "PAY_PER_TOKEN_FOUNDATION_MODEL",
+      destination_name: "system.ai.gpt-oss-20b",
+      input_tokens: "300",
+      output_tokens: "12",
+      token_details: '{"output_reasoning_tokens":"9","output_audio_tokens":"42"}',
+    });
+    expect(u.reasoning).toBe(9);
+    expect(u.extras["token_details.output_audio_tokens"]).toBe("42");
   });
 });

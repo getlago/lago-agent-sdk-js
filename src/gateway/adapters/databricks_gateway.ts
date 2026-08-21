@@ -18,6 +18,7 @@
  *   token_details.cache_read_input_tokens         -> cache_read
  *   token_details.cache_creation_input_tokens     -> cache_write
  *   token_details.output_reasoning_tokens         -> reasoning
+ *   token_details.<anything else>                 -> extras["token_details.<key>"]
  *   destination_type + destination_name/_model    -> model, provider  (see below)
  *   api                                            -> hardcoded "databricks_gateway"
  *   extras                                         -> routing/identity columns
@@ -96,6 +97,27 @@ const HOSTED_NAME_PREFIX = "system.ai.";
 // columns agree that it is an artefact. Disagreement keeps the raw name: a model
 // emitted under a slightly ugly id is recoverable, a silently renamed one is not.
 const HOSTED_ENDPOINT_PREFIX = "databricks-";
+
+// Keys inside the `token_details` STRUCT that this adapter MAPS onto a CanonicalUsage
+// field. Anything else nested there is drift and is surfaced in `extras` under a dotted
+// key rather than dropped.
+//
+// The column is read by name, so nothing ever inspects a key the mapping below does not
+// name — measured against the real table with the struct evolved by two fields
+// (`cache_read_5m_input_tokens: 77`, `output_audio_tokens: 42`): they reached neither a
+// numeric field nor `extras`, so 119 tokens vanished with no error and no `onError`.
+// Latent today — the live struct has exactly the three fields listed here — but this
+// table's schema does evolve (`service_type`, `mcp_metadata`, `invocation_metadata` are
+// newer additions, and old rows still read `service_type = NULL`).
+//
+// Dotted key, not the object swept whole under `extras["token_details"]`, for the same
+// reason as openai_native's `MAPPED_DETAIL_FIELDS`: three of the struct's keys ARE
+// mapped, so emitting the container whole would re-publish counts already billed.
+const MAPPED_DETAIL_FIELDS = new Set([
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+  "output_reasoning_tokens",
+]);
 
 /**
  * Coerce a STRUCT/MAP column to an object, accepting either shape it arrives in.
@@ -183,6 +205,37 @@ export function extractDatabricksLog(row: Record<string, unknown>): CanonicalUsa
   const details = safeObj(row.token_details);
   const [model, provider] = modelAndProvider(row);
 
+  const extras: Record<string, unknown> = {
+    // `invocation_id` is per individual inference call while `request_id` is per
+    // request — one request with a fallback produces several invocations, the same
+    // distinction Cloudflare's `step` marks. Keep both; `invocation_id` is the
+    // row's natural idempotency key.
+    request_id: row.request_id,
+    invocation_id: row.invocation_id,
+    // A THIRD naming variant: `endpoint_name` is the requested form
+    // (`databricks-llama-4-maverick`, `system.ai.gemma-3-12b`) where
+    // `destination_name` is the resolved entity (`system.ai.gemma-3-12b-it`).
+    // Kept for reconciliation; never price off it.
+    endpoint_name: row.endpoint_name,
+    endpoint_id: row.endpoint_id,
+    destination_type: row.destination_type,
+    destination_name: row.destination_name,
+    api_type: row.api_type,
+    status_code: row.status_code,
+  };
+
+  // Drift sweep one level down, into `token_details` (see MAPPED_DETAIL_FIELDS). A new
+  // key there is a token count nobody has classified yet: it must not be miscounted as
+  // one of the metrics above, and it must not disappear either.
+  //
+  // Scope, measured over the live 2026-08-06 window: it reaches every hosted event
+  // (54 of 54) and no BYOK event (0 of 66), because `asBucket` strips per-request extras
+  // from an hourly spend aggregate on purpose. Both tables share this struct, so a new
+  // field still surfaces wherever the workspace has hosted traffic.
+  for (const [k, v] of Object.entries(details)) {
+    if (!MAPPED_DETAIL_FIELDS.has(k)) extras[`token_details.${k}`] = v;
+  }
+
   return makeCanonicalUsage({
     input: safeInt(row.input_tokens),
     output: safeInt(row.output_tokens),
@@ -192,24 +245,7 @@ export function extractDatabricksLog(row: Record<string, unknown>): CanonicalUsa
     model,
     provider,
     api: "databricks_gateway",
-    extras: {
-      // `invocation_id` is per individual inference call while `request_id` is per
-      // request — one request with a fallback produces several invocations, the same
-      // distinction Cloudflare's `step` marks. Keep both; `invocation_id` is the
-      // row's natural idempotency key.
-      request_id: row.request_id,
-      invocation_id: row.invocation_id,
-      // A THIRD naming variant: `endpoint_name` is the requested form
-      // (`databricks-llama-4-maverick`, `system.ai.gemma-3-12b`) where
-      // `destination_name` is the resolved entity (`system.ai.gemma-3-12b-it`).
-      // Kept for reconciliation; never price off it.
-      endpoint_name: row.endpoint_name,
-      endpoint_id: row.endpoint_id,
-      destination_type: row.destination_type,
-      destination_name: row.destination_name,
-      api_type: row.api_type,
-      status_code: row.status_code,
-    },
+    extras,
   });
 }
 
