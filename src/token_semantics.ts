@@ -167,6 +167,13 @@ export const KNOWN_PROVIDERS = new Set([
   "mistral",
   "databricks",
   "snowflake",
+  // Ramp Router, from the wrapper's host hint. Deliberately in NO subset set: Router
+  // normalizes the response SCHEMA to OpenAI's but no document says whether it also
+  // normalizes the NUMBERS, so the overlap convention is unmeasured and the additive
+  // default is the conservative answer — it can leave a subset uncounted in a total but
+  // never inflates output with tokens that were never generated. Re-measure the day a
+  // live Router account exists; the capture script is already in the tree.
+  "ramp_router",
   // adapters/bedrock_*, from providerFromModel
   "amazon",
   "meta",

@@ -21,7 +21,7 @@
  * Per-call `lago: { subscription, dimensions }` is forwarded as a COPY with the key
  * removed: the provider's validator rejects it, and the caller may reuse the object.
  */
-import { extractOpenAINative } from "../adapters/openai_native.js";
+import { RAMP_ROUTER_PROVIDER, extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
 // The one import a wrapper takes from gateway code, and it is load-bearing: the REST-view
 // dedup only works if this wrapper and `gateway/snowflake.ts` compute the IDENTICAL
@@ -225,14 +225,28 @@ export const PROVIDER_BY_BASE_URL_PATH: ReadonlyArray<readonly [string, string]>
  * stripVersion strip it into a match and silently under-bill 2.5-5x. Stamping the real
  * provider turns that accident into a guaranteed honest miss.
  */
+// Ramp Router cannot be a row in the path table above: it serves every provider it
+// fronts through one dedicated host with no distinguishing path, so the HOST is the
+// signal — and it must be the PARSED host, never a substring test. A substring row
+// ("api.router.com") also matches `https://evil.example.com/api.router.com/v1`, which
+// would stamp an unrelated endpoint's traffic as Router-served. The `.router.com`
+// suffix arm covers a regional or staging host without widening to arbitrary domains —
+// `evilrouter.com` does not end in `.router.com`. The path table keeps first say: its
+// rows are more specific, and no Snowflake or Databricks URL lives under router.com.
+const RAMP_ROUTER_HOST = "api.router.com";
+const RAMP_ROUTER_DOMAIN = ".router.com";
+
 export function providerHintFor(client: unknown): string {
   try {
     const url = String((client as { baseURL?: unknown })?.baseURL ?? "");
     for (const [path, provider] of PROVIDER_BY_BASE_URL_PATH) {
       if (url.includes(path)) return provider;
     }
+    const host = new URL(url).host.toLowerCase();
+    if (host === RAMP_ROUTER_HOST || host.endsWith(RAMP_ROUTER_DOMAIN)) return RAMP_ROUTER_PROVIDER;
     return "";
   } catch {
+    // A relative or malformed baseURL is not a gateway. Never throw out of wrap().
     return "";
   }
 }

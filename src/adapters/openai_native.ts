@@ -26,6 +26,106 @@ import { resolveModel } from "./_common.js";
 const WORKERS_AI_MODEL_PREFIX = "@cf/";
 const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
 
+/**
+ * Provider stamped on any call that reached a model through Ramp Router.
+ *
+ * Router is an OpenAI-Responses-compatible gateway in front of OpenAI, Anthropic, Google
+ * Vertex, Fireworks and xAI. It is treated as a provider in its own right here, rather
+ * than resolved to the vendor that actually served the call, because Router's model ids
+ * are ACCOUNT-SPECIFIC and opaque — its docs are explicit: "Valid model IDs are
+ * account-specific. They come from `GET /v1/models`. Never invent one or reuse a
+ * provider's public model name." So unless the caller named an explicit
+ * `provider:provider-model` candidate, nothing in the response says who served it, and
+ * the model-string rule `inferProvider` uses cannot see it.
+ *
+ * "ramp_router" is in `TOKEN_BILLED_PROVIDERS` and deliberately in neither `VENDOR_MAP`
+ * nor the token-semantics subset sets. Two distinct things would otherwise go wrong at
+ * once:
+ *
+ *   - A price lookup under a guessed vendor can be flatly wrong. Router bills at list
+ *     price on its shared key but $0 for a BYOK-served request, and a non-default service
+ *     tier bills at a rate its own catalog says "may differ" from the base one.
+ *   - The cache and reasoning overlap semantics are UNMEASURED. `openai` counts
+ *     cache_read inside input and reasoning inside output; `anthropic` counts both
+ *     additively. Router normalizes the SCHEMA to OpenAI's, and no document says whether
+ *     it also normalizes the NUMBERS. Stamping the served vendor before that is measured
+ *     de-overlaps a call that may not overlap, or fails to de-overlap one that does.
+ *     Absence from the subset sets means the total_tokens guard treats the counts as
+ *     additive — the conservative direction: it can leave a subset uncounted in the
+ *     total but never inflates output with tokens that were never generated.
+ *
+ * Token mode is unaffected and exact either way: it emits the counts Router reported.
+ * Price mode routes to those same token events via `TOKEN_BILLED_PROVIDERS`, with no
+ * per-call price-miss report — a structural, permanent miss must not cry wolf on the
+ * error hook (the same decision Databricks and Snowflake got). Promoting
+ * `extras.router_provider` into `provider` is safe only once the overlap question is
+ * measured against a live account.
+ */
+export const RAMP_ROUTER_PROVIDER = "ramp_router";
+
+/**
+ * Router's documented service tiers, appearing as the third segment of a candidate id
+ * (`openai:gpt-5.4-mini:flex`). OpenAI sells `auto`/`default`/`flex`/`priority`,
+ * Fireworks `default`/`priority`.
+ *
+ * Matched against this set rather than read as "whatever follows the last colon": a model
+ * segment may contain a colon of its own, and mistaking one for a tier would silently
+ * rename the model and split it into a second row in Lago. An unrecognized trailing
+ * segment therefore stays part of the model, which is recoverable; a renamed model is
+ * not.
+ */
+const ROUTER_SERVICE_TIERS = new Set(["auto", "default", "flex", "priority"]);
+
+/** A provider segment is a short lowercase token. Anything else is part of the model. */
+const ROUTER_PROVIDER_SEGMENT = /^[a-z0-9][a-z0-9_-]{1,31}$/;
+
+interface RouterModelParts {
+  /** Router's own provider name, or "" when the id is an opaque account-specific one. */
+  provider: string;
+  /** The model, with the provider prefix and any service tier removed. */
+  model: string;
+  /** The pinned service tier, or "" when none was named. */
+  tier: string;
+}
+
+/**
+ * Split a Router model id into its provider, model and service-tier parts.
+ *
+ * Router names a model two ways, and only one of them is parseable. A plain `model` is an
+ * account-specific id that reveals nothing; a `models` candidate is
+ * `provider:provider-model[:service-tier]`. Both arrive in the same response field, so
+ * this decides which one it is looking at rather than assuming.
+ *
+ * Split on the FIRST colon, never on all of them: Fireworks candidates carry a path as
+ * their model segment (`fireworks:accounts/fireworks/models/kimi-k2p7-code`), so a naive
+ * split loses everything after the second separator.
+ *
+ * The model comes back BARE, provider prefix and tier stripped, so a model served through
+ * Router rolls up in Lago against the same name a direct call to it reports. Leaving the
+ * prefix on splits one model across two rows for no billing benefit.
+ */
+function parseRouterModel(id: string): RouterModelParts {
+  const firstColon = id.indexOf(":");
+  if (firstColon <= 0) return { provider: "", model: id, tier: "" };
+
+  const head = id.slice(0, firstColon).toLowerCase();
+  let rest = id.slice(firstColon + 1);
+  // A head that is not a plausible provider token — a path, or something long — means
+  // this is an opaque id that merely happens to contain a colon, not a candidate.
+  if (!rest || !ROUTER_PROVIDER_SEGMENT.test(head)) return { provider: "", model: id, tier: "" };
+
+  let tier = "";
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon > 0) {
+    const trailing = rest.slice(lastColon + 1).toLowerCase();
+    if (ROUTER_SERVICE_TIERS.has(trailing)) {
+      tier = trailing;
+      rest = rest.slice(0, lastColon);
+    }
+  }
+  return { provider: head, model: rest, tier };
+}
+
 const KNOWN_USAGE_FIELDS = new Set<string>([
   // chat completions
   "prompt_tokens",
@@ -292,6 +392,31 @@ export function extractOpenAINative(
     }
   }
 
+  // `resolveModel` prefers the response's own model over the requested one, which is what
+  // makes a Router fallback bill correctly with no extra work: a `models` request sends no
+  // `model` at all, and Switchyard routing can serve a different model than the one asked
+  // for, so the response is the only place the SERVED model appears.
+  let model = resolvedModel;
+  let api = extracted.api;
+  if (providerHint === RAMP_ROUTER_PROVIDER) {
+    const parts = parseRouterModel(resolvedModel);
+    if (parts.provider) {
+      model = parts.model;
+      // Recorded, not promoted to `provider` — see RAMP_ROUTER_PROVIDER for why the
+      // served vendor cannot drive pricing until Router's overlap semantics are measured.
+      extras.router_provider = parts.provider;
+    }
+    // The tier is billing-relevant on its own: Router's catalog says tiers "may use
+    // different rates" than the base ones it publishes, so a pinned non-default tier is
+    // the difference between a correct price and an over-bill at the standard rate.
+    if (parts.tier) extras.service_tier = parts.tier;
+    // Which of Router's two OpenAI-shaped surfaces answered. Router documents only
+    // `/v1/responses` (`/v1/chat/completions` 404s), so a `chat_completions` value here is
+    // drift worth seeing rather than a case to handle.
+    extras.router_surface = api;
+    api = RAMP_ROUTER_PROVIDER;
+  }
+
   return makeCanonicalUsage({
     input: extracted.inputTokens,
     output: extracted.outputTokens,
@@ -300,9 +425,9 @@ export function extractOpenAINative(
     audio_input: extracted.audioInput,
     audio_output: extracted.audioOutput,
     tool_calls: extracted.toolCalls,
-    model: resolvedModel,
+    model,
     provider,
-    api: extracted.api,
+    api,
     extras,
   });
 }
