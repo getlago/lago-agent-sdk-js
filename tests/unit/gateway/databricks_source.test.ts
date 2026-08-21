@@ -8,7 +8,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LagoSDK } from "../../../src/sdk.js";
-import { DatabricksSource, DatabricksUsageRow, intervalSql } from "../../../src/gateway/databricks.js";
+import {
+  DatabricksSource,
+  DatabricksUsageRow,
+  floorHour,
+  timestampSql,
+  windowBounds,
+} from "../../../src/gateway/databricks.js";
 import { nonzeroNumeric, makeCanonicalUsage } from "../../../src/canonical.js";
 
 // --------------------------------------------------------------------------
@@ -81,31 +87,109 @@ function source(
 // --------------------------------------------------------------------------
 // The window
 // --------------------------------------------------------------------------
+const NOW = new Date("2026-08-21T13:34:12.000Z");
+
 describe("Databricks reader — the window", () => {
-  it("renders interval strings to SQL", () => {
-    expect(intervalSql("1 day")).toBe("current_timestamp() - INTERVAL 1 DAY");
-    expect(intervalSql("36 hours")).toBe("current_timestamp() - INTERVAL 36 HOUR");
-    expect(intervalSql("30 minutes")).toBe("current_timestamp() - INTERVAL 30 MINUTE");
+  it("resolves interval strings to instants, not SQL", () => {
+    // Resolved in JS, so both statements can share one bound. A `current_timestamp()`
+    // expression is re-evaluated per statement and the two reads then cover different
+    // windows — measured 5.1s apart, and a hosted row in the gap is billed by neither.
+    expect(windowBounds("1 day", NOW)).toEqual([
+      new Date("2026-08-20T13:00:00.000Z"),
+      new Date("2026-08-21T13:00:00.000Z"),
+    ]);
+    expect(windowBounds("36 hours", NOW)[0]).toEqual(new Date("2026-08-20T01:00:00.000Z"));
+    expect(windowBounds("2 weeks", NOW)[0]).toEqual(new Date("2026-08-07T13:00:00.000Z"));
   });
 
   it("renders a Date window as a literal", () => {
-    expect(intervalSql(new Date(Date.UTC(2026, 7, 7, 14, 0, 0)))).toBe("TIMESTAMP '2026-08-07 14:00:00'");
+    expect(timestampSql(new Date(Date.UTC(2026, 7, 7, 14, 0, 0)))).toBe(
+      "TIMESTAMP '2026-08-07 14:00:00+00:00'",
+    );
   });
 
-  // The window reaches SQL by interpolation, so validation is the only thing standing
-  // between a caller's string and the warehouse.
+  it("floors the window to the hour at both ends", () => {
+    // `external_model_spend` is an hourly aggregate whose `usage_start_time` is always the
+    // hour start (65 of 65 live rows), so a mid-hour bound drops the hour CONTAINING it
+    // while the usage table still yields that hour's rows. Live: `since` of 13:30 read 11
+    // of 65 spend rows, dropping $0.1256 of $0.1723, and still read 35 BYOK usage rows
+    // from inside the dropped hour.
+    const [lower, upper] = windowBounds(new Date("2026-08-07T13:30:45.000Z"), NOW);
+    expect(lower).toEqual(new Date("2026-08-07T13:00:00.000Z"));
+    expect(upper).toEqual(new Date("2026-08-21T13:00:00.000Z"));
+  });
+
+  it("excludes the still-aggregating hour", () => {
+    // A spend row cannot be complete before its hour closes — the 08:00–09:00 row appeared
+    // ~7 min AFTER 09:00. Billing the open hour bills a fraction of it under that hour's
+    // `record_id`, and Lago then rejects the corrected re-run as a duplicate
+    // `transaction_id`, so the remainder is never billed.
+    expect(windowBounds("1 day", NOW)[1]).toEqual(floorHour(NOW));
+    expect(floorHour(NOW).getTime()).toBeLessThan(NOW.getTime());
+  });
+
+  it("does not mutate the caller's Date", () => {
+    // JS `Date` is mutable and `floorHour` moves the instant, so flooring in place would
+    // silently rewrite a window the caller may reuse — or log. Python has no twin for this
+    // test: `datetime` is immutable, so the hazard exists in one port only.
+    const since = new Date("2026-08-07T13:30:45.000Z");
+    windowBounds(since, NOW);
+    expect(since.toISOString()).toBe("2026-08-07T13:30:45.000Z");
+  });
+
+  it("names the zone in every timestamp literal", () => {
+    // A bare literal is parsed in the warehouse's `spark.sql.session.timeZone`, so on a
+    // non-UTC workspace the same literal names a different instant and the window slides
+    // by the offset. Verified live that the suffixed form is accepted.
+    expect(timestampSql(NOW).endsWith("+00:00'")).toBe(true);
+  });
+
+  // The string no longer reaches SQL — the bound is resolved to an instant first — so this
+  // is no longer an injection guard; it is what stops a window being quietly read as
+  // something other than what the caller wrote.
   it.each(["1 day; DROP TABLE system.ai_gateway.usage", "1 day OR 1=1", "yesterday", "-1 day", ""])(
     "refuses %j rather than interpolating it",
     (bad) => {
-      expect(() => intervalSql(bad)).toThrow(/not understood/);
+      expect(() => windowBounds(bad)).toThrow(/not understood/);
     },
   );
 
-  it("scopes both queries to the window", async () => {
+  it("scopes both queries to one shared window", async () => {
+    // The point of resolving the bounds in JS: both statements must carry the SAME two
+    // literals. Two `current_timestamp()` expressions drift, and the read that runs second
+    // covers the narrower window — a hosted row in the gap is lost, since hosted is billed
+    // from `usage` alone.
     const src = source([], []);
+    const before = floorHour(new Date());
     await src.readUsage("3 days");
+    const after = floorHour(new Date());
     expect(src.queries).toHaveLength(2);
-    for (const sql of src.queries) expect(sql).toContain("current_timestamp() - INTERVAL 3 DAY");
+    const [spend, usage] = src.queries;
+    for (const sql of src.queries) expect(sql).not.toContain("current_timestamp()");
+    const DAY = 86_400_000;
+    for (const [sql, column] of [
+      [spend, "usage_start_time"],
+      [usage, "event_time"],
+    ] as const) {
+      const lowers = [before, after].map((t) => timestampSql(new Date(t.getTime() - 3 * DAY)));
+      expect(lowers.some((lit) => sql.includes(`${column} >= ${lit}`))).toBe(true);
+      expect([before, after].some((t) => sql.includes(`${column} < ${timestampSql(t)}`))).toBe(true);
+    }
+  });
+
+  it("reads nothing and says so when the window is entirely inside the open hour", async () => {
+    // Excluding the open hour means a sub-hour window can resolve to nothing. Zero rows
+    // then says nothing about whether there was traffic, so it must not pass silently —
+    // and it must not spend warehouse time either.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const src = source([], []);
+      expect(await src.readUsage("30 minutes")).toEqual([]);
+      expect(src.queries).toEqual([]);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("widen the"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -626,8 +710,12 @@ describe("Databricks reader — review fixes", () => {
 
   it("converts a Date window to UTC", () => {
     // Kept in step with Python, which had to be fixed to convert rather than format local
-    // wall time — otherwise the two repos read different windows from the same input.
-    expect(intervalSql(new Date("2026-08-11T12:00:00.000Z"))).toBe("TIMESTAMP '2026-08-11 12:00:00'");
+    // wall time — otherwise the two repos read different windows from the same input. A
+    // `Date` is always an instant, so there is no naive case here; Python's `_as_utc` is
+    // what covers the input shape this language cannot express.
+    expect(timestampSql(windowBounds(new Date("2026-08-11T12:00:00.000Z"), NOW)[0])).toBe(
+      "TIMESTAMP '2026-08-11 12:00:00+00:00'",
+    );
   });
 
   it("still buckets and reconciles when timestamps arrive as Date", async () => {

@@ -14,5 +14,5 @@ export * from "./adapters/index.js";
 // exposes no logs API, only Delta tables over the SQL Statement Execution API, and
 // hand-rolling that read is ~100 lines with several money-losing traps in it. The
 // adapters stay pure; this is their sibling, not their replacement.
-export { DatabricksSource, DatabricksUsageRow, intervalSql } from "./databricks.js";
+export { DatabricksSource, DatabricksUsageRow, floorHour, timestampSql, windowBounds } from "./databricks.js";
 export type { DatabricksSourceOptions } from "./databricks.js";

@@ -39,8 +39,11 @@ import {
 
 const STATEMENTS_PATH = "/api/2.0/sql/statements";
 
-// `since` as an interval string is interpolated into SQL, so it is validated strictly
-// rather than escaped — only a bare count plus a unit is ever accepted.
+// An interval string no longer reaches SQL at all — `windowBounds` resolves it to an
+// instant and `timestampSql` renders the literal — but it stays validated strictly rather
+// than loosely parsed. Only a bare count plus a unit is accepted: a window quietly read as
+// something other than what the caller wrote under-reads, and under-reading is the one
+// direction that loses money.
 const INTERVAL_RE = /^\s*(\d{1,5})\s+(second|minute|hour|day|week)s?\s*$/i;
 
 /**
@@ -160,19 +163,84 @@ export class DatabricksUsageRow {
   }
 }
 
-/** Render a window as a SQL predicate value. Rejects anything unrecognized. */
-export function intervalSql(since: string | Date): string {
+/**
+ * The start of the hour containing `moment`.
+ *
+ * Distinct from `truncateHour`, which trims a timestamp STRING to build a join key.
+ * This one moves an instant, and it decides what gets read at all.
+ */
+export function floorHour(moment: Date): Date {
+  const floored = new Date(moment.getTime());
+  floored.setUTCMinutes(0, 0, 0);
+  return floored;
+}
+
+/**
+ * Render an instant as a zone-explicit SQL TIMESTAMP literal.
+ *
+ * The `+00:00` is not decoration. A bare `TIMESTAMP '2026-08-07 13:00:00'` is parsed in
+ * the warehouse's own `spark.sql.session.timeZone`, so on a workspace set to anything but
+ * UTC the identical literal names a different instant and the whole window slides by that
+ * offset. Verified live: the suffixed form is accepted and resolves to the same epoch as
+ * the bare form under this warehouse's `Etc/UTC`.
+ */
+export function timestampSql(moment: Date): string {
+  return `TIMESTAMP '${moment.toISOString().slice(0, 19).replace("T", " ")}+00:00'`;
+}
+
+const UNIT_MS: Record<string, number> = {
+  second: 1000,
+  minute: 60_000,
+  hour: 3_600_000,
+  day: 86_400_000,
+  week: 604_800_000,
+};
+
+/**
+ * Resolve the read window to ONE pair of instants, both floored to the hour.
+ *
+ * Rejects anything unrecognized. Three money bugs live in leaving any part of this to
+ * SQL, all three measured on real gateway tables:
+ *
+ *   * **Two statements, two windows.** `current_timestamp() - INTERVAL 1 DAY` is a SQL
+ *     *string*, so it is re-evaluated per statement — 5.1s of drift measured between the
+ *     spend read and the usage read. Spend runs first, so the usage window is the
+ *     narrower one, and a hosted row in the gap is read by neither statement. Hosted is
+ *     billed from `usage` alone, so that row is simply lost.
+ *   * **The boundary hour.** `external_model_spend` is an hourly aggregate whose
+ *     `usage_start_time` is always the hour START (65 of 65 rows). Compared against a
+ *     mid-hour bound, the hour CONTAINING that bound fails the predicate while its usage
+ *     rows pass: live, a `since` of 13:30 read 11 of 65 spend rows and dropped $0.1256 of
+ *     $0.1723, while still reading 35 BYOK usage rows from inside the hour it dropped.
+ *     Flooring is what makes the two tables agree on one window.
+ *   * **The open hour.** A spend row cannot be complete before its hour closes (the
+ *     08:00–09:00 row appeared ~7 min AFTER 09:00). Billing it early bills a fraction of
+ *     the hour under that hour's `record_id`, and the corrected re-run is then rejected by
+ *     Lago as a duplicate `transaction_id` — so the remainder is never billed at all.
+ *     Hence the upper bound, and hence both tables get it: a window whose halves cover
+ *     different hours is the first bug again.
+ *
+ * Flooring the lower bound can read rows slightly older than the caller asked for. That
+ * is deliberate: every `transaction_id` is derived from the source row, so a row already
+ * billed is rejected as a duplicate and one not billed yet SHOULD be. Under-reading is
+ * the only direction that loses money.
+ */
+export function windowBounds(since: string | Date, now?: Date): [Date, Date] {
+  const moment = now ?? new Date();
+  let lower: Date;
   if (since instanceof Date) {
-    return `TIMESTAMP '${since.toISOString().slice(0, 19).replace("T", " ")}'`;
+    lower = since;
+  } else {
+    const m = INTERVAL_RE.exec(String(since));
+    if (!m) {
+      throw new Error(
+        `since=${JSON.stringify(since)} not understood — pass a Date, or a string like ` +
+          `'7 days' / '24 hours' / '30 minutes'`,
+      );
+    }
+    lower = new Date(moment.getTime() - Number(m[1]) * UNIT_MS[m[2].toLowerCase()]);
   }
-  const m = INTERVAL_RE.exec(String(since));
-  if (!m) {
-    throw new Error(
-      `since=${JSON.stringify(since)} not understood — pass a Date, or a string like ` +
-        `'7 days' / '24 hours' / '30 minutes'`,
-    );
-  }
-  return `current_timestamp() - INTERVAL ${m[1]} ${m[2].toUpperCase()}`;
+  return [floorHour(lower), floorHour(moment)];
 }
 
 export interface DatabricksSourceOptions {
@@ -355,13 +423,36 @@ export class DatabricksSource {
    *
    * Rows whose usage is entirely zero (failed calls are recorded with NULL token
    * counts) are skipped, so nothing emits an empty event.
+   *
+   * Reads **whole closed hours only**: the window is floored to the hour at both ends and
+   * the current, still-aggregating hour is excluded, because a spend row for it cannot be
+   * complete yet. `windowBounds` documents why each of those three properties is
+   * load-bearing. The practical consequence for a caller is that the newest hour of
+   * traffic arrives on the NEXT run, so pass a window comfortably wider than your run
+   * interval — this reader keeps no cursor.
    */
   async readUsage(
     since: string | Date = "1 day",
     opts: { eventIdPrefix?: string } = {},
   ): Promise<DatabricksUsageRow[]> {
     const prefix = opts.eventIdPrefix ?? "dbx";
-    const window = intervalSql(since);
+    const [lower, upper] = windowBounds(since);
+    if (lower >= upper) {
+      // Not an error, but it must not read as success either: the caller asked for a
+      // window that lies entirely inside the hour this reader excludes, so zero rows
+      // here says nothing about whether there was traffic.
+      console.warn(
+        `[lago] since=${JSON.stringify(since)} resolves to [${lower.toISOString()}, ` +
+          `${upper.toISOString()}), which is empty — the window falls inside the current, ` +
+          `still-aggregating hour that this reader excludes. Nothing was read; widen the ` +
+          `window past the hour boundary.`,
+      );
+      return [];
+    }
+    // One pair of literals, both statements — see `windowBounds`. Resolving the bounds
+    // here rather than in SQL is what makes the two reads the same window.
+    const window = timestampSql(lower);
+    const ceiling = timestampSql(upper);
 
     const spend = await this.query(`
             SELECT record_id,
@@ -371,12 +462,12 @@ export class DatabricksSource {
                    to_json(custom_tags.request_tags)    AS request_tags,
                    usage_quantity
             FROM system.ai_gateway.external_model_spend
-            WHERE usage_start_time >= ${window}
+            WHERE usage_start_time >= ${window} AND usage_start_time < ${ceiling}
         `);
 
     const usage = await this.query(`
             SELECT * FROM system.ai_gateway.usage
-            WHERE event_time >= ${window}
+            WHERE event_time >= ${window} AND event_time < ${ceiling}
             ORDER BY event_time
         `);
 
