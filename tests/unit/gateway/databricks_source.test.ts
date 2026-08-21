@@ -70,6 +70,21 @@ const FAILED: Record<string, unknown> = {
   status_code: "403",
 };
 
+// The BYOK half of the same thing. Shaped from the live table: a rejected external call
+// is logged with NULL tokens and — because the gateway never got far enough to resolve
+// one — an EMPTY `destination_model`.
+const FAILED_BYOK: Record<string, unknown> = {
+  invocation_id: "inv-failed-byok",
+  event_time: "2026-08-07 14:31:00",
+  destination_type: "EXTERNAL_FOUNDATION_MODEL",
+  destination_name: "workspace.default.anthropickey",
+  destination_model: null,
+  api_type: "anthropic/v1/messages",
+  input_tokens: null,
+  output_tokens: null,
+  status_code: "403",
+};
+
 /** A source whose `query` answers from canned rows, keyed on which table. */
 function source(
   spend: Record<string, unknown>[],
@@ -177,14 +192,28 @@ describe("Databricks reader — the window", () => {
     }
   });
 
+  it("collapses a sub-hour interval to an empty window", () => {
+    // Both bounds floor to the same hour, so there is nothing left to read. Asserted
+    // against a pinned clock: driving this through the real one makes the test pass or
+    // fail on the current MINUTE — "30 minutes" spans two hours at 13:34 and one at
+    // 13:04, which is a coin flip in CI, not a property of the code.
+    const [lower, upper] = windowBounds("30 minutes", NOW);
+    expect(lower).toEqual(new Date("2026-08-21T13:00:00.000Z"));
+    expect(upper).toEqual(lower);
+  });
+
   it("reads nothing and says so when the window is entirely inside the open hour", async () => {
-    // Excluding the open hour means a sub-hour window can resolve to nothing. Zero rows
-    // then says nothing about whether there was traffic, so it must not pass silently —
-    // and it must not spend warehouse time either.
+    // Excluding the open hour means such a window can resolve to nothing. Zero rows then
+    // says nothing about whether there was traffic, so it must not pass silently — and it
+    // must not spend warehouse time either.
+    //
+    // `since` is half an hour AHEAD of the real clock so the guard fires whatever minute
+    // this runs at; the collapse itself is pinned in the test above.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const src = source([], []);
-      expect(await src.readUsage("30 minutes")).toEqual([]);
+      const insideTheOpenHour = new Date(Date.now() + 30 * 60_000);
+      expect(await src.readUsage(insideTheOpenHour)).toEqual([]);
       expect(src.queries).toEqual([]);
       expect(warn.mock.calls.some((c) => String(c[0]).includes("widen the"))).toBe(true);
     } finally {
@@ -273,6 +302,37 @@ describe("Databricks reader — BYOK/hosted split", () => {
     // 403/404s are recorded with NULL token counts. Emitting them would bill an empty
     // event for a call that never reached a provider.
     expect(await source([], [FAILED]).readUsage("1 day")).toEqual([]);
+  });
+
+  it("does not let failed BYOK calls enter the join index", async () => {
+    // A rejected external call bought nothing, so Databricks meters no dollars for it and
+    // its key can never match a spend row. Indexing it manufactures a bucket the unbilled
+    // warning then tells the operator to re-run the window for — advice that can never
+    // bill it, because there is nothing to bill.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await source([], [FAILED_BYOK]).readUsage("1 day")).toEqual([]);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("NOT billed"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("counts only buckets with real tokens in the unbilled warning", async () => {
+    // The warning exists to name genuine spend-table lag. Live over 2026-08-06 it reported
+    // 29 buckets of which 28 were failed calls, and the single example row it showed the
+    // operator was one of them — so the one real lagging bucket was the thing least likely
+    // to be read.
+    const lagging = { ...BYOK_USAGE, invocation_id: "inv-lagging", destination_model: "claude-opus-4-1" };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await source([], [FAILED_BYOK, lagging]).readUsage("1 day");
+      const msg = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(msg).toContain("1 BYOK token bucket(s)");
+      expect(msg).toContain("model=claude-opus-4-1");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps the databricks provider on hosted rows", async () => {

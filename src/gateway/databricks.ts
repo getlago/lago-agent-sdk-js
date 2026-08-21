@@ -480,6 +480,13 @@ export class DatabricksSource {
     const tokens = new Map<string, CanonicalUsage>();
     for (const [row, u] of extracted) {
       if (u.provider === "databricks") continue;
+      // A failed call carries NULL tokens and bought nothing, so Databricks meters no
+      // dollars for it — its key can never match a spend row. Indexed, it becomes a
+      // bucket the warning below tells the operator to re-run the window for, which can
+      // never bill it: measured live over 2026-08-06, 28 of the 29 reported buckets were
+      // these phantoms (all 83 zero-usage rows were 4xx/5xx), including the one example
+      // row the warning names. The hosted loop applies the same guard for the same reason.
+      if (Object.keys(nonzeroNumeric(u)).length === 0) continue;
       const key = JSON.stringify([
         bucketOf(row.event_time),
         u.provider,
