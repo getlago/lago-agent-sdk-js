@@ -200,3 +200,26 @@ describe("Mistral wrapper", () => {
     expect(map.llm_output_tokens).toBe(4);
   });
 });
+
+describe("Mistral wrapper — caller params are not consumed", () => {
+  it("a reused params object still bills per-call opts", async () => {
+    // The params object belongs to the caller and may be reused across calls (a retry
+    // loop, a request-scoped config). Deleting `lago` from it made every later call
+    // fall back to the default subscription, dimensions, mode and markup.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new FakeMistral() as any);
+    const params: any = {
+      model: "mistral-small-latest",
+      messages: [],
+      lago: { subscription: "sub_per_call", dimensions: { feature: "X" } },
+    };
+    await client.chat.complete(params);
+    expect("lago" in params).toBe(true);
+    await client.chat.complete(params);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(2);
+    expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
+    expect(received.every((e) => e.properties.feature === "X")).toBe(true);
+  });
+});

@@ -34,6 +34,9 @@ export interface LagoConfig {
   requestTimeoutMs: number;
   maxRetryMs: number;
   onError?: (err: unknown, where: string) => void;
+  /** TLS verification for `apiUrl`; disable only for a local dev Lago behind a
+   * self-signed cert. See `LagoClient` for how it is scoped. */
+  verifySsl: boolean;
   // --- pricing (price mode) ---
   /** Global default mode. "tokens" preserves the existing behavior exactly. */
   pricingMode: PricingMode;
@@ -45,6 +48,15 @@ export interface LagoConfig {
   pricingTtlMs: number;
   /** Region used for Bedrock pricing when the model id carries no region prefix. */
   bedrockDefaultRegion: string;
+  /** Cloudflare account id + API token, needed to price "workers-ai" against
+   * Cloudflare's own catalog. Without both, that source is empty and calls fall back to
+   * token events like any other price miss. */
+  cloudflareAccountId?: string;
+  cloudflareApiToken?: string;
+  /** Usually NOT needed: `wrap()`-ing a Mistral client auto-detects it. Set it only to
+   * price Mistral usage without ever calling `wrap()` (e.g. a backfill); an explicit
+   * value always wins over an auto-detected one. */
+  mistralApiKey?: string;
   /** Optional injected PricingProvider (or stub) — primarily for tests/overrides. Typed unknown to avoid a config→pricing import cycle. */
   pricingProvider?: unknown;
 }
@@ -59,6 +71,7 @@ export function makeConfig(partial: Partial<LagoConfig> & { apiKey: string }): L
     maxBufferSize: 10_000,
     requestTimeoutMs: 10_000,
     maxRetryMs: 60_000,
+    verifySsl: true,
     pricingMode: "tokens",
     markup: 1.0,
     costMetricCode: DEFAULT_COST_METRIC_CODE,

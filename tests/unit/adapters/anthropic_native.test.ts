@@ -48,6 +48,26 @@ describe("Anthropic native adapter — fixtures (captured via @anthropic-ai/sdk)
   });
 });
 
+describe("Anthropic native adapter — model attribution (bill on what answered, not what was requested)", () => {
+  it("resolves to the response's model, not the requested alias", () => {
+    // Verified live, no gateway involved at all: requesting
+    // "claude-sonnet-4-5" answers as "claude-sonnet-4-5-20250929". Pricing
+    // and attribution must key off what actually answered.
+    const resp = {
+      model: "claude-sonnet-4-5-20250929",
+      content: [{ type: "text", text: "hi" }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    };
+    const u = extractAnthropicNative(resp, "claude-sonnet-4-5");
+    expect(u.model).toBe("claude-sonnet-4-5-20250929");
+  });
+
+  it("falls back to the requested model when the response is silent about it", () => {
+    const u = extractAnthropicNative({ usage: { input_tokens: 1, output_tokens: 1 } }, "claude-sonnet-4-5");
+    expect(u.model).toBe("claude-sonnet-4-5");
+  });
+});
+
 describe("Anthropic native adapter — synthetic", () => {
   it("cache_creation nested 5m + 1h are extracted", () => {
     const resp = {

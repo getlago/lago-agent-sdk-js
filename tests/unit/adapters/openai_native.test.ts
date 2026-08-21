@@ -118,6 +118,52 @@ describe("OpenAI native adapter — API detection", () => {
   });
 });
 
+describe("OpenAI native adapter — model attribution (bill on what answered, not what was requested)", () => {
+  it("resolves to the response's model, not the requested alias", () => {
+    // Every non-streaming fixture in this suite shows this exact mismatch —
+    // e.g. modelId="gpt-4o-mini" was requested, but the response reports
+    // "gpt-4o-mini-2024-07-18". Pricing/attribution must key off what
+    // actually answered, or every alias-based call gets billed under the
+    // wrong model.
+    const { modelId, response } = load("01_plain_chat.json");
+    expect(modelId).toBe("gpt-4o-mini"); // sanity: the alias that was requested
+    const u = extractOpenAINative(response, modelId);
+    expect(u.model).toBe("gpt-4o-mini-2024-07-18"); // the resolved model that actually answered
+  });
+
+  it("falls back to the requested model when the response is silent about it", () => {
+    // The synthetic usage blob the streaming wrapper builds carries no
+    // top-level `model` — fall back to the requested model rather than
+    // emitting an empty string.
+    const u = extractOpenAINative({ usage: { prompt_tokens: 1, completion_tokens: 1 } }, "gpt-4o-mini");
+    expect(u.model).toBe("gpt-4o-mini");
+  });
+});
+
+describe("OpenAI native adapter — provider inference", () => {
+  it("infers workers-ai from a Cloudflare @cf/ model string via the openai SDK shape", () => {
+    // Real shape: the openai SDK pointed at Cloudflare's `.../compat`
+    // endpoint, routed to a Workers AI model. The SDK shape looks identical
+    // to a real OpenAI response — "provider" can only be told apart by the
+    // resolved model string itself. Getting this wrong makes Workers AI
+    // calls permanently unpriceable in price mode (stamped "openai", which
+    // has no Workers AI entries in its price table).
+    const resp = {
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      usage: { prompt_tokens: 38, completion_tokens: 2 },
+    };
+    const u = extractOpenAINative(resp, "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(u.provider).toBe("workers-ai");
+    expect(u.model).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+  });
+
+  it("still infers openai for a real OpenAI model (no @cf/ prefix)", () => {
+    const resp = { model: "gpt-4o-mini-2024-07-18", usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    const u = extractOpenAINative(resp, "gpt-4o-mini");
+    expect(u.provider).toBe("openai");
+  });
+});
+
 describe("OpenAI native adapter — synthetic edge cases", () => {
   it("counts multiple tool_calls in chat completion", () => {
     const resp = {

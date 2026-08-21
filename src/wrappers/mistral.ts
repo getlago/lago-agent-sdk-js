@@ -6,7 +6,8 @@
  *
  * Per-call override pattern:
  *   await client.chat.complete({...}, { lago: { subscription: "sub_x", dimensions: {...} } })
- * The wrapper strips the `lago` option before forwarding.
+ * The wrapper forwards a COPY with `lago` removed, leaving the caller's own object
+ * intact for reuse.
  */
 import { extractMistralNative } from "../adapters/mistral_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -74,11 +75,18 @@ export function wrapMistralClient<T extends MistralLike>(
   // ---------- chat.complete ----------
   if (originalComplete) {
     const wrappedComplete = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      // Work on a COPY: the params object belongs to the caller and may be reused
+      // across calls (a retry loop, a request-scoped config). Deleting `lago` from it
+      // made every later call silently fall back to the default subscription,
+      // dimensions, mode and markup. Python pops from its own `**kwargs` and never
+      // touches caller state; this matches.
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const response = await originalComplete(...args);
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      const response = await originalComplete(...forwarded);
       try {
         const usage = extractMistralNative(response, modelId);
         sdk.emit(usage, resolveOpts(lagoOpts));
@@ -103,11 +111,13 @@ export function wrapMistralClient<T extends MistralLike>(
   // silently break customer code that uses .then() or instanceof Promise.
   if (originalStream) {
     const wrappedStream = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
-      const source = (await originalStream(...args)) as AsyncIterable<unknown>;
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      const source = (await originalStream(...forwarded)) as AsyncIterable<unknown>;
 
       async function* iterate() {
         let lastUsage: Record<string, unknown> | null = null;

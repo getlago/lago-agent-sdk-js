@@ -13,7 +13,8 @@
  * chunk's usage.
  *
  * Per-call override: pass `lago: { subscription, dimensions }` in the request
- * options. The wrapper strips it before forwarding.
+ * options. The wrapper forwards a COPY with `lago` removed, leaving the caller's own
+ * object intact for reuse.
  */
 import { extractGeminiNative } from "../adapters/gemini_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -62,6 +63,17 @@ function pickUsageMetadata(payload: unknown): Record<string, unknown> | null {
   return isObject(um) ? um : null;
 }
 
+/** The chunk's resolved model version, in either casing the SDK might use.
+ *
+ * Gemini hot-swaps "-latest" aliases server-side, so the chunk's own version is
+ * what OpenRouter lists and what pricing must key off. A usage-only streaming
+ * payload silently reverted to the requested alias on every call. */
+function pickModelVersion(payload: unknown): string | null {
+  if (!isObject(payload)) return null;
+  const mv = payload.modelVersion ?? payload.model_version;
+  return typeof mv === "string" && mv ? mv : null;
+}
+
 export function wrapGeminiClient<T extends GoogleGenAILike>(
   sdk: SDKLike,
   client: T,
@@ -99,13 +111,20 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
   // ---------- models.generateContent ----------
   if (originalGenerate) {
     const wrappedGenerate = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      // Work on a COPY: the params object belongs to the caller and may be reused
+      // across calls (a retry loop, a request-scoped config). Deleting `lago` from it
+      // made every later call silently fall back to the default subscription,
+      // dimensions, mode and markup. Python pops from its own `**kwargs` and never
+      // touches caller state; this matches.
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
 
-      const response = await originalGenerate(...args);
+      const response = await originalGenerate(...forwarded);
       emitFrom(response, modelId, emitOpts);
       return response;
     };
@@ -115,21 +134,25 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
   // ---------- models.generateContentStream ----------
   if (originalStream) {
     const wrappedStream = async (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
 
-      const src = (await originalStream(...args)) as AsyncIterable<unknown>;
+      const src = (await originalStream(...forwarded)) as AsyncIterable<unknown>;
 
       async function* iterate(): AsyncIterable<unknown> {
         let lastWithUsage: Record<string, unknown> | null = null;
+        let resolvedModel: string | null = null;
         try {
           for await (const chunk of src) {
+            resolvedModel = pickModelVersion(chunk) ?? resolvedModel;
             const usage = pickUsageMetadata(chunk);
             if (usage) {
-              lastWithUsage = { usageMetadata: usage };
+              lastWithUsage = { usageMetadata: usage, modelVersion: resolvedModel };
             }
             yield chunk;
           }

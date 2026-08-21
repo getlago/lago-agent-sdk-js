@@ -1,39 +1,17 @@
 /**
- * Gemini native adapter — verified against real fixtures.
+ * Gemini native adapter (`@google/genai`) — usage lives in `response.usageMetadata`,
+ * on the final chunk when streaming.
  *
- * Wraps the modern `@google/genai` SDK. Both `client.models.generateContent`
- * (sync + async) and `client.models.generateContentStream` (sync + async) put
- * usage in `response.usageMetadata` (final chunk for streaming).
+ * Billing semantics that are NOT visible from the field names:
+ *   - `thoughtsTokenCount` (→ reasoning) is ADDITIVE to `candidatesTokenCount`, so
+ *     Google's billable output is candidates + thoughts. This is the opposite of
+ *     OpenAI, where reasoning is a subset of output.
+ *   - `cachedContentTokenCount` (→ cache_read) IS counted inside `promptTokenCount`.
  *
- * Field mapping (`usageMetadata.*`):
- *   promptTokenCount                                          → input
- *   candidatesTokenCount                                      → output
- *   cachedContentTokenCount                                   → cache_read
- *   thoughtsTokenCount                                        → reasoning
- *                                                               (Gemini 2.5; ADDITIVE
- *                                                               to candidates, not a subset)
- *   promptTokensDetails[modality=AUDIO].tokenCount            → audio_input
- *   promptTokensDetails[modality=IMAGE].tokenCount            → image_input
- *   candidatesTokensDetails[modality=AUDIO].tokenCount        → audio_output
- *
- * Tool calls: count of candidates[0].content.parts[] entries that have a
- * non-null `functionCall` field.
- *
- * Semantic note vs OpenAI:
- *   Gemini's `thoughtsTokenCount` is ADDITIVE to `candidatesTokenCount`
- *   (total billable output for Google = candidates + thoughts).
- *   OpenAI's `reasoning_tokens` is a SUBSET of `completion_tokens`.
- *   When a customer bills on both `llm_output_tokens` and
- *   `llm_reasoning_tokens` as separate Lago metrics, the Gemini-side sum
- *   reflects the full Google bill; the OpenAI-side `llm_output_tokens`
- *   already includes reasoning.
- *
- * Note on field naming: the @google/genai SDK uses camelCase
- * (usageMetadata, promptTokenCount, etc.); when responses are serialized to
- * JSON for fixtures we capture them as snake_case via model_dump. This
- * adapter handles both shapes.
+ * Both camelCase (live SDK) and snake_case (fixtures via model_dump) are accepted.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { resolveModel } from "./_common.js";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   // snake_case (from Python model_dump or wire JSON)
@@ -126,7 +104,6 @@ export function extractGeminiNative(response: unknown, modelId: string = ""): Ca
   }
 
   const modelVersion = pick(resp, "model_version", "modelVersion");
-  const model = typeof modelVersion === "string" ? modelVersion : "";
 
   return makeCanonicalUsage({
     input: safeInt(pick(usage, "prompt_token_count", "promptTokenCount")),
@@ -137,7 +114,7 @@ export function extractGeminiNative(response: unknown, modelId: string = ""): Ca
     audio_output: modalityTokenCount(candidatesDetails, "AUDIO"),
     image_input: modalityTokenCount(promptDetails, "IMAGE"),
     tool_calls: countToolCalls(resp),
-    model: modelId || model,
+    model: resolveModel(modelVersion, modelId),
     provider: "gemini",
     api: "native",
     extras,
