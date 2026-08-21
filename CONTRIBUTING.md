@@ -34,12 +34,14 @@ npm run build
 - `src/` — the SDK source
 - `src/adapters/` — one file per (provider, access path); transforms provider responses into `CanonicalUsage`
 - `src/wrappers/` — one file per (provider SDK, access path); patches client objects in place
+- `src/gateway/` — connectors for third-party AI gateways: maps a gateway's own usage-reporting surface into `CanonicalUsage`, consumed by a poller rather than by `wrap()`
 - `src/canonical.ts` — the normalized usage shape sent to Lago
 - `src/queue.ts` — async event queue with backoff
 - `src/lago_client.ts` — thin HTTP client to `/events/batch`
 - `src/gateway/` — second front door: gateway usage logs → `CanonicalUsage`, for backfill
 - `tests/unit/` — unit tests, organized to mirror `src/`
 - `tests/unit/adapters/fixtures/` — captured real provider responses, used by adapter tests
+- `tests/unit/adapters/fixtures/capture_*.{ts,py}` — capture scripts; each reads its credential from the environment and scrubs secrets in the same step that writes a fixture into the tree
 
 ## Adding a provider
 
