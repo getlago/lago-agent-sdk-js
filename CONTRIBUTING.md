@@ -14,15 +14,13 @@ npm install
 # Unit tests (fast, no network)
 npm test -- tests/unit
 
-# Integration tests (require credentials — see env vars in each test)
-AWS_BEARER_TOKEN_BEDROCK="..." \
-MISTRAL_API_KEY="..." \
-LAGO_API_URL="..." LAGO_API_KEY="..." LAGO_EXTERNAL_SUBSCRIPTION_ID="..." \
-npm test -- tests/integration
-
 # All tests
 npm test
 ```
+
+There is no committed live-provider test tier. Adapter behaviour is pinned by
+captured real responses under `tests/unit/adapters/fixtures/`, which is what the
+unit tests assert against; re-capture a fixture rather than hand-editing one.
 
 ## Build and type-check
 
@@ -42,7 +40,6 @@ npm run build
 - `src/gateway/` — second front door: gateway usage logs → `CanonicalUsage`, for backfill
 - `tests/unit/` — unit tests, organized to mirror `src/`
 - `tests/unit/adapters/fixtures/` — captured real provider responses, used by adapter tests
-- `tests/integration/` — live tests, gated on credential env vars
 
 ## Adding a provider
 
@@ -52,7 +49,6 @@ npm run build
 4. Update `detector.ts` to recognize the client class.
 5. Update `sdk.ts::wrap()` to dispatch to the new wrapper.
 6. Add unit tests against the captured fixtures.
-7. Add a live integration test gated on the provider's API key env var.
 
 ## Adding a gateway
 

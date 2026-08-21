@@ -34,15 +34,8 @@ export interface LagoConfig {
   requestTimeoutMs: number;
   maxRetryMs: number;
   onError?: (err: unknown, where: string) => void;
-  /**
-   * TLS certificate verification for requests to `apiUrl`. Defaults to
-   * `true` (always verify — never disable this against a real Lago
-   * instance). The one legitimate reason to set `false`: a local dev Lago
-   * instance behind a self-signed certificate (e.g. Traefik's default
-   * local cert), where the alternative is routing through a public tunnel
-   * (ngrok, etc.) purely to get a browser-trusted cert — adding a flaky,
-   * unnecessary network hop for a problem this flag solves directly.
-   */
+  /** TLS verification for `apiUrl`; disable only for a local dev Lago behind a
+   * self-signed cert. See `LagoClient` for how it is scoped. */
   verifySsl: boolean;
   // --- pricing (price mode) ---
   /** Global default mode. "tokens" preserves the existing behavior exactly. */
@@ -55,21 +48,14 @@ export interface LagoConfig {
   pricingTtlMs: number;
   /** Region used for Bedrock pricing when the model id carries no region prefix. */
   bedrockDefaultRegion: string;
-  /**
-   * Cloudflare account id + API token for pricing "workers-ai" calls in
-   * price mode, via Cloudflare's own model catalog (not a public/no-auth
-   * source the way OpenRouter/AWS are — without both set, Workers AI
-   * pricing is simply unavailable and falls back to token events, same as
-   * any other miss).
-   */
+  /** Cloudflare account id + API token, needed to price "workers-ai" against
+   * Cloudflare's own catalog. Without both, that source is empty and calls fall back to
+   * token events like any other price miss. */
   cloudflareAccountId?: string;
   cloudflareApiToken?: string;
-  /**
-   * Usually NOT needed — wrap()-ing a mistral client auto-detects this (see
-   * LagoSDK's auto-prime-on-wrap). Set it explicitly only when pricing
-   * Mistral usage without ever calling wrap() (e.g. a log-backfill path);
-   * an explicit value here always wins over an auto-detected one.
-   */
+  /** Usually NOT needed: `wrap()`-ing a Mistral client auto-detects it. Set it only to
+   * price Mistral usage without ever calling `wrap()` (e.g. a backfill); an explicit
+   * value always wins over an auto-detected one. */
   mistralApiKey?: string;
   /** Optional injected PricingProvider (or stub) — primarily for tests/overrides. Typed unknown to avoid a config→pricing import cycle. */
   pricingProvider?: unknown;

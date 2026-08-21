@@ -7,33 +7,19 @@
  *
  * Instrumentation never breaks the customer's call.
  *
- * APIPromise plumbing: OpenAI's create() returns an APIPromise<T> — a Promise
- * subclass with extra methods (.withResponse(), .asResponse()). To preserve
- * that interface while intercepting the resolved value, we wrap the returned
- * APIPromise in a Proxy. Class-private fields force us to bind methods to the
- * underlying target rather than the Proxy.
+ * `create()` returns an APIPromise, so the return value is a Proxy that preserves that
+ * interface (`.withResponse()`, `.asResponse()`) while intercepting the resolved value.
+ * Class-private fields mean every method must be bound to the target, not the Proxy.
  *
- * Streaming usage: when `stream: true` is passed without
- * `stream_options.include_usage`, we inject it so the final chunk carries the
- * usage payload. Without this, OpenAI's stream returns no usage at all —
- * silent under-billing for the customer.
+ * `stream: true` without `stream_options.include_usage` is injected, because OpenAI's
+ * stream otherwise reports no usage at all — silent under-billing.
  *
- * Gateway cache-hit detection (non-streaming only): before emitting, peek at
- * the raw response via `.asResponse()` (an APIPromise method OpenAI's SDK
- * already exposes for exactly this — safe to call alongside `.then()`/await
- * on the same promise, no extra network round-trip). If a gateway in front
- * of the provider (e.g. Cloudflare AI Gateway) marks the response
- * `cf-aig-cache-status: HIT`, the provider served it from cache at zero cost
- * to the customer — we skip billing it. No-op with no gateway in the path
- * (the header is simply absent) or with a simplified/custom client that
- * doesn't expose `.asResponse()` (degrades to the pre-existing behavior:
- * always emit). Streaming is NOT covered — OpenAI recommends
- * `.with_streaming_response`/other handling for that, which behaves
- * differently and hasn't been verified end-to-end.
+ * Gateway cache hits (non-streaming only): `cf-aig-cache-status: HIT` means the provider
+ * was never called, so it must not be billed. Read via `.asResponse()` on the same
+ * promise — no extra round-trip. A client without `.asResponse()` always emits.
  *
- * Per-call override: pass `lago: { subscription, dimensions }` in the args
- * object. The wrapper strips it before forwarding so OpenAI's strict validator
- * doesn't reject it.
+ * Per-call `lago: { subscription, dimensions }` is forwarded as a COPY with the key
+ * removed: the provider's validator rejects it, and the caller may reuse the object.
  */
 import { extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
@@ -213,14 +199,33 @@ export function wrapOpenAIClient<T extends OpenAILike>(
    */
   const makeWrappedCreate = (original: (...args: unknown[]) => unknown, autoIncludeUsage: boolean) => {
     return (...args: unknown[]) => {
-      const firstArg = args[0] as Record<string, unknown> | undefined;
-      const lagoOpts: LagoOpts = (firstArg && (firstArg.lago as LagoOpts)) || {};
+      const caller = args[0] as Record<string, unknown> | undefined;
+      const lagoOpts: LagoOpts = (caller && (caller.lago as LagoOpts)) || {};
+      // Work on a COPY. `delete caller.lago` and the stream_options injection both
+      // mutated the object the customer handed us, so a params object reused across
+      // calls — a retry loop, or a request-scoped config — lost its `lago` key after
+      // the first call and every later one silently fell back to the default
+      // subscription, dimensions, mode and markup. Python pops from its own per-call
+      // `**kwargs` dict and never touches caller state; this now matches.
+      const firstArg = caller === undefined ? undefined : { ...caller };
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       if (autoIncludeUsage) ensureStreamOptionsIncludeUsage(firstArg);
       const modelId = String(firstArg?.model ?? "");
       const emitOpts = resolveOpts(lagoOpts);
 
-      const apiPromise = original(...args) as object;
+      const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      const apiPromise = original(...forwarded) as object;
+
+      // ONE emit per call, whichever trap the caller touches. `await p` and
+      // `p.withResponse()` are both instrumented below and both resolve from the SAME
+      // underlying APIPromise, so doing both — a caller reading usage, then reading
+      // rate-limit headers — billed the call twice.
+      let emitted = false;
+      const emitOnce = (payload: unknown) => {
+        if (emitted) return;
+        emitted = true;
+        emitFrom(payload, modelId, emitOpts);
+      };
 
       // APIPromise has class-private fields (#httpResponse). Methods accessed
       // through the Proxy must be bound to the underlying target — not the
@@ -241,7 +246,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                     // underlying promise before emitting — see
                     // isCacheHit()'s docstring for why this is safe.
                     if (!(await isCacheHit(target))) {
-                      emitFrom(value, modelId, emitOpts);
+                      emitOnce(value);
                     }
                   } else if (isAsyncIterable(value)) {
                     next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
@@ -251,6 +256,29 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                 }
                 return onfulfilled ? onfulfilled(next) : next;
               }, onrejected);
+          }
+          // `withResponse()` resolves to `{ data, response }` and is a documented public
+          // API for reading rate-limit headers, but it calls `this.parse()` on the
+          // TARGET, so the `then` trap never fires for it. Bill from its parsed `data`,
+          // with the same cache-hit suppression and the same once-guard.
+          //
+          // `asResponse()` is deliberately NOT wrapped: it hands back an unparsed
+          // `Response`, and reading the body to find usage would consume the stream the
+          // caller is about to read. An unbillable call beats a broken one.
+          const rawWithResponse = (target as { withResponse?: unknown }).withResponse;
+          if (prop === "withResponse" && typeof rawWithResponse === "function") {
+            const orig = (rawWithResponse as () => Promise<unknown>).bind(target);
+            return async () => {
+              const result = (await orig()) as { data?: unknown };
+              try {
+                if (looksLikeResponse(result?.data) && !(await isCacheHit(target))) {
+                  emitOnce(result.data);
+                }
+              } catch {
+                /* never break the call */
+              }
+              return result;
+            };
           }
           const value = Reflect.get(target, prop, target);
           if (typeof value === "function") {
@@ -288,15 +316,21 @@ export function wrapOpenAIClient<T extends OpenAILike>(
  * Responses API:    usage sits under `event.response.usage` on the terminal
  *   `response.completed` event:
  *   `{ type: "response.completed", response: { usage: {...} } }`
+ *
+ * The chunk's own `model` is carried through with the usage: it is the RESOLVED
+ * snapshot, and the requested alias usually is not in OpenRouter's table, so dropping
+ * it makes price mode miss and degrade to token events.
  */
 function extractStreamUsage(payload: unknown): Record<string, unknown> | null {
   if (!isObject(payload)) return null;
   if (isObject(payload.usage)) {
-    return { usage: payload.usage };
+    return { usage: payload.usage, model: payload.model };
   }
+  // Responses API stream events nest usage under `.response.usage` — and the
+  // resolved model under `.response.model`, not at the event's top level.
   const response = payload.response;
   if (isObject(response) && isObject(response.usage)) {
-    return { usage: response.usage };
+    return { usage: response.usage, model: response.model };
   }
   return null;
 }

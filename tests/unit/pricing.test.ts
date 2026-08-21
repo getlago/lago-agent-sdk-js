@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage } from "../../src/index.js";
+import { extractOpenAINative } from "../../src/adapters/openai_native.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 import {
   applyMarkup,
@@ -10,6 +11,7 @@ import {
   coerceMarkup,
   computeCost,
   computePrecomputedCost,
+  deoverlappedTokenTotal,
   HttpPricingFetcher,
   moneyStrToCents,
   lookupBedrock,
@@ -23,6 +25,7 @@ import {
   parseMistralAliases,
   parseOpenRouter,
   parseScaled,
+  type PricingFetcher,
   PricingProvider,
 } from "../../src/pricing.js";
 
@@ -302,6 +305,51 @@ describe("Bedrock matching", () => {
 });
 
 // ---------- Cloudflare Workers AI parsing + matching ----------
+// ----------------------------------------------------------------------
+// OpenRouter's "~" moving-alias marker. Measured live: 11 ids across 6 vendors,
+// every one a "-latest" moniker with real token pricing, and every one unpriceable
+// before this — the vendor parsed as "~anthropic"/"~openai"/"~google", which match
+// nothing in VENDOR_MAP.
+// ----------------------------------------------------------------------
+const TILDE_RAW = {
+  data: [
+    { id: "~anthropic/claude-sonnet-latest", pricing: { prompt: "0.000002", completion: "0.00001" } },
+    { id: "~openai/gpt-latest", pricing: { prompt: "0.0000025", completion: "0.000015" } },
+    {
+      id: "~google/gemini-flash-latest",
+      pricing: { prompt: "0.000000375", completion: "0.000001875" },
+    },
+  ],
+};
+
+describe("OpenRouter moving-alias (~) ids", () => {
+  it.each([
+    ["anthropic", "claude-sonnet-latest"],
+    ["openai", "gpt-latest"],
+    ["gemini", "gemini-flash-latest"],
+  ])("%s/%s is priceable", (provider, model) => {
+    // A "-latest" alias a customer plausibly requests must resolve. Billing nothing
+    // at all is the outcome in an llm_cost-only setup.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(lookupOpenRouter(t, provider, model)).not.toBeNull();
+  });
+
+  it("still indexed under its verbatim id", () => {
+    // Stripping the marker must ADD a key, not replace one.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(t.exact.has("~openai/gpt-latest")).toBe(true);
+    expect(t.exact.has("openai/gpt-latest")).toBe(true);
+  });
+
+  it("a 3-digit revision suffix strips to a hit", () => {
+    // Gemini's `model_version` can report a "-002" revision where OpenRouter lists
+    // only the bare name. Verified against the live catalog that no real id's model
+    // part ends in exactly three digits, so this arm is safe.
+    const t = parseOpenRouter(TILDE_RAW);
+    expect(lookupOpenRouter(t, "gemini", "gemini-flash-latest-002")).not.toBeNull();
+  });
+});
+
 describe("Cloudflare Workers AI matching", () => {
   it("parses the real price shape", () => {
     const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
@@ -347,6 +395,43 @@ describe("Cloudflare Workers AI matching", () => {
     expect(mp!.input).toBe(parseScaled("0.000000293"));
   });
 
+  it.each([
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    // The routing prefix and the version-suffix drift, together.
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast-v2",
+  ])("lookup accepts the /compat routing prefix: %s", (requested) => {
+    // Cloudflare's catalog lists bare "@cf/..." names, but reaching a model
+    // through the gateway's OpenAI-compatible `/compat` endpoint requires the
+    // "workers-ai/" prefix — the form the README prescribes and the only form a
+    // streaming call reports. Both must price to the same rate.
+    const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
+    const mp = lookupCloudflareWorkersAi(table, requested);
+    expect(mp).not.toBeNull();
+    expect(mp!.input).toBe(parseScaled("0.000000293"));
+  });
+
+  it("a miss is still a miss with the prefix", () => {
+    // The prefix strip must not turn an unknown model into a false hit.
+    const table = parseCloudflareWorkersAi(CLOUDFLARE_MODELS_RAW);
+    expect(lookupCloudflareWorkersAi(table, "workers-ai/@cf/nope/not-a-model")).toBeNull();
+  });
+
+  it.each([
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  ])("provider is inferred from both spellings: %s", (requested) => {
+    // A streaming Workers AI call carries no response model, so the requested
+    // string — which the docs give in prefixed form — is all `inferProvider`
+    // has. Stamping "openai" there priced it against OpenRouter, missed, and
+    // silently degraded to token events.
+    const u = extractOpenAINative({ usage: { prompt_tokens: 10, completion_tokens: 5 } }, requested);
+    expect(u.provider).toBe("workers-ai");
+    // The model keeps the spelling the customer used — the strip happens at
+    // lookup, so reporting stays faithful to the request.
+    expect(u.model).toBe(requested);
+  });
+
   it("fetcher returns empty without credentials — never makes a request", async () => {
     const fetcher = new HttpPricingFetcher();
     expect((await fetcher.fetchCloudflareWorkersAi()).size).toBe(0);
@@ -354,6 +439,126 @@ describe("Cloudflare Workers AI matching", () => {
 });
 
 // ---------- Mistral alias resolution ----------
+describe("de-overlapped token total (precomputed `unit` basis)", () => {
+  it.each([
+    // Ancor's cited case: a real captured Gemini row. `input + output` dropped 852
+    // additive reasoning tokens and published unit="30" for 882 consumed.
+    [{ input: 9, output: 21, reasoning: 852, provider: "gemini" }, 882],
+    // Cache-inclusive provider: cache_read sits INSIDE input, so counting both doubles it.
+    [{ input: 10000, output: 100, cache_read: 9000, provider: "openai" }, 10100],
+    // Additive provider: cache_read/cache_write are real extra consumption — the old
+    // basis under-reported this one by 9.6x.
+    [{ input: 1000, output: 100, cache_read: 9000, cache_write: 500, provider: "anthropic" }, 10600],
+    // reasoning ⊆ output for openai — must not be added on top.
+    [{ input: 10, output: 100, reasoning: 80, provider: "openai" }, 110],
+    // tool_calls is a CALL COUNT, not tokens, so it must never land in a token total.
+    [{ input: 10, output: 20, tool_calls: 3, provider: "openai" }, 30],
+  ])("%o -> %i", (fields, expected) => {
+    expect(deoverlappedTokenTotal(makeCanonicalUsage(fields as any))).toBe(expected);
+  });
+
+  it("precomputed unit matches the split path basis", async () => {
+    // The two cost branches must report the same quantity for one call — that was
+    // the actual complaint: `unit` on the single-event path used a different basis
+    // from `parts.tokens` on the split path.
+    const usage = makeCanonicalUsage({
+      input: 1000,
+      output: 100,
+      cache_read: 900,
+      model: "claude-opus-4-8",
+      provider: "anthropic",
+      api: "native",
+    });
+
+    const split = priceSdk(await warmProvider());
+    split.sdk.emit(usage);
+    expect(await split.sdk.flush(2000)).toBe(true);
+    await split.sdk.shutdown(1000);
+    const splitTotal = split.received.reduce((a, e) => a + parseInt(String(e.properties.unit), 10), 0);
+
+    const single = priceSdk(await warmProvider());
+    single.sdk.emit(usage, { usdCost: 0.05 });
+    expect(await single.sdk.flush(2000)).toBe(true);
+    await single.sdk.shutdown(1000);
+    expect(single.received).toHaveLength(1);
+    expect(parseInt(String(single.received[0].properties.unit), 10)).toBe(splitTotal);
+  });
+});
+
+describe("Cloudflare catalog fetch — pagination and malformed entries", () => {
+  const priced = (name: string) => ({
+    name,
+    properties: [
+      { property_id: "price", value: [{ unit: "per M input tokens", price: 1.0, currency: "USD" }] },
+    ],
+  });
+
+  const pages = (counts: number[], totalCount: number | null) =>
+    counts.map((n, i) => ({
+      result: Array.from({ length: n }, (_, j) => priced(`@cf/m/p${i + 1}-${j}`)),
+      result_info: {
+        page: i + 1,
+        per_page: 50,
+        count: n,
+        ...(totalCount === null ? {} : { total_count: totalCount }),
+      },
+    }));
+
+  async function runFetch(body: ReturnType<typeof pages>) {
+    const seen: number[] = [];
+    vi.stubGlobal("fetch", async (url: string) => {
+      const page = Number(new URL(url).searchParams.get("page") ?? 1);
+      seen.push(page);
+      const b = page - 1 < body.length ? body[page - 1] : { result: [], result_info: {} };
+      return { ok: true, status: 200, json: async () => b } as unknown as Response;
+    });
+    try {
+      const f = new HttpPricingFetcher(10_000, "acct", "tok");
+      const table = await f.fetchCloudflareWorkersAi();
+      return { size: table.size, seen };
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("an entry with null properties does not unprice everything", () => {
+    // Only the malformed entry is dropped; a sibling must survive.
+    const table = parseCloudflareWorkersAi([
+      { name: "@cf/broken/model", properties: null },
+      priced("@cf/good/model"),
+    ]);
+    expect(table.has("@cf/good/model")).toBe(true);
+    expect(table.has("@cf/broken/model")).toBe(false);
+  });
+
+  it("walks until a short page — matching the real endpoint's 50 then 14", async () => {
+    const { size, seen } = await runFetch(pages([50, 14], 291));
+    expect(seen).toEqual([1, 2]);
+    expect(size).toBe(64);
+  });
+
+  it("survives a missing total_count", async () => {
+    // The bug: total_count falling back to models.length made an absent count break
+    // after page one, silently keeping 50 of the 64 available.
+    const { size, seen } = await runFetch(pages([50, 14], null));
+    expect(seen).toEqual([1, 2]);
+    expect(size).toBe(64);
+  });
+
+  it("ignores a wrong total_count", async () => {
+    // Measured live: the endpoint reports total_count=291 while serving 64.
+    const { size } = await runFetch(pages([50, 14], 291));
+    expect(size).toBe(64);
+  });
+
+  it("is bounded", async () => {
+    // Runs on the queue's flush tick ahead of the drain, so an endpoint that always
+    // returns a full page must not stall event delivery.
+    const { seen } = await runFetch(pages(Array(60).fill(50), 100000));
+    expect(seen.length).toBeLessThanOrEqual(40);
+  });
+});
+
 describe("Mistral alias resolution", () => {
   it("parses the real alias shape", () => {
     const aliases = parseMistralAliases(MISTRAL_MODELS_RAW);
@@ -417,6 +622,59 @@ describe("Mistral alias resolution", () => {
     const aliases = parseMistralAliases(MISTRAL_MODELS_RAW_MUTUAL_ALIASING);
     expect(aliases.get("voxtral-small-latest")).toBe("voxtral-small-2507");
     expect(aliases.has("voxtral-small-2507")).toBe(false);
+  });
+
+  const family = (names: string[]) => ({
+    data: names.map((n) => ({ id: n, aliases: names.filter((x) => x !== n) })),
+  });
+
+  it("a family resolves to the NEWEST dated snapshot", () => {
+    // Regression: the tie-break used to resolve on the date ASCENDING. Every
+    // dated id in one family is the same length, so `a.length - b.length` fell
+    // through to the alphabetical term — which for `-2402` / `-2407` / `-2411`
+    // is the date, oldest first. The whole family collapsed onto
+    // `mistral-large-2402` and got priced at a two-year-old rate.
+    const aliases = parseMistralAliases(
+      family(["mistral-large-2402", "mistral-large-2407", "mistral-large-2411", "mistral-large-latest"]),
+    );
+    expect(aliases.get("mistral-large-latest")).toBe("mistral-large-2411");
+  });
+
+  it("an explicit dated snapshot is never remapped", () => {
+    // An exact snapshot request is already the id OpenRouter lists, so it must
+    // pass through untouched. Remapping it onto the group's canonical priced it
+    // at a sibling's rate — a mispricing, not a miss.
+    const aliases = parseMistralAliases(
+      family(["mistral-large-2402", "mistral-large-2411", "mistral-large-latest"]),
+    );
+    expect(aliases.has("mistral-large-2402")).toBe(false);
+    expect(aliases.has("mistral-large-2411")).toBe(false);
+    expect(aliases.get("mistral-large-latest")).toBe("mistral-large-2411");
+  });
+
+  it.each([
+    // Mistral's own 4-digit YYMM convention.
+    [["m-2402", "m-2411", "m-latest"], "m-2411"],
+    // Mixed widths: "20250929" sorts BELOW "2411" as a raw string, so the
+    // normalization to one scale is what makes this come out right.
+    [["m-2411", "m-20250929", "m-latest"], "m-20250929"],
+  ])("picks the newest across suffix shapes: %s", (names, expected) => {
+    const aliases = parseMistralAliases(family(names as string[]));
+    expect(aliases.get("m-latest")).toBe(expected);
+  });
+
+  it("orders by code point, not locale", () => {
+    // Cross-repo parity: `localeCompare` is ICU/locale-dependent, so it is not
+    // reproducible across environments AND it made this port pick a different
+    // canonical than Python for the same input — `mistral_small_2603`, which
+    // normalizes onto a name OpenRouter does not list, instead of
+    // `Mistral-Small-2603`, which does.
+    const aliases = parseMistralAliases(family(["mistral-small-2603", "Mistral-Small-2603"]));
+    expect([...aliases.values()]).toEqual([]); // both are dated -> both pass through
+    const withAlias = parseMistralAliases(
+      family(["mistral-small-2603", "Mistral-Small-2603", "mistral-small-latest"]),
+    );
+    expect(withAlias.get("mistral-small-latest")).toBe("Mistral-Small-2603");
   });
 });
 
@@ -1248,7 +1506,9 @@ describe("SDK price mode", () => {
   it("eventId is suffixed per field in token mode", async () => {
     // Token mode can push several events from one call (input, output,
     // ...); reusing the same eventId verbatim for all of them would
-    // collide, so each field gets its own suffix off the same base id.
+    // collide, so each field gets its own suffix off the same base id — in
+    // the `_tok_` namespace, which keeps it distinct from the cost path's
+    // suffix for the same field.
     const received: LagoEvent[] = [];
     const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: "sub_default" });
     sdk._setSender(async (b) => {
@@ -1267,8 +1527,46 @@ describe("SDK price mode", () => {
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
     expect(new Set(received.map((e) => e.transaction_id))).toEqual(
-      new Set(["backfill_01ABC_input", "backfill_01ABC_output"]),
+      new Set(["backfill_01ABC_tok_input", "backfill_01ABC_tok_output"]),
     );
+  });
+
+  it("token-fallback and cost ids never collide for one eventId", async () => {
+    // The bug this namespacing exists for. A price miss falls back to token
+    // events; the SAME window re-run once the table is warm takes the cost
+    // path. Under one shared namespace both emitted `{eventId}_input`, so Lago
+    // rejected the second as a duplicate — and since `/events/batch` is
+    // all-or-nothing, that rejection failed every other event in the batch too.
+    // The dollar amounts for that window were never billed, only the raw token
+    // counts, and nothing surfaced it.
+    const usage = makeCanonicalUsage({
+      input: 10,
+      output: 5,
+      model: "claude-opus-4-8",
+      provider: "anthropic",
+      api: "native",
+    });
+
+    // Run 1: cold table -> price miss -> token fallback, same eventId.
+    const cold = priceSdk(new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 }));
+    cold.sdk.emit(usage, { eventId: "backfill_01ABC" });
+    expect(await cold.sdk.flush(2000)).toBe(true);
+    await cold.sdk.shutdown(1000);
+    const coldIds = new Set(cold.received.map((e) => e.transaction_id));
+
+    // Run 2: warm table -> real per-field cost events, same eventId.
+    const warm = priceSdk(await warmProvider());
+    warm.sdk.emit(usage, { eventId: "backfill_01ABC" });
+    expect(await warm.sdk.flush(2000)).toBe(true);
+    await warm.sdk.shutdown(1000);
+    const warmIds = new Set(warm.received.map((e) => e.transaction_id));
+
+    expect(coldIds.size).toBeGreaterThan(0);
+    expect(warmIds.size).toBeGreaterThan(0);
+    const overlap = [...coldIds].filter((i) => warmIds.has(i));
+    expect(overlap).toEqual([]);
+    expect([...coldIds].every((i) => i.includes("_tok_"))).toBe(true);
+    expect([...warmIds].every((i) => i.includes("_cost_"))).toBe(true);
   });
 
   it("no eventId still falls back to a random id — works exactly as before this option existed", async () => {
@@ -1404,5 +1702,198 @@ describe("date-suffix shapes — both vendors' conventions must strip", () => {
       },
     ]);
     expect(lookupCloudflareWorkersAi(cf, "@cf/meta/llama-3.3-70b-instruct-fp8-fast")).not.toBeNull();
+  });
+});
+
+// ----------------------------------------------------------------------
+// prime() must respect the TTL. It runs on the queue's loop ahead of
+// takeBatch(), so a needless catalogue refetch also delays event delivery.
+// ----------------------------------------------------------------------
+describe("PricingProvider — prime() staleness bookkeeping", () => {
+  it("does NOT re-flag a table that is still inside its TTL", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+
+    // Exactly what a server doing `sdk.wrap(new Mistral(...))` per request triggers —
+    // and note it re-primed OpenRouter even though only "mistral" was named.
+    for (let i = 0; i < 3; i++) {
+      p.prime(["mistral"]);
+      await p.maybeRefresh();
+    }
+    expect(fetcher.openrouterCalls).toBe(1);
+  });
+
+  it("DOES re-flag once the TTL has expired", async () => {
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 0 }); // everything is instantly stale
+    p.prime();
+    await p.maybeRefresh();
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(2);
+  });
+
+  it("still fetches a genuinely cold table", async () => {
+    // The gate must not turn "throttle a warm table" into "never warm a cold one".
+    const fetcher = new StubFetcher(parseOpenRouter(OPENROUTER_RAW));
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai", "mistral"]);
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(1);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    expect(fetcher.mistralAliasesCalls).toBe(1);
+  });
+});
+
+// ----------------------------------------------------------------------
+// A failing fetch must back off. maybeRefresh() runs once per queue flush (1s) and
+// each attempt can burn the full 10s HTTP timeout, so retrying on every tick means a
+// rotated credential re-attempts forever at the speed of its own timeout.
+// ----------------------------------------------------------------------
+class FailingFetcher {
+  calls = 0;
+  fail = true;
+  async fetchOpenRouter(): Promise<OpenRouterTable> {
+    this.calls++;
+    if (this.fail) throw new Error("401 bad credential");
+    return parseOpenRouter(OPENROUTER_RAW);
+  }
+  async fetchBedrock(): Promise<Map<string, ModelPrice>> {
+    return new Map();
+  }
+  async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+    return new Map();
+  }
+  async fetchMistralAliases(): Promise<Map<string, string>> {
+    return new Map();
+  }
+}
+
+describe("PricingProvider — a failing source backs off instead of retrying every tick", () => {
+  it("attempts once, then holds off across many ticks", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime();
+    for (let i = 0; i < 20; i++) await p.maybeRefresh();
+    // 20 ticks, 1 attempt: the first failure parks the source for 1s.
+    expect(fetcher.calls).toBe(1);
+  });
+
+  it("stays stale, so the retry does happen once the window passes", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime();
+    await p.maybeRefresh();
+    expect(fetcher.calls).toBe(1);
+    await new Promise((r) => setTimeout(r, 1100)); // first backoff window is 1s
+    fetcher.fail = false;
+    await p.maybeRefresh();
+    expect(fetcher.calls).toBe(2);
+    // Recovered: the table is warm and the price resolves.
+    expect(p.lookup("openai", "gpt-4o", "chat.completions")).not.toBeNull();
+  });
+
+  it("resets the backoff after a success, so the next failure starts at 1s again", async () => {
+    const fetcher = new FailingFetcher();
+    const p = new PricingProvider({ fetcher: fetcher as unknown as PricingFetcher, ttlMs: 0 });
+    p.prime();
+    await p.maybeRefresh(); // fails -> 1s window
+    await new Promise((r) => setTimeout(r, 1100));
+    fetcher.fail = false;
+    await p.maybeRefresh(); // succeeds -> window cleared
+    fetcher.fail = true;
+    p.prime();
+    await p.maybeRefresh(); // fails again: allowed immediately, not stuck at 2s
+    expect(fetcher.calls).toBe(3);
+  });
+});
+
+// ----------------------------------------------------------------------
+// The four sources are independent. Walking them sequentially makes one hanging
+// endpoint a delay for all of them — four 10s timeouts is a 40s tick.
+// ----------------------------------------------------------------------
+describe("PricingProvider — independent sources refresh concurrently", () => {
+  it("a slow source does not serialize the others", async () => {
+    const DELAY = 300;
+    const finished: string[] = [];
+    const slow = {
+      async fetchOpenRouter(): Promise<OpenRouterTable> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("openrouter");
+        return parseOpenRouter(OPENROUTER_RAW);
+      },
+      async fetchBedrock(): Promise<Map<string, ModelPrice>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("bedrock");
+        return new Map();
+      },
+      async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("cloudflare");
+        return new Map();
+      },
+      async fetchMistralAliases(): Promise<Map<string, string>> {
+        await new Promise((r) => setTimeout(r, DELAY));
+        finished.push("mistral");
+        return new Map();
+      },
+    };
+    const p = new PricingProvider({ fetcher: slow as unknown as PricingFetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai", "mistral"]);
+    p.lookup("anthropic", "anthropic.claude-3-5-sonnet-20241022-v2:0", "bedrock.converse");
+
+    const t0 = Date.now();
+    await p.maybeRefresh();
+    const elapsed = Date.now() - t0;
+
+    expect(finished.length).toBe(4);
+    // Concurrent: ~1 delay, not 4. Generous ceiling so a loaded CI box cannot flake it,
+    // while still failing outright on a sequential walk (which would be >= 1200ms).
+    expect(elapsed).toBeLessThan(DELAY * 2.5);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Workers AI reaches us only through Cloudflare's OpenAI-COMPATIBLE endpoint, so
+// OpenAI's overlap semantics apply on BOTH axes. Latent today (measured live,
+// `/compat` returns `completion_tokens_details: null` and the catalog publishes no
+// reasoning unit) — but the Python port has carried it since the same review, and the
+// two repos must never report different quantities for one call.
+// ----------------------------------------------------------------------
+describe("workers-ai token semantics match openai on both axes", () => {
+  const usage = (provider: string) =>
+    makeCanonicalUsage({
+      provider,
+      model: "m",
+      api: "chat.completions",
+      input: 78,
+      output: 187,
+      reasoning: 137, // subset of output
+      cache_read: 20, // subset of input
+    });
+
+  it("reports the same de-overlapped total as openai", () => {
+    expect(deoverlappedTokenTotal(usage("workers-ai"))).toBe(deoverlappedTokenTotal(usage("openai")));
+    expect(deoverlappedTokenTotal(usage("workers-ai"))).toBe(78 + 187);
+  });
+
+  it("does not bill reasoning on top of output when a rate exists", () => {
+    // Scaled 1e12 per token, and a reasoning rate Cloudflare does not publish *yet*.
+    const price: ModelPrice = {
+      source: "cloudflare_workers_ai",
+      input: 1n,
+      output: 2n,
+      cache_read: 1n,
+      cache_write: null,
+      reasoning: 2n,
+    };
+    const cf = computeCost(usage("workers-ai"), price, parseScaled("1")!);
+    const oa = computeCost(usage("openai"), price, parseScaled("1")!);
+    expect(cf.total).toBe(oa.total);
+    expect(cf.fields.reasoning).toBeUndefined();
   });
 });

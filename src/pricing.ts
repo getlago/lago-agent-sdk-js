@@ -5,35 +5,23 @@
  * call as `Σ(unit_price × token_count) × markup`.
  *
  * Sources:
- *   - OpenRouter (https://openrouter.ai/api/v1/models) for native providers
- *     (anthropic / openai / mistral / gemini). Prices are USD per token.
- *   - AWS Bedrock Price List Bulk API (public, no credentials) for Bedrock.
- *   - Cloudflare's own model catalog (/accounts/{id}/ai/models/search) for
- *     "workers-ai" — the actual rate the gateway bills at, not a third
- *     party's price for hosting the same open-weight model elsewhere
- *     (verified live: Cloudflare's real charged cost for one call matched
- *     this catalog's rate exactly; OpenRouter's listing for the same
- *     underlying model came out ~3.5x lower — a genuinely different price,
- *     not just a naming mismatch). Needs an account id + API token
- *     (Cloudflare's catalog isn't public/no-auth the way OpenRouter/AWS
- *     are); without both set, this source is simply empty.
- *   - Mistral's own /v1/models for *alias resolution*, not pricing directly.
- *     Mistral has no per-token price table of its own — but a customer
- *     request commonly uses a moving alias ("mistral-small-latest") that
- *     Mistral's response never resolves (unlike Anthropic/OpenAI, which
- *     report the dated snapshot that answered) — so the OpenRouter lookup
- *     below misses even though OpenRouter *does* list the resolved id
- *     (e.g. "mistralai/mistral-small-2603") with real pricing. /v1/models
- *     exposes the resolution directly via each model's `aliases` array;
- *     needs the customer's own Mistral API key.
+ *   - OpenRouter, for native providers (anthropic / openai / mistral / gemini).
+ *   - AWS Bedrock Price List Bulk API, for Bedrock.
+ *   - Cloudflare's model catalog, for "workers-ai" — the rate the gateway actually bills
+ *     at, which is NOT a third party's price for the same open-weight model. Needs an
+ *     account id + token; without both, the source is empty.
+ *   - Mistral's /v1/models, for ALIAS RESOLUTION, not pricing: Mistral publishes no
+ *     per-token table and never resolves a moving alias ("mistral-small-latest") in its
+ *     response, so the OpenRouter lookup misses even though OpenRouter lists the
+ *     resolved id. Needs the customer's own Mistral key.
  *
- * `lookup()` is pure in-memory and never does network I/O, so the customer's
- * call is never blocked on pricing. All HTTP happens in `maybeRefresh()`, which
- * the EventQueue's background loop awaits on its flush tick. A cold/missing
- * table returns null → the caller falls back to token events (never under-bill).
+ * `lookup()` is pure in-memory and O(1) — the customer's call is never blocked on
+ * pricing. ALL HTTP happens in `maybeRefresh()`, on the queue's background loop. A cold
+ * or missing table returns null and the caller falls back to token events; it must never
+ * bill zero.
  *
- * Money uses fixed-point BigInt scaled by 1e12, floored (truncated) to 12
- * decimal places — deterministic and identical to the Python implementation.
+ * Money is fixed-point BigInt scaled by 1e12, floored to 12dp — byte-identical to the
+ * Python port's Decimal path, which `money_golden.json` pins in both repos.
  */
 
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
@@ -43,37 +31,51 @@ export const cloudflareModelsUrl = (accountId: string): string =>
   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
 export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
 
+// A failed pricing fetch must not be retried on every tick. `maybeRefresh()` runs once
+// per queue flush (1s by default) and each attempt can burn the full 10s HTTP timeout,
+// so an unreachable endpoint or a rotated credential would otherwise retry forever at
+// the speed of its own timeout, with nothing to show for it. Per source: 1s, 2s, 4s …
+// to a 60s ceiling — the same shape and ceiling as the event queue's send backoff —
+// cleared on that source's next success.
+const FETCH_RETRY_BASE_MS = 1_000;
+const FETCH_RETRY_MAX_MS = 60_000;
+
 export const PRICED_FIELDS = ["input", "output", "cache_read", "cache_write", "reasoning"] as const;
 export type PricedField = (typeof PRICED_FIELDS)[number];
 
-// Providers whose reported `input` ALREADY includes the cached (cache_read)
-// tokens — cache_read is a subset of input, not additive — and whose `output`
-// already includes reasoning. Pricing the parent at full count AND the subset
-// separately would double-bill. Anthropic reports input exclusive of cache
-// (cache_read/cache_write additive) and Gemini's `thoughts` are additive, so
-// they're absent from the respective sets.
+// MEMBERSHIP IS BILLING-CRITICAL. These two sets say whether a subset metric is already
+// counted inside its parent; pricing the parent at full count AND the subset separately
+// double-bills the overlap. Getting a provider's side wrong over-bills real customers,
+// and the error scales with cache hit rate.
 //
-// "workers-ai" belongs here because it is only ever reached through
-// Cloudflare's OpenAI-COMPATIBLE endpoint (`.../compat`), so its usage payload
-// is the OpenAI shape: `prompt_tokens` includes
-// `prompt_tokens_details.cached_tokens`. It is a distinct provider only
-// because it prices against Cloudflare's own catalog (see inferProvider in
-// adapters/openai_native.ts) — the token semantics are still OpenAI's.
-// Omitting it billed the cached tokens twice: once at the full input rate
-// because they were never subtracted, and again at the cache-read rate, which
-// Cloudflare's catalog does publish for some models.
+//   openai, gemini    — cache_read is INSIDE input (`prompt_tokens_details.cached_tokens`)
+//   anthropic         — cache_read/cache_write are ADDITIVE to input, hence absent
+//   workers-ai        — only ever reached through Cloudflare's OpenAI-COMPATIBLE
+//                       endpoint, so the payload is the OpenAI shape and the OpenAI
+//                       semantics apply on BOTH axes: `cached_tokens` inside
+//                       `prompt_tokens`, and `reasoning_tokens` inside
+//                       `completion_tokens`. It is a separate provider only because it
+//                       prices against Cloudflare's catalog (see inferProvider in
+//                       adapters/openai_native.ts).
+//   mistral           — OpenAI-shaped API reporting `prompt_tokens_details.cached_tokens`
+//                       as a SUBSET of `prompt_tokens`. Mistral's own documented example
+//                       settles it: prompt=1013, cached=1008, total=1043 = prompt +
+//                       completion, which only reconciles if the cached tokens sit inside
+//                       the prompt count. Omitting it over-billed that payload by 6.15x,
+//                       and 13 of 18 Mistral models on OpenRouter publish a cache-read
+//                       rate, so the wrong path was reachable for most of them —
+//                       including Mistral routed through a Cloudflare gateway, since the
+//                       gateway adapter leaves provider="mistral" as-is.
 //
-// "mistral" belongs here for the same reason: the API is OpenAI-shaped and
-// reports `prompt_tokens_details.cached_tokens` as a SUBSET of `prompt_tokens`.
-// Mistral's own documented example is unambiguous — prompt_tokens=1013,
-// cached_tokens=1008, total_tokens=1043 = prompt + completion, which only
-// reconciles if the cached tokens sit inside the prompt count. Omitting it
-// double-billed the cached portion by 6.15x on that payload. 13 of 18 Mistral
-// models on OpenRouter publish a cache-read rate, so the wrong path was
-// reachable for most of them, including Mistral traffic routed through a
-// Cloudflare gateway (the gateway adapter leaves provider="mistral" as-is).
+// Workers AI's reasoning membership is latent, not live: measured against the real
+// gateway, `/compat` returns `completion_tokens_details: null` even for reasoning
+// models (gpt-oss-120b, deepseek-r1-distill-qwen-32b, qwq-32b), and Cloudflare's
+// catalog publishes no per-M-reasoning-tokens unit. It is here because the day either
+// changes, the overlap has to already be known — and because the Python port
+// (_OUTPUT_INCLUDES_REASONING) has carried it since the same review, and the two
+// repos reporting different token quantities for one call is its own bug.
 const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai", "mistral"]);
-const OUTPUT_INCLUDES_REASONING = new Set(["openai"]);
+const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
 
 // Providers this SDK bills as TOKEN COUNTS by design, even in price mode — because no
 // per-token rate for them exists anywhere the SDK could read it.
@@ -123,6 +125,19 @@ const CLOUDFLARE_UNIT_FIELD_MAP: Record<string, PricedField> = {
   "per M output tokens": "output",
   "per M cached input tokens": "cache_read",
 };
+
+// The routing prefix the gateway's OpenAI-compatible `/compat` endpoint requires.
+// Cloudflare's catalog keys models as bare "@cf/...", so this comes off before a
+// lookup. Kept in sync with `adapters/openai_native.WORKERS_AI_COMPAT_PREFIX`, which
+// decides the provider from the same two spellings.
+const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
+
+// Cloudflare's catalog page size, and a hard bound on the paging loop. The loop runs
+// on the queue's flush tick ahead of the drain, so it must terminate even if the
+// endpoint keeps returning full pages. 40 pages covers ~2000 models against a real
+// catalog of 64.
+const CF_PER_PAGE = 50;
+const CF_MAX_PAGES = 40;
 
 // A real dated Mistral snapshot ends in a short numeric tag (e.g. "-2603",
 // "-2411", "-2508") — never a "-latest"-style moniker. Used to pick the one
@@ -244,6 +259,23 @@ function stripVersion(model: string): string {
   return model.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2}|v\d+)$/, "");
 }
 
+/**
+ * `stripVersion`, plus Gemini's 3-digit revision ("-002", which `model_version`
+ * can report where OpenRouter lists only the bare name). OPENROUTER MATCHING ONLY.
+ *
+ * Deliberately not folded into `stripVersion`: that helper also builds the
+ * AWS/Bedrock price keys, where a shortened key does not merely miss but silently
+ * MIS-prices — `bedrockModelKey` feeds a map keyed by model, so two distinct models
+ * collapsing to one key overwrite each other's rate. All four live catalogs are
+ * currently clean (OpenRouter 415 ids, Cloudflare 64, AWS offer 77, captured Bedrock
+ * 39: zero model parts end in exactly three digits), but the arm was only ever
+ * motivated by OpenRouter, and scoping it makes that risk structurally zero instead
+ * of empirically zero. Mirrors `_strip_version_openrouter` in the Python port.
+ */
+function stripVersionOpenrouter(model: string): string {
+  return model.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{3}|v\d+)$/, "");
+}
+
 // ----------------------------------------------------------------------
 // Price tables
 // ----------------------------------------------------------------------
@@ -330,16 +362,41 @@ function finalizeBreakdown(
 }
 
 /**
+ * Total tokens a call actually consumed, with per-provider overlaps removed.
+ *
+ * Sums the same PRICED_FIELDS the split cost path emits one event each for, so the
+ * single-event `unit` equals the sum of the split path's `unit`s instead of
+ * reporting a different basis. Both `_INCLUDES_` sets are applied, because a subset
+ * counted twice inflates the reported quantity exactly as it would inflate a price:
+ *
+ *   - reasoning ⊆ output for providers in OUTPUT_INCLUDES_REASONING
+ *   - cache_read ⊆ input  for providers in INPUT_INCLUDES_CACHE_READ
+ *
+ * NOT gated on a unit price existing (unlike `computeCost`'s subtraction): a published
+ * rate cannot change how many tokens were consumed. The two still agree in the case
+ * that matters — a cache-inclusive provider with no cache_read price leaves the cached
+ * tokens inside `input` on both paths.
+ *
+ * Limited to PRICED_FIELDS, the five text fields: `tool_calls` counts calls not tokens,
+ * and `cache_write_5m`/`_1h` are a breakdown OF `cache_write`.
+ */
+export function deoverlappedTokenTotal(usage: CanonicalUsageLike): number {
+  const provider = (usage.provider || "").toLowerCase();
+  const counts: Record<string, number> = {};
+  for (const f of PRICED_FIELDS) counts[f] = Number((usage as any)[f] ?? 0) || 0;
+  if (OUTPUT_INCLUDES_REASONING.has(provider)) counts.reasoning = 0;
+  if (INPUT_INCLUDES_CACHE_READ.has(provider)) counts.cache_read = 0;
+  return Object.values(counts).reduce((a, b) => a + b, 0);
+}
+
+/**
  * Build a CostBreakdown from a cost the CALLER already knows.
  *
- * For a gateway that reports its own real, metered price per call (e.g.
- * Cloudflare AI Gateway's `cost` field), computing our own per-token
- * estimate via the OpenRouter/Bedrock tables would be redundant AND less
- * accurate than the number the gateway already gives us. This skips
- * `computeCost` entirely — there's one lump sum, not a per-field
- * breakdown, so `fields` is empty and the invalid/negative case floors to
- * 0 the same way `parseScaled` always has, rather than throwing or
- * silently mis-billing.
+ * For a gateway that reports its own real, metered price per call (e.g. Cloudflare AI
+ * Gateway's `cost`), our per-token estimate would be both redundant and less accurate
+ * than the number the gateway already has. Skips `computeCost` entirely: one lump sum,
+ * so `fields` is empty, and an invalid or negative input floors to 0 the way
+ * `parseScaled` always has rather than throwing or mis-billing.
  */
 export function computePrecomputedCost(usdCost: unknown, markupScaled: bigint): CostBreakdown {
   const baseScaled = parseScaled(usdCost) ?? 0n;
@@ -389,11 +446,18 @@ export function parseOpenRouter(data: unknown): OpenRouterTable {
     if (typeof id !== "string" || !isObj(pricing)) continue;
     const mp = emptyPrice("openrouter");
     for (const f of PRICED_FIELDS) mp[f] = parseScaled(pricing[OPENROUTER_FIELD_MAP[f]]);
+    // OpenRouter marks a MOVING alias with a leading "~" on the vendor
+    // ("~anthropic/claude-sonnet-latest"). The marker must be stripped or the vendor
+    // parses as "~anthropic", which is not in VENDOR_MAP, and every "-latest" alias
+    // becomes unpriceable despite carrying real pricing. Collision-free: no
+    // un-prefixed id duplicates a "~"-prefixed one.
+    const bare = id.startsWith("~") ? id.slice(1) : id;
     exact.set(id, mp);
-    const slash = id.indexOf("/");
+    if (bare !== id) exact.set(bare, mp);
+    const slash = bare.indexOf("/");
     if (slash > 0) {
-      const vendor = id.slice(0, slash).toLowerCase();
-      const suffix = id.slice(slash + 1);
+      const vendor = bare.slice(0, slash).toLowerCase();
+      const suffix = bare.slice(slash + 1);
       normMap.set(`${vendor}\n${norm(suffix)}`, mp);
     }
   }
@@ -417,7 +481,7 @@ export function lookupOpenRouter(table: OpenRouterTable, provider: string, model
   return (
     table.exact.get(`${vendor}/${model}`) ??
     table.norm.get(`${vendor}\n${norm(model)}`) ??
-    table.norm.get(`${vendor}\n${norm(stripVersion(model))}`) ??
+    table.norm.get(`${vendor}\n${norm(stripVersionOpenrouter(model))}`) ??
     null
   );
 }
@@ -476,9 +540,22 @@ export function parseCloudflareWorkersAi(models: unknown): Map<string, ModelPric
  * Exact match first; a version-suffix fallback covers the same drift we've
  * seen in practice — e.g. a live response naming a model "...instruct-v2"
  * when the catalog itself only lists "...instruct".
+ *
+ * The "workers-ai/" routing prefix comes off first. Cloudflare's catalog keys
+ * models as bare "@cf/...", but calling one through the gateway's `/compat`
+ * endpoint requires "workers-ai/@cf/..." — the form the README prescribes and the
+ * only form a streaming call can report. Without the strip, recognising the
+ * prefixed spelling as Workers AI upstream just moves the miss here.
  */
 export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model: string): ModelPrice | null {
-  return table.get(model) ?? table.get(stripVersion(model)) ?? null;
+  const bare = model.startsWith(WORKERS_AI_COMPAT_PREFIX)
+    ? model.slice(WORKERS_AI_COMPAT_PREFIX.length)
+    : model;
+  for (const candidate of bare === model ? [model] : [model, bare]) {
+    const hit = table.get(candidate) ?? table.get(stripVersion(candidate));
+    if (hit !== undefined) return hit;
+  }
+  return null;
 }
 
 // ----------------------------------------------------------------------
@@ -486,35 +563,52 @@ export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model:
 // ----------------------------------------------------------------------
 
 /**
- * Prefer a dated snapshot id (what OpenRouter actually lists models under)
- * over a "-latest"-style moniker. Falls back to shortest-then-alphabetical
- * so the choice is always deterministic even with no dated candidate in
- * the group.
+ * Normalize a dated Mistral suffix to a comparable number; newest = largest.
+ *
+ * Mistral's own convention is a 4-digit YYMM ("-2411", "-2603"), but the regex
+ * admits 4-8 digits and mixed widths do NOT compare correctly as raw strings:
+ * "20241101" sorts *below* "2411" lexicographically. Widening YYMM to YYYYMM00
+ * puts both shapes on one scale.
+ */
+function mistralDateKey(name: string): number {
+  const m = MISTRAL_DATED_ID.exec(name);
+  if (m === null) return -1;
+  const digits = m[0].slice(1); // drop the leading "-"
+  if (digits.length === 4) return Number(`20${digits}00`); // YYMM -> 20YY-MM, day unknown
+  return Number(digits); // YYYYMMDD, or an unexpected width taken at face value
+}
+
+/**
+ * Prefer the NEWEST dated snapshot id (what OpenRouter actually lists models
+ * under) over a "-latest"-style moniker.
+ *
+ * Newest, not shortest: every dated id in a family is the same length, so a
+ * shortest-then-alphabetical tie-break resolves on the DATE, ascending — which picks
+ * the OLDEST snapshot and prices the whole family at a years-old rate.
+ *
+ * Falls back to shortest-then-code-point when no dated candidate exists, so the choice
+ * is deterministic either way. NOT `localeCompare`: it is ICU/locale-dependent, so it
+ * is not reproducible across environments and made the two ports disagree on which
+ * canonical name to pick for the same input.
  */
 function pickMistralCanonical(names: string[]): string {
+  const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
   const dated = names.filter((n) => MISTRAL_DATED_ID.test(n));
-  const pool = dated.length > 0 ? dated : names;
-  return [...pool].sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+  if (dated.length > 0) {
+    return [...dated].sort((a, b) => mistralDateKey(b) - mistralDateKey(a) || byCodePoint(a, b))[0];
+  }
+  return [...names].sort((a, b) => a.length - b.length || byCodePoint(a, b))[0];
 }
 
 /**
  * Parse Mistral's `/v1/models` response into a `{alias: canonicalId}` map.
  *
- * Naively mapping "each name in this entry's `aliases` -> this entry's
- * `id`" is wrong: Mistral's real response lists EVERY name in a family as
- * its own top-level entry, each one's `aliases` pointing at the others —
- * e.g. `id="mistral-small-2603"`, `id="mistral-small-latest"`, AND
- * `id="magistral-small-latest"` each appear separately, each listing the
- * other two as `aliases`. A directional last-write-wins map is then
- * order-dependent and can resolve an alias to ANOTHER alias instead of the
- * real dated snapshot (confirmed live: this resolved "mistral-small-latest"
- * -> "magistral-small-latest", which OpenRouter doesn't list, instead of ->
- * "mistral-small-2603", which it does).
- *
- * Union-find instead: treat a model's id + its aliases as one connected
- * group regardless of which entry mentions which, then pick a single
- * canonical name per group (see `pickMistralCanonical`) and map every other
- * member of the group to it.
+ * Mistral lists EVERY name in a family as its own top-level entry, each one's
+ * `aliases` pointing at the others, so a directional last-write-wins map is
+ * order-dependent and can resolve an alias to ANOTHER alias rather than the dated
+ * snapshot OpenRouter actually lists. Union-find instead: id + aliases form one
+ * connected group whichever entry mentions which, then one canonical per group (see
+ * `pickMistralCanonical`) that every member maps to.
  */
 export function parseMistralAliases(data: unknown): Map<string, string> {
   const models = isObj(data) && Array.isArray(data.data) ? data.data : [];
@@ -560,7 +654,13 @@ export function parseMistralAliases(data: unknown): Map<string, string> {
     if (members.length < 2) continue; // no aliasing at all — nothing to resolve
     const canonical = pickMistralCanonical(members);
     for (const name of members) {
-      if (name !== canonical) result.set(name, canonical);
+      if (name === canonical) continue;
+      // An explicit dated snapshot is already the real id OpenRouter lists, so it
+      // must pass through untouched — never rewritten onto a sibling. Without this,
+      // requesting `mistral-large-2411` was remapped to the group's canonical and
+      // priced at THAT snapshot's rate instead of its own, a mispricing not a miss.
+      if (MISTRAL_DATED_ID.test(name)) continue;
+      result.set(name, canonical);
     }
   }
   return result;
@@ -732,14 +832,31 @@ export class HttpPricingFetcher implements PricingFetcher {
     const headers = { Authorization: `Bearer ${this.cloudflareApiToken}` };
     const models: unknown[] = [];
     let page = 1;
-    while (true) {
-      const url = `${cloudflareModelsUrl(this.cloudflareAccountId)}?per_page=50&page=${page}`;
+    for (;;) {
+      const url = `${cloudflareModelsUrl(this.cloudflareAccountId)}?per_page=${CF_PER_PAGE}&page=${page}`;
       const body = (await this.getJson(url, headers)) as Record<string, unknown>;
       const batch = Array.isArray(body.result) ? body.result : [];
-      models.push(...batch);
-      const resultInfo = isObj(body.result_info) ? body.result_info : {};
-      const total = typeof resultInfo.total_count === "number" ? resultInfo.total_count : models.length;
-      if (batch.length < 50 || models.length >= total) break;
+      // `push(...batch)` spreads every element as an argument, which throws
+      // RangeError once a batch is large enough — on exactly the one-wide-read
+      // pattern this is used for. A loop has no argument ceiling.
+      for (const m of batch) models.push(m);
+      // A SHORT page is the only reliable end-of-catalog signal. `result_info.total_count`
+      // is not — it can report several times the number the endpoint actually serves, so
+      // a `models.length >= total` test never fires — and it must never fall back to
+      // `models.length`, which breaks after page one and silently keeps a partial
+      // catalog.
+      if (batch.length < CF_PER_PAGE) break;
+      if (page >= CF_MAX_PAGES) {
+        // Bounded because this runs on the queue's flush tick, ahead of the drain —
+        // an endpoint that always returns a full page must not stall event delivery
+        // indefinitely. Truncation is reported rather than silent, since a short
+        // catalog reads as "these models are unpriced".
+        console.warn(
+          `[lago] cloudflare model catalog truncated at ${CF_MAX_PAGES} pages ` +
+            `(${models.length} models); prices for later models are unavailable`,
+        );
+        break;
+      }
       page++;
     }
     return parseCloudflareWorkersAi(models);
@@ -784,6 +901,10 @@ export class PricingProvider {
   // requiring a separate LagoConfig.mistralApiKey.
   private mistralApiKeyOverride: string | null = null;
   private refreshing = new Set<string>();
+  // Post-failure backoff, per source: current delay, and the earliest next attempt.
+  // Absent from both maps == healthy.
+  private retryDelayMs = new Map<string, number>();
+  private retryAfterMs = new Map<string, number>();
 
   constructor(
     opts: {
@@ -825,12 +946,27 @@ export class PricingProvider {
    * than throwing, since this is a hint, not a contract.
    */
   prime(providers: string[] = []): void {
-    this.openrouterStale = true;
+    // Gated on "is this table actually cold?", NOT unconditional. `wrap()` and
+    // `warmPricing()` both reach here and a server can run either per request, so
+    // flagging an in-TTL table stale means re-downloading the ~400-model OpenRouter
+    // catalogue on the next tick — `pricingTtlMs` would never apply on this path.
+    //
+    // "Cold" is the same test `lookup()` uses, so priming and looking up cannot
+    // disagree about what needs fetching.
+    if (this.isCold(this.openrouter, this.openrouterFetched)) this.openrouterStale = true;
     for (const p of providers) {
       const key = (p || "").toLowerCase();
-      if (key === "workers-ai") this.cloudflareStale = true;
-      else if (key === "mistral") this.mistralStale = true;
+      if (key === "workers-ai") {
+        if (this.isCold(this.cloudflareWorkersAi, this.cloudflareFetched)) this.cloudflareStale = true;
+      } else if (key === "mistral") {
+        if (this.isCold(this.mistralAliases, this.mistralFetched)) this.mistralStale = true;
+      }
     }
+  }
+
+  /** True when a table needs fetching: absent, or older than the TTL. */
+  private isCold(table: unknown | null, fetchedAt: number): boolean {
+    return table === null || Date.now() - fetchedAt >= this.ttlMs;
   }
 
   /**
@@ -883,7 +1019,14 @@ export class PricingProvider {
     }
   }
 
-  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale. */
+  /** Background refresh — awaited by the queue's loop. Fast-path no-op when nothing is stale.
+   *
+   * The four sources are independent: no ordering dependency, no shared state beyond
+   * their own table. They run CONCURRENTLY, so one slow or hanging endpoint delays only
+   * itself rather than everything queued behind it — a sequential walk of four 10s
+   * timeouts is a 40s tick. `allSettled` because `refreshSource` already contains every
+   * failure; it is here so one unexpected rejection can never leave the rest unawaited.
+   */
   async maybeRefresh(): Promise<void> {
     if (
       !this.openrouterStale &&
@@ -894,62 +1037,79 @@ export class PricingProvider {
       return;
     }
 
-    if (this.openrouterStale && !this.refreshing.has("openrouter")) {
-      this.refreshing.add("openrouter");
-      try {
-        const table = await this.fetcher.fetchOpenRouter();
-        this.openrouter = table;
-        this.openrouterFetched = Date.now();
-        this.openrouterStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchOpenRouter");
-      } finally {
-        this.refreshing.delete("openrouter");
-      }
+    const jobs: Array<Promise<void>> = [];
+
+    if (this.openrouterStale) {
+      jobs.push(
+        this.refreshSource("openrouter", "pricing.fetchOpenRouter", async () => {
+          const table = await this.fetcher.fetchOpenRouter();
+          this.openrouter = table;
+          this.openrouterFetched = Date.now();
+          this.openrouterStale = false;
+        }),
+      );
     }
 
-    if (this.cloudflareStale && !this.refreshing.has("cloudflare_workers_ai")) {
-      this.refreshing.add("cloudflare_workers_ai");
-      try {
-        const table = await this.fetcher.fetchCloudflareWorkersAi();
-        this.cloudflareWorkersAi = table;
-        this.cloudflareFetched = Date.now();
-        this.cloudflareStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchCloudflareWorkersAi");
-      } finally {
-        this.refreshing.delete("cloudflare_workers_ai");
-      }
+    if (this.cloudflareStale) {
+      jobs.push(
+        this.refreshSource("cloudflare_workers_ai", "pricing.fetchCloudflareWorkersAi", async () => {
+          const table = await this.fetcher.fetchCloudflareWorkersAi();
+          this.cloudflareWorkersAi = table;
+          this.cloudflareFetched = Date.now();
+          this.cloudflareStale = false;
+        }),
+      );
     }
 
-    if (this.mistralStale && !this.refreshing.has("mistral_aliases")) {
-      this.refreshing.add("mistral_aliases");
-      try {
-        const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
-        this.mistralAliases = aliases;
-        this.mistralFetched = Date.now();
-        this.mistralStale = false;
-      } catch (err) {
-        this.report(err, "pricing.fetchMistralAliases");
-      } finally {
-        this.refreshing.delete("mistral_aliases");
-      }
+    if (this.mistralStale) {
+      jobs.push(
+        this.refreshSource("mistral_aliases", "pricing.fetchMistralAliases", async () => {
+          const aliases = await this.fetcher.fetchMistralAliases(this.mistralApiKeyOverride);
+          this.mistralAliases = aliases;
+          this.mistralFetched = Date.now();
+          this.mistralStale = false;
+        }),
+      );
     }
 
     for (const region of [...this.bedrockStale]) {
-      const key = `bedrock:${region}`;
-      if (this.refreshing.has(key)) continue;
-      this.refreshing.add(key);
-      try {
-        const table = await this.fetcher.fetchBedrock(region);
-        this.bedrock.set(region, table);
-        this.bedrockFetched.set(region, Date.now());
-        this.bedrockStale.delete(region);
-      } catch (err) {
-        this.report(err, "pricing.fetchBedrock");
-      } finally {
-        this.refreshing.delete(key);
-      }
+      jobs.push(
+        this.refreshSource(`bedrock:${region}`, "pricing.fetchBedrock", async () => {
+          const table = await this.fetcher.fetchBedrock(region);
+          this.bedrock.set(region, table);
+          this.bedrockFetched.set(region, Date.now());
+          this.bedrockStale.delete(region);
+        }),
+      );
+    }
+
+    await Promise.allSettled(jobs);
+  }
+
+  /** Run one source's fetch, guarded by the in-flight set AND its retry backoff.
+   *
+   * A source stays flagged stale on failure — the event is still unpriced, so the
+   * retry must happen; `retryAfterMs` is what decides WHEN, instead of "every tick".
+   */
+  private async refreshSource(source: string, where: string, run: () => Promise<void>): Promise<void> {
+    if (this.refreshing.has(source)) return;
+    const notBefore = this.retryAfterMs.get(source);
+    if (notBefore !== undefined && Date.now() < notBefore) return;
+    this.refreshing.add(source);
+    try {
+      await run();
+      // Healthy again: the next failure starts the backoff over at 1s rather than
+      // inheriting a ceiling reached hours ago.
+      this.retryDelayMs.delete(source);
+      this.retryAfterMs.delete(source);
+    } catch (err) {
+      const prev = this.retryDelayMs.get(source) ?? 0;
+      const delay = prev === 0 ? FETCH_RETRY_BASE_MS : Math.min(prev * 2, FETCH_RETRY_MAX_MS);
+      this.retryDelayMs.set(source, delay);
+      this.retryAfterMs.set(source, Date.now() + delay);
+      this.report(err, where);
+    } finally {
+      this.refreshing.delete(source);
     }
   }
 

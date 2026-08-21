@@ -1,39 +1,14 @@
 /**
  * Cloudflare AI Gateway log adapter — maps a Logs API entry to CanonicalUsage.
  *
- * Verified against a real captured log entry (live account, real Anthropic call
- * routed through a real gateway, real Lago rollup confirmed exact).
+ * Reads both the list and single-entry Logs API shapes. No request-side model kwarg to
+ * reconcile: a log entry always names the model that actually served the request.
  *
- * Field mapping (`GET .../ai-gateway/gateways/{id}/logs` and the single-entry
- * `GET .../logs/{log_id}`):
- *   tokens_in                                       -> input
- *   tokens_out                                       -> output
- *   usage_metadata.input_cached_tokens               -> cache_read
- *   usage_metadata.input_cache_creation_tokens       -> cache_write
- *   usage_metadata.reasoningTokens/reasoning_tokens  -> reasoning
- *   model, provider                                  -> passed straight through
- *
- * `usage_metadata`'s exact key casing is NOT normalized by Cloudflare — it
- * passes through whatever convention the underlying provider's own usage
- * object used (Anthropic/OpenAI: snake_case `input_cached_tokens`; a real
- * captured Gemini entry: camelCase `reasoningTokens`). Both cases are checked
- * for every field we map; this is observed behavior across two providers,
- * not a documented guarantee, so a third provider could use a convention we
- * haven't seen yet.
- *
- * Unlike the provider-native adapters (`adapters/openai_native.ts`,
- * `adapters/anthropic_native.ts`), there is no request-side model kwarg to
- * prefer or fall back on here — a Cloudflare log entry always reports the
- * model that actually served the request. This adapter is immune, by
- * construction, to the alias-vs-resolved-model bug fixed in those two.
- *
- * Billing *policy* is deliberately not decided here — this module only
- * extracts. `cached`, `step`, and the log's own `id` land in `extras` because
- * the caller (the poller) needs them: `cached` to decide whether to skip
- * billing a request Cloudflare served for free, `id` as the idempotency key
- * against replays. `resolveSubscription()` is separate from extraction
- * because attribution can be absent, and dropping vs. warning on that is
- * also a caller policy decision.
+ * Billing *policy* is deliberately not decided here; this module only extracts. `cached`,
+ * `step` and the log's own `id` land in `extras` because the caller needs them — `cached`
+ * to skip a request Cloudflare served for free, `id` as the idempotency key against
+ * replays. `resolveSubscription()` is separate because attribution can be absent, and
+ * dropping vs. warning on that is the caller's policy too.
  */
 
 import { CanonicalUsage, makeCanonicalUsage } from "../../canonical.js";
@@ -52,21 +27,41 @@ function safeStr(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
-// Cloudflare AI Gateway logs its OWN provider vocabulary, which is not the name
-// the pricing tables and token-semantics tables key off — and not always its own
-// URL slug either (the logs say "workers-ai" where the endpoint path says
-// "workersai"). Passed through verbatim, "google-ai-studio" matched no vendor in
-// pricing's VENDOR_MAP, so every Gemini call backfilled through the gateway
-// missed on price; worse, it also missed INPUT_INCLUDES_CACHE_READ, so Gemini's
-// cache_read — a SUBSET of its input count, not additive — was billed twice.
+/**
+ * First of `names` present in `meta` with a usable value, as a number.
+ *
+ * The gateway does NOT normalize every key it forwards: its own counters are
+ * snake_case, but a provider's native key passes through untouched (the real Gemini
+ * entry carries camelCase `reasoningTokens`), so a cache key's spelling on a provider
+ * we have no capture for is unknown. Hence every plausible spelling is checked.
+ *
+ * A silent 0 here OVER-bills, it does not merely lose a field: `gemini` is in
+ * INPUT_INCLUDES_CACHE_READ, so `computeCost` needs `cache_read` populated in order to
+ * subtract the cached portion out of `input`.
+ *
+ * Falls through on zero as well as on a missing key — NOT `??`, which skips only
+ * null/undefined and would resolve to a zeroed duplicate key, losing the real count and
+ * disagreeing with Python's `or` chain.
+ */
+function firstInt(meta: Record<string, unknown>, ...names: string[]): number {
+  for (const name of names) {
+    const v = safeInt(meta[name]);
+    if (v) return v;
+  }
+  return 0;
+}
+
+// The gateway logs its OWN provider vocabulary, which is neither the name the pricing
+// and token-semantics tables key off nor even its own URL slug (logs say "workers-ai",
+// the endpoint path says "workersai"). An unmapped name misses VENDOR_MAP *and*
+// INPUT_INCLUDES_CACHE_READ — so it does not just fail to price, it double-bills the
+// cache overlap for a cache-inclusive provider.
 //
-// Only providers this SDK can actually price need an entry. Anything else passes
-// through unchanged: an unrecognized provider is one we have no table for, and a
-// clean miss falls back to token events, which is strictly better than inventing
-// a mapping. AWS Bedrock is deliberately absent for that reason — Bedrock prices
-// are keyed off `api.startsWith("bedrock")`, and this connector always sets
-// api="cloudflare_gateway", so mapping its provider name would route it to
-// OpenRouter under a vendor that cannot match. A miss there is honest.
+// Only providers this SDK can price need an entry; anything else passes through and
+// takes a clean miss to token events, which beats inventing a mapping. Bedrock is
+// deliberately absent: its prices key off `api.startsWith("bedrock")` and this
+// connector always sets api="cloudflare_gateway", so a mapping would route it to
+// OpenRouter under a vendor that cannot match.
 const PROVIDER_ALIASES: Record<string, string> = {
   "google-ai-studio": "gemini",
   "google-vertex-ai": "gemini",
@@ -97,9 +92,16 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
   return makeCanonicalUsage({
     input: safeInt(entry.tokens_in),
     output: safeInt(entry.tokens_out),
-    cache_read: safeInt(usageMeta.input_cached_tokens),
-    cache_write: safeInt(usageMeta.input_cache_creation_tokens),
-    reasoning: safeInt(usageMeta.reasoningTokens ?? usageMeta.reasoning_tokens),
+    // Gateway snake_case, then its camelCase, then the provider's own native name.
+    // See `firstNumber` for why all three are required.
+    cache_read: firstInt(usageMeta, "input_cached_tokens", "inputCachedTokens", "cachedContentTokenCount"),
+    cache_write: firstInt(
+      usageMeta,
+      "input_cache_creation_tokens",
+      "inputCacheCreationTokens",
+      "cache_creation_input_tokens",
+    ),
+    reasoning: firstInt(usageMeta, "reasoningTokens", "reasoning_tokens"),
     model: safeStr(entry.model),
     provider: normalizeProvider(entry.provider),
     api: "cloudflare_gateway",

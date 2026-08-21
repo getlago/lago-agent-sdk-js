@@ -37,7 +37,6 @@ class FakeBedrockRuntimeClient {
 
   async send(command: any) {
     this.sentCount++;
-    expect("__lago" in command).toBe(false); // wrapper must strip per-call lago opts
     if (command.constructor.name === "ConverseCommand") {
       return { usage: this.converseUsage, output: { message: { content: [] } } };
     }
@@ -176,17 +175,21 @@ describe("Bedrock wrapper", () => {
     expect(map.llm_output_tokens).toBe(14);
   });
 
-  it("strips __lago metadata from command before forwarding + applies per-call subscription", async () => {
+  it("applies per-call __lago opts without consuming them — a reused command still bills", async () => {
     const { sdk, received } = newSdk();
     const fake = new FakeBedrockRuntimeClient();
     const client = sdk.wrap(fake as any);
     const cmd = new FakeConverseCommand({ modelId: "eu.amazon.nova-lite-v1:0" }) as any;
     cmd.__lago = { subscription: "sub_per_call", dimensions: { feature: "X" } };
     await client.send(cmd);
+    // Deleting the key robbed a reused command of its options on every later send.
+    expect("__lago" in cmd).toBe(true);
+    await client.send(cmd);
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(2);
     expect(received.every((e) => e.external_subscription_id === "sub_per_call")).toBe(true);
-    expect(received[0].properties.feature).toBe("X");
+    expect(received.every((e) => e.properties.feature === "X")).toBe(true);
   });
 
   it("double-wrap is idempotent — emit once per call", async () => {

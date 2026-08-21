@@ -67,8 +67,11 @@ export function wrapBedrockClient(
   const originalSend = client.send.bind(client);
 
   const send = async (command: CommandLike, ...rest: unknown[]) => {
+    // Read, never delete: an AWS SDK v3 command is a class instance that cannot be
+    // safely shallow-copied, and the caller may reuse it. `send()` marshals
+    // `command.input` only, so a stray `__lago` property is ignored on the wire —
+    // deleting it just robbed a reused command of its options on the second send.
     const lagoOpts: LagoOpts = command[LAGO_KEY] || {};
-    if (LAGO_KEY in command) delete command[LAGO_KEY];
 
     const cmdName = command.constructor.name;
     const modelId = String(command.input?.modelId ?? "");
