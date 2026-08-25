@@ -10,6 +10,7 @@ import { LagoClient, LagoEvent } from "./lago_client.js";
 import {
   CostBreakdown,
   PricingProvider,
+  TOKEN_BILLED_PROVIDERS,
   applyMarkup,
   coerceMarkup,
   computeCost,
@@ -39,6 +40,27 @@ export interface LagoSDKOptions {
   verifySsl?: boolean;
   config?: Partial<LagoConfig>;
 }
+
+/**
+ * `LagoConfig` fields that `LagoSDKOptions` has no equivalent for. Presence of any of
+ * them means a config object was handed in where options were expected — see the
+ * constructor. `apiKey` / `apiUrl` / `defaultSubscriptionId` / `verifySsl` are
+ * deliberately absent: those exist on BOTH, so they are not evidence of the mistake.
+ */
+const CONFIG_ONLY_KEYS = [
+  "metricCodes",
+  "flushIntervalMs",
+  "maxBatchSize",
+  "maxBufferSize",
+  "requestTimeoutMs",
+  "maxRetryMs",
+  "onError",
+  "pricingMode",
+  "markup",
+  "costMetricCode",
+  "pricingTtlMs",
+  "bedrockDefaultRegion",
+] as const;
 
 export interface WrapOptions {
   dimensions?: Record<string, unknown>;
@@ -79,6 +101,39 @@ export interface WrapOptions {
    * all-or-nothing that rejection takes the whole batch with it.
    */
   eventId?: string;
+  /**
+   * Bill the events at this instant instead of at now — pass the source row's own
+   * time when replaying/backfilling from a gateway's logs, or a window reaching
+   * back a week bills every one of its calls into the period the script happens
+   * to run in. Accepts a `Date` or epoch seconds.
+   *
+   * Deliberately NOT an ISO-8601 string: `new Date()` accepts the trailing "Z"
+   * that gateway APIs emit while the Python port's `fromisoformat` rejects it on
+   * 3.10, which is still supported there — so a string would parse in one repo
+   * and fail in the other. Connectors parse their own source column instead,
+   * where the shapes that column really returns are known and tested (see
+   * `DatabricksUsageRow.occurredAt`). A live call has no source time and should
+   * leave this unset.
+   */
+  timestamp?: number | Date;
+}
+
+/** A caller-supplied event time as the unix seconds Lago's `timestamp` wants. */
+function toEpochSeconds(value: number | Date): number {
+  // A numeric STRING is refused, not coerced: `Number("1786112523")` would sail
+  // through here while the Python port's `isinstance` check rejects it, so the same
+  // input would bill in one repo and report an error in the other.
+  const ms = value instanceof Date ? value.getTime() : typeof value === "number" ? value * 1000 : NaN;
+  // An Invalid Date and a NaN both arrive here as NaN, as does anything that is
+  // neither a Date nor a number — the three cases the Python port raises on.
+  if (!Number.isFinite(ms)) {
+    throw new TypeError(
+      `timestamp=${JSON.stringify(value)} not understood — pass a Date or ` +
+        `epoch seconds (an ISO-8601 string is deliberately not accepted; see emit())`,
+    );
+  }
+  // `trunc`, not `floor`, so a pre-epoch stamp rounds the same way Python's `int()` does.
+  return Math.trunc(ms / 1000);
 }
 
 export class LagoSDK {
@@ -86,20 +141,63 @@ export class LagoSDK {
   private client: LagoClient;
   private queue: EventQueue;
   private pricing: PricingProvider;
+  /** (provider, model) pairs already noted as token-billed — see `noteTokenBilled`. */
+  private tokenBilledNoted = new Set<string>();
 
   constructor(opts: LagoSDKOptions) {
+    // `new LagoSDK(config)` is the natural-looking call, it TYPECHECKS — a `LagoConfig`
+    // is structurally assignable to `LagoSDKOptions`, both starting with a required
+    // `apiKey` — and it silently drops every field that only `config` can carry.
+    // Measured: a config with `pricingMode: "price"` and an `onError` hook built an SDK
+    // billing in TOKENS mode with no error hook wired and no warning anywhere, i.e. the
+    // wrong bill, delivered successfully. Python's twin of this mistake is positional
+    // (`LagoSDK(cfg)`) and 401s every event instead; both are silent, so both throw.
+    const misplaced = CONFIG_ONLY_KEYS.filter((k) => k in opts);
+    if (misplaced.length) {
+      throw new TypeError(
+        `LagoSDK takes { apiKey, config }, not a LagoConfig. These belong under ` +
+          `\`config\` and were being ignored: ${misplaced.join(", ")}. ` +
+          `Use new LagoSDK({ apiKey: config.apiKey, config }).`,
+      );
+    }
     // Explicit options win over `config`. Spread order is load-bearing: with `config`
     // last, a `config.apiUrl` would beat an explicitly passed `apiUrl` and bill a
     // different Lago instance than the Python port does.
+    //
+    // `apiUrl` is guarded on TRUTHINESS, not on `!== undefined` like its neighbours —
+    // an empty string must not win either. This used to be `!== undefined`, which meant
+    // the ports diverged on the same input: `apiUrl: process.env.LAGO_API_URL ?? ""`
+    // with the var unset wrote `""` here while Python kept its default. Downstream that
+    // is unrecoverable — `fetch("" + "/events/batch")` throws a plain TypeError, not a
+    // `LagoApiError`, so `isPermanentFailure` calls it transient, the batch is
+    // re-prepended and retried at the 60s ceiling forever. All billing stops, nothing is
+    // dropped or escalated, and the only symptom is a growing buffer. Falling back is
+    // right, but it must not be SILENT — see the report below.
     this.config = makeConfig({
       ...(opts.config || {}),
       apiKey: opts.apiKey,
-      ...(opts.apiUrl !== undefined ? { apiUrl: opts.apiUrl } : {}),
+      ...(opts.apiUrl ? { apiUrl: opts.apiUrl } : {}),
       ...(opts.defaultSubscriptionId !== undefined
         ? { defaultSubscriptionId: opts.defaultSubscriptionId }
         : {}),
       ...(opts.verifySsl !== undefined ? { verifySsl: opts.verifySsl } : {}),
     });
+    // A caller who passed `apiUrl` explicitly MEANT to point somewhere specific.
+    // Discarding a falsy one is the safe choice for delivery, but doing it silently is
+    // the one outcome that must not happen here: the default is PRODUCTION, so the
+    // fallback above now points a CI job or a developer holding a real production key at
+    // production Lago, which accepts every event — and ingested events cannot be
+    // un-ingested. Reported through the same log-plus-callback floor as every other drop
+    // path rather than trusting an opt-in callback to exist.
+    if (opts.apiUrl !== undefined && !opts.apiUrl) {
+      this.reportError(
+        new Error(
+          `apiUrl was explicitly set to an empty value; falling back to ${this.config.apiUrl}. ` +
+            `Set LAGO_API_URL (or pass config.apiUrl) if you did not intend to send events there.`,
+        ),
+        "config.apiUrl",
+      );
+    }
     this.client = new LagoClient(
       this.config.apiKey,
       this.config.apiUrl,
@@ -263,6 +361,11 @@ export class LagoSDK {
    */
   emit(usage: CanonicalUsage, opts: WrapOptions = {}): void {
     try {
+      // Resolved ONCE, ahead of every branch: a price-lookup miss falls through to
+      // the token path, so one usage row can reach two of the push paths below. Two
+      // separate `Date.now()` reads there let a call that straddles a billing-period
+      // boundary land half in each period.
+      const at = this.eventTime(opts.timestamp);
       const sub = this.resolveSubscription(opts.subscription);
       if (!sub) {
         this.reportError(new Error(`no subscription resolved for model=${usage.model}`), "emit");
@@ -283,7 +386,7 @@ export class LagoSDK {
             "pricing",
           );
         }
-        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
         return;
       }
       const [markupScaled, ok] = coerceMarkup(opts.markup ?? this.config.markup);
@@ -300,20 +403,47 @@ export class LagoSDK {
       // Python's `usd_cost is not None`.
       if (opts.usdCost != null) {
         breakdown = computePrecomputedCost(opts.usdCost, markupScaled);
+      } else if (TOKEN_BILLED_PROVIDERS.has(usage.provider)) {
+        // NOT a failure, so deliberately not routed through onError: this provider
+        // publishes no per-token rate at all, so token counts are the complete answer
+        // rather than a fallback. Said once per model instead of once per call. See
+        // TOKEN_BILLED_PROVIDERS for the reasoning.
+        this.noteTokenBilled(usage);
+        this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
+        return;
       } else {
         const price = this.pricing.lookup(usage.provider, usage.model, usage.api);
         if (price === null) {
           // Don't silently under-bill: fall back to token events + report.
           this.reportError(new PricingUnavailableError(usage.provider, usage.model, usage.api), "pricing");
-          this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId);
+          this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
           return;
         }
         breakdown = computeCost(usage, price, markupScaled);
       }
-      this.pushCostEvent(usage, breakdown, sub, opts.dimensions, opts.eventId);
+      this.pushCostEvent(usage, breakdown, sub, opts.dimensions, opts.eventId, at);
     } catch (err) {
       this.reportError(err, "emit");
     }
+  }
+
+  /**
+   * The instant to stamp this call's events with — the caller's, or now.
+   *
+   * A value we cannot read is reported and falls back to `now` rather than dropping
+   * the call. Stamping the wrong period is a reconciliation problem the operator can
+   * see and fix; losing the event is revenue that never appears at all. Same
+   * trade-off as a missed price lookup.
+   */
+  private eventTime(timestamp?: number | Date): number {
+    if (timestamp !== undefined && timestamp !== null) {
+      try {
+        return toEpochSeconds(timestamp);
+      } catch (err) {
+        this.reportError(err, "timestamp");
+      }
+    }
+    return Math.floor(Date.now() / 1000);
   }
 
   private emitTokenEvents(
@@ -321,9 +451,12 @@ export class LagoSDK {
     sub: string,
     dimensions?: Record<string, unknown>,
     eventId?: string,
+    at?: number,
   ): void {
     const counts = nonzeroNumeric(usage);
-    const now = Math.floor(Date.now() / 1000);
+    // `emit` already resolved the instant; the fallback covers nothing today and is
+    // kept only so this stays callable on its own without stamping the epoch.
+    const now = at ?? Math.floor(Date.now() / 1000);
     for (const field of NUMERIC_FIELDS) {
       const value = counts[field];
       if (!value) continue;
@@ -365,8 +498,10 @@ export class LagoSDK {
     sub: string,
     dimensions: Record<string, unknown> | undefined,
     eventId: string | undefined,
+    at?: number,
   ): void {
-    const now = Math.floor(Date.now() / 1000);
+    // See the note in `emitTokenEvents` — `emit` is the one authority on this.
+    const now = at ?? Math.floor(Date.now() / 1000);
     // Caller dimensions are spread LAST in each `properties` below, not here — they
     // must win over every SDK-computed key, exactly as they already do in
     // `emitTokenEvents`. Spreading them into `baseProperties` put them *before*
@@ -433,6 +568,22 @@ export class LagoSDK {
     }
   }
 
+  /**
+   * Say it once per model, at info level.
+   *
+   * It is a standing fact about the provider, not an event about this call, so repeating
+   * it per request would bury the log in something the reader can neither fix nor act on.
+   */
+  private noteTokenBilled(usage: CanonicalUsage): void {
+    const key = `${usage.provider}\u0000${usage.model}`;
+    if (this.tokenBilledNoted.has(key)) return;
+    this.tokenBilledNoted.add(key);
+    console.info(
+      `[lago] ${usage.provider} bills ${JSON.stringify(usage.model)} in its own units, not ` +
+        `per token — emitting token counts for it instead of a dollar cost`,
+    );
+  }
+
   private reportError(err: unknown, where: string): void {
     if (this.config.onError) {
       try {
@@ -441,6 +592,146 @@ export class LagoSDK {
         /* ignore */
       }
     }
+    // The LOG is the floor, not the callback: `onError` is opt-in, so a customer who
+    // never set one used to get literally nothing for a dropped event here while the
+    // Python port logged a warning for the same one — the two repos reported 0 lines
+    // vs 1 for an identical billing gap. Mirrors `_report_error`'s `logger.warning`.
+    console.warn(`[lago] ${where} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  /**
+   * Read a window of Databricks AI Gateway usage and bill all of it.
+   *
+   * The one-call entrypoint: give it a window, it does the rest. Returns counts of what
+   * it handed to `emit()`, e.g. `{cost: 56, tokens: 45, skipped: 0, deferred: 0}`.
+   *
+   * The last two are billing GAPS, and both are also reported through `config.onError`
+   * (`where: "backfill"`) — the hook every other gap in this SDK uses — so a caller does
+   * not have to inspect the return value to notice one. They fail differently: `skipped`
+   * rows had no resolvable subscription and stay lost until they are tagged or a default
+   * is set, while `deferred` buckets are billable revenue that the NEXT run of the same
+   * window collects once Databricks has aggregated their spend row. A run with both at 0
+   * is the only one that billed the whole window.
+   *
+   * Billing follows the rule the connector establishes rather than re-deriving it: a
+   * BYOK row carries Databricks' own metered USD and bills as a dollar cost; a
+   * Databricks-hosted row has no per-request dollar figure anywhere in Databricks'
+   * system tables and bills as token counts.
+   *
+   * `unified: true` bills everything to `defaultSubscription`, ignoring per-call
+   * `request_tags` — right when one gateway serves one customer. Left false, each row
+   * goes to the subscription its own tags name, falling back to `defaultSubscription`
+   * only when a row is untagged.
+   *
+   * Every event also carries the Databricks-side grouping key for its row —
+   * `endpoint_name` for hosted, `bucket` for BYOK — so grouping Lago the same way the
+   * Databricks page groups puts the two side by side. See
+   * `DatabricksUsageRow.reconcileDimensions`. Anything in `dimensions` is added on top
+   * and wins on a key collision.
+   *
+   * Idempotent: every event id is derived from the source row's own id and scoped by
+   * subscription, so re-running the same window has Lago reject the duplicates rather
+   * than double-bill. Does not flush — call `flush()` when you want to await delivery.
+   *
+   * `source` is normally a `DatabricksSource`, and `since` the window. It also accepts an
+   * already-read array of `DatabricksUsageRow` — pass one when you have inspected the rows
+   * first, so the window is read ONCE. Reading twice is not just slow: a SQL warehouse
+   * costs roughly 1,500x the model-serving usage it reports on, and rows landing between
+   * the two reads make the summary you printed disagree with what was billed.
+   */
+  async backfillDatabricks(
+    source: { readUsage(since: any, opts?: { eventIdPrefix?: string }): Promise<any[]> } | any[],
+    since: any = "1 day",
+    opts: {
+      defaultSubscription?: string;
+      unified?: boolean;
+      dimensions?: Record<string, unknown>;
+      eventIdPrefix?: string;
+    } = {},
+  ): Promise<{ cost: number; tokens: number; skipped: number; deferred: number }> {
+    const counts = { cost: 0, tokens: 0, skipped: 0, deferred: 0 };
+    const reader = Array.isArray(source) ? undefined : source;
+    const rows = reader
+      ? await reader.readUsage(since, { eventIdPrefix: opts.eventIdPrefix ?? "dbx" })
+      : (source as any[]);
+    for (const row of rows) {
+      const sub = opts.unified ? opts.defaultSubscription : row.subscription || opts.defaultSubscription;
+      if (!sub) {
+        // No attribution and no fallback — emit() would drop it anyway, but counting
+        // it here makes the gap visible instead of silent.
+        counts.skipped += 1;
+        continue;
+      }
+      // Row's own reconciliation key first, so an explicit caller dimension of the same
+      // name wins rather than being silently overwritten.
+      const dims = { ...row.reconcileDimensions, ...(opts.dimensions || {}) };
+      if (row.usdCost !== undefined) {
+        this.emit(row.usage, {
+          subscription: sub,
+          dimensions: dims,
+          mode: "price",
+          usdCost: row.usdCost,
+          // Keyed off the subscription actually billed, not the row's own tag — an
+          // untagged row billed to the default must not carry an id that blocks it
+          // from a different default on a later run.
+          eventId: row.eventIdFor(sub),
+          // The row's own time, not the run's — see `occurredAt`. A backfill that
+          // stamps `now` bills last week's usage into this week's period, and
+          // nothing in Lago can tell afterwards.
+          timestamp: row.occurredAt,
+        });
+        counts.cost += 1;
+      } else {
+        this.emit(row.usage, {
+          subscription: sub,
+          dimensions: dims,
+          mode: "tokens",
+          eventId: row.eventIdFor(sub),
+          timestamp: row.occurredAt,
+        });
+        counts.tokens += 1;
+      }
+    }
+
+    // Both gaps below were counted but never reported: measured live over a window with
+    // one hour's spend rows withheld — the shape of real spend-table lag — this returned
+    // `{cost: 12, tokens: 54, skipped: 0}` while 54 BYOK buckets went unbilled and
+    // `onError` fired zero times. `cost` alone dropping from 66 to 12 is not something an
+    // automated caller can read as a gap, so route both through the hook that already
+    // means "billing gap".
+    if (counts.skipped) {
+      this.reportError(
+        new Error(
+          `${counts.skipped} Databricks row(s) had no resolvable subscription and were NOT ` +
+            `billed. Pass defaultSubscription, set LagoConfig.defaultSubscriptionId, or tag ` +
+            `the calls.`,
+        ),
+        "backfill",
+      );
+    }
+    // Only the reader knows about a bucket it never yielded, so a caller who passed an
+    // already-read array gets 0 here — they hold the source and can read
+    // `deferredBuckets` off it directly. Optional because `source` is duck-typed: a
+    // caller's own reader need not carry the property.
+    const deferred = reader ? ((reader as any).deferredBuckets ?? []) : [];
+    counts.deferred = deferred.length;
+    if (deferred.length) {
+      const first = deferred[0];
+      // `readUsage` logs this too. That is deliberate, not a stutter: a caller who reads
+      // the window itself never reaches this line, and one who ran the backfill needs it on
+      // the channel they reconcile against. Worded from the RUN's side so the two read as
+      // one gap seen from two layers rather than as two gaps.
+      this.reportError(
+        new Error(
+          `this run left ${deferred.length} Databricks BYOK bucket(s) unbilled: no ` +
+            `external_model_spend row yet (e.g. hour=${first.hour} ` +
+            `provider=${first.provider} model=${first.model}). The spend table lags; ` +
+            `re-run this window later to bill them.`,
+        ),
+        "backfill",
+      );
+    }
+    return counts;
   }
 
   flush(timeoutMs: number = 5000): Promise<boolean> {

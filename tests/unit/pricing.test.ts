@@ -453,6 +453,26 @@ describe("de-overlapped token total (precomputed `unit` basis)", () => {
     [{ input: 10, output: 100, reasoning: 80, provider: "openai" }, 110],
     // tool_calls is a CALL COUNT, not tokens, so it must never land in a token total.
     [{ input: 10, output: 20, tool_calls: 3, provider: "openai" }, 30],
+    // --- gateway SURFACES that re-shape every vendor (OPENAI_SHAPED_APIS) ---
+    // Real shape from system.ai_gateway.usage: input CONTAINS cache_read even for
+    // Anthropic, whose own API reports it additively. Keying on the vendor billed
+    // 48,798 tokens against 31,091 consumed on a real backfill (1.570x). The honest
+    // total is the table's own total_tokens, i.e. input + output.
+    [{ input: 1822, output: 4, cache_read: 1812, provider: "anthropic", api: "databricks_gateway" }, 1826],
+    // The write half of the same shape — the overlap no provider-keyed set covers,
+    // because no vendor's native API reports cache_write inside input.
+    [{ input: 1825, output: 4, cache_write: 1812, provider: "anthropic", api: "databricks_gateway" }, 1829],
+    // Hosted Databricks models bill as TOKEN COUNTS (TOKEN_BILLED_PROVIDERS), so this
+    // path IS the bill. Latent today (0 of 96 hosted rows carry cache) and a direct
+    // 1.991x over-bill the day one does.
+    [{ input: 1825, output: 4, cache_read: 1812, provider: "databricks", api: "databricks_gateway" }, 1829],
+    // A vendor the surface set must NOT reach: reasoning is inside output here even
+    // though gemini reports thoughts additively on its own API.
+    [{ input: 500, output: 200, reasoning: 50, provider: "gemini", api: "databricks_gateway" }, 700],
+    // Cloudflare is deliberately NOT in OPENAI_SHAPED_APIS: measured on real logs, an
+    // anthropic entry reads input=10, output=4, total=14 with cache OUTSIDE that total.
+    // Adding it to the set would UNDER-bill by the cached portion.
+    [{ input: 10, output: 4, cache_read: 3429, provider: "anthropic", api: "cloudflare_gateway" }, 3443],
   ])("%o -> %i", (fields, expected) => {
     expect(deoverlappedTokenTotal(makeCanonicalUsage(fields as any))).toBe(expected);
   });
@@ -700,8 +720,14 @@ describe("computeCost / money", () => {
       const price = modelPrice(c.prices);
       // `provider` is optional and defaults to a name in no INCLUDES_ set, so
       // the pre-existing cases keep their original semantics; cases that pin
-      // per-provider token semantics set it explicitly.
-      const usage = makeCanonicalUsage({ ...c.counts, provider: c.provider ?? "p" });
+      // per-provider token semantics set it explicitly. `api` defaults to
+      // "native" for the same reason — only the cases pinning a gateway
+      // surface's own token shape (OPENAI_SHAPED_APIS) set it.
+      const usage = makeCanonicalUsage({
+        ...c.counts,
+        provider: c.provider ?? "p",
+        api: c.api ?? "native",
+      });
       const b = computeCost(usage, price, parseScaled(c.markup)!);
       expect(b.base, `${c.name}: base`).toBe(c.base);
       expect(b.total, `${c.name}: total`).toBe(c.total);
@@ -1266,6 +1292,92 @@ describe("SDK price mode", () => {
     expect(errors).toContain("PricingUnavailableError");
   });
 
+  it("token-billed provider emits tokens without reporting an error", async () => {
+    // A Databricks-hosted model has no per-token rate anywhere — not a cold table, not
+    // an unmatched name, none exists. So token counts are the complete answer, and
+    // calling that a failure on every request trains the reader to ignore onError.
+    const errors: string[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 11,
+        output: 4,
+        model: "meta-llama-4-maverick-040225",
+        provider: "databricks",
+        api: "chat_completions",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(errors).toEqual([]);
+  });
+
+  it("still reports a real price miss", async () => {
+    // The narrow exception above must not become a blanket silence: an unmatched model
+    // on a provider that DOES publish rates is a genuine miss the customer can act on.
+    const errors: string[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async () => {});
+    sdk.emit(makeCanonicalUsage({ input: 5, model: "no-such-model", provider: "anthropic", api: "native" }));
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(errors).toContain("PricingUnavailableError");
+  });
+
+  it("notes a token-billed provider once per model, not once per call", async () => {
+    // It is a standing fact about the provider, not an event about this call.
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const { sdk } = priceSdk(await warmProvider());
+      for (let i = 0; i < 3; i++) {
+        sdk.emit(
+          makeCanonicalUsage({ input: 1, model: "llama-4-maverick", provider: "databricks", api: "x" }),
+        );
+      }
+      sdk.emit(makeCanonicalUsage({ input: 1, model: "gpt-oss-20b", provider: "databricks", api: "x" }));
+      await sdk.shutdown(1000);
+      const notes = spy.mock.calls.filter((c) => String(c[0]).includes("in its own units"));
+      expect(notes).toHaveLength(2); // one per distinct model
+      expect(notes.some((c) => String(c[0]).includes("llama-4-maverick"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still prices BYOK traffic through the same gateway", async () => {
+    // TOKEN_BILLED_PROVIDERS keys on provider, so it covers Databricks-HOSTED models
+    // only — BYOK traffic through the same gateway is stamped with the real vendor and
+    // must keep pricing normally.
+    const { sdk, received } = priceSdk(await warmProvider());
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 100,
+        output: 50,
+        model: "claude-opus-4.8",
+        provider: "anthropic",
+        api: "native",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect([...new Set(received.map((e) => e.code))]).toEqual(["llm_cost"]);
+  });
+
   it("per-call mode='price' overrides global tokens default", async () => {
     const received: LagoEvent[] = [];
     const sdk = new LagoSDK({ apiKey: "x", defaultSubscriptionId: "sub_default" }); // global tokens
@@ -1556,6 +1668,66 @@ describe("SDK price mode", () => {
     expect(fetcher.mistralAliasesCalls).toBe(1);
     expect(provider.lookup("mistral", "mistral-small-latest", "native")).not.toBeNull();
     await sdk.shutdown(1000);
+  });
+});
+
+describe("date-suffix shapes — both vendors' conventions must strip", () => {
+  // OpenRouter lists BARE ids for the current OpenAI lineup; the API returns dated
+  // ones. `resolveModel` prefers the response's own name, so the dated form is what
+  // reaches lookup.
+  const BARE_OPENAI = parseOpenRouter({
+    data: ["gpt-4.1", "gpt-4.1-mini", "gpt-5", "gpt-5-mini", "o3", "o4-mini"].map((m) => ({
+      id: `openai/${m}`,
+      pricing: { prompt: "0.000001", completion: "0.000002" },
+    })),
+  });
+
+  it.each([
+    "gpt-4.1-2025-04-14",
+    "gpt-4.1-mini-2025-04-14",
+    "gpt-5-2025-08-07",
+    "gpt-5-mini-2025-08-07",
+    "o3-2025-04-16",
+    "o4-mini-2025-04-16",
+  ])("OpenAI hyphenated date suffix strips to a hit: %s", (dated) => {
+    // OpenAI stamps HYPHENATED dates ("gpt-5-2025-08-07"), Anthropic COMPACT ones
+    // ("claude-sonnet-4-5-20250929"). Handling only the compact shape silently broke
+    // price mode for every current OpenAI model — all six of these missed and fell
+    // back to token events. Verified against the live 400-model OpenRouter table
+    // before and after.
+    expect(lookupOpenRouter(BARE_OPENAI, "openai", dated)).not.toBeNull();
+  });
+
+  it.each([
+    ["claude-sonnet-4-5-20250929", "anthropic/claude-sonnet-4.5"],
+    ["claude-haiku-4-5-20251001", "anthropic/claude-haiku-4.5"],
+    ["claude-opus-4-5-20251101", "anthropic/claude-opus-4.5"],
+  ])("Anthropic compact date suffix still strips: %s", (dated, bare) => {
+    // Regression guard: widening the pattern must not break the compact form.
+    const t = parseOpenRouter({ data: [{ id: bare, pricing: { prompt: "0.000003" } }] });
+    expect(lookupOpenRouter(t, "anthropic", dated)).not.toBeNull();
+  });
+
+  it("a non-date suffix is not stripped", () => {
+    // `gpt-5.6-sol` resolves with a `-sol` suffix that is neither a date nor a
+    // version tag. It must be left intact — OpenRouter lists it verbatim, so
+    // stripping would turn a hit into a miss.
+    const t = parseOpenRouter({ data: [{ id: "openai/gpt-5.6-sol", pricing: { prompt: "0.000005" } }] });
+    expect(lookupOpenRouter(t, "openai", "gpt-5.6-sol")).not.toBeNull();
+  });
+
+  it("workers-ai model names are never date-stripped", () => {
+    // Workers AI ids carry dotted versions and fp8 suffixes, not dates. The widened
+    // pattern must leave them untouched or the Cloudflare catalog lookup breaks.
+    const cf = parseCloudflareWorkersAi([
+      {
+        name: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        properties: [
+          { property_id: "price", value: [{ currency: "USD", unit: "per M input tokens", price: 0.29 }] },
+        ],
+      },
+    ]);
+    expect(lookupCloudflareWorkersAi(cf, "@cf/meta/llama-3.3-70b-instruct-fp8-fast")).not.toBeNull();
   });
 });
 

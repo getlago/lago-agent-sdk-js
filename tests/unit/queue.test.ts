@@ -212,7 +212,13 @@ describe("EventQueue — permanent vs transient failures", () => {
 // aimed `maxBatchSize` extra requests at a server that had just asked us to
 // slow down.
 // ----------------------------------------------------------------------
-describe("EventQueue — throttling 4xx is transient", () => {
+// Which side of the permanent/transient line each 4xx belongs on. The test is whether a
+// DIFFERENT PAYLOAD is what it would take to succeed (permanent, so `sendIndividually`
+// can split the batch and save what is savable) or whether an OUT-OF-BAND change fixes
+// it (transient, so the events must be held — dropping them is unrecoverable, holding
+// them is bounded by `maxBufferSize`). See `PERMANENT_STATUSES` for what each status
+// cost when it was on the wrong side, measured over a real socket.
+describe("EventQueue — which 4xx is permanent", () => {
   it.each([429, 408])("retries rather than drops a %i", async (status) => {
     // Dropping loses revenue, and isolating one-by-one multiplies the load on
     // a server that is already shedding it.
@@ -260,15 +266,27 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
-  it.each([401, 403])("holds rather than drops a %i — credentials are not the batch", async (status) => {
-    // A rotated or revoked key is fixed out-of-band, so the events are still billable.
-    // Dropping them one-by-one discarded every event for the whole outage.
+  it.each([
+    [401, "a rotated or revoked key"],
+    [403, "a key that lost its scope"],
+    [402, "an unpaid account"],
+    [404, "a mistyped apiUrl"],
+    [415, "a proxy rejecting the media type"],
+  ])("holds rather than drops a %i — %s is not the batch", async (status, cause) => {
+    // None of these is a property of the BATCH, so dropping the events is unrecoverable
+    // while holding them is not. Each was in PERMANENT_STATUSES, which routes to
+    // sendIndividually: the batch fails, every isolated send fails the same way, and
+    // each event is logged and dropped for good. Measured over a real socket at a server
+    // returning 401 for 3s and then 200 — the shape of a key being put back — all 5
+    // events were destroyed inside the first second and none ever reached Lago. Held,
+    // all 5 were delivered when it healed. So this asserts recovery, not merely
+    // "not dropped".
     let attempts = 0;
     const delivered: string[] = [];
     const sender = async (batch: LagoEvent[]) => {
       attempts++;
-      if (attempts === 1) throw new LagoApiError(status, '{"error":"unauthorized"}');
-      for (const e of batch) delivered.push(e.transaction_id);
+      if (attempts === 1) throw new LagoApiError(status as number, String(cause));
+      for (const e of batch) delivered.push(e.transaction_id); // the out-of-band fix lands
     };
 
     const q = new EventQueue(sender, 50, 10, 10_000, 500);
@@ -278,7 +296,7 @@ describe("EventQueue — throttling 4xx is transient", () => {
       const deadline = Date.now() + 3000;
       while (Date.now() < deadline && delivered.length === 0) await sleep(50);
       expect(delivered).toEqual(["a", "b"]);
-      // Retried as one batch — never fanned out into per-event requests.
+      // Held as one batch — never fanned out into per-event requests.
       expect(attempts).toBe(2);
     } finally {
       await q.shutdown(2000);
@@ -309,7 +327,31 @@ describe("EventQueue — throttling 4xx is transient", () => {
     }
   });
 
-  it.each([400, 404, 409, 422])("still isolates and drops on a %i", async (status) => {
+  it.each([413])("splits a batch-only %i instead of head-of-line blocking", async (status) => {
+    // 413 is the one status where the SAME batch can never succeed but its events can
+    // individually, so isolating it is a real recovery rather than a formality.
+    // Measured over a real socket at an nginx-style server answering 413 above a byte
+    // limit and 200 below it: routed here, the split path delivered 5 of 5. Classified
+    // transient, it delivered 0 and stalled at the backoff ceiling forever.
+    const sentIndividually: number[] = [];
+    const sender = async (batch: LagoEvent[]) => {
+      if (batch.length > 1) throw new LagoApiError(status, "batch too large as-is");
+      sentIndividually.push(Number(batch[0].transaction_id)); // each event succeeds alone
+    };
+
+    const q = new EventQueue(sender, 50, 10, 10_000, 500);
+    try {
+      for (let i = 0; i < 4; i++) q.push(evId(String(i)));
+      expect(await q.flush(3000)).toBe(true);
+      expect(sentIndividually.sort()).toEqual([0, 1, 2, 3]);
+      // Splitting must not leave a stale backoff behind.
+      expect((q as unknown as { backoffMs: number }).backoffMs).toBe(0);
+    } finally {
+      await q.shutdown(1000);
+    }
+  });
+
+  it.each([400, 409, 413, 422])("still isolates and drops on a %i", async (status) => {
     // The statuses that genuinely cannot succeed on a re-send keep the
     // isolate-one-by-one behaviour, so a single bad transaction_id still
     // doesn't take the rest of its batch down with it.

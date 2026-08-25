@@ -57,6 +57,15 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 //                       `completion_tokens`. It is a separate provider only because it
 //                       prices against Cloudflare's catalog (see inferProvider in
 //                       adapters/openai_native.ts).
+//   mistral           — OpenAI-shaped API reporting `prompt_tokens_details.cached_tokens`
+//                       as a SUBSET of `prompt_tokens`. Mistral's own documented example
+//                       settles it: prompt=1013, cached=1008, total=1043 = prompt +
+//                       completion, which only reconciles if the cached tokens sit inside
+//                       the prompt count. Omitting it over-billed that payload by 6.15x,
+//                       and 13 of 18 Mistral models on OpenRouter publish a cache-read
+//                       rate, so the wrong path was reachable for most of them —
+//                       including Mistral routed through a Cloudflare gateway, since the
+//                       gateway adapter leaves provider="mistral" as-is.
 //
 // Workers AI's reasoning membership is latent, not live: measured against the real
 // gateway, `/compat` returns `completion_tokens_details: null` even for reasoning
@@ -65,8 +74,53 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // changes, the overlap has to already be known — and because the Python port
 // (_OUTPUT_INCLUDES_REASONING) has carried it since the same review, and the two
 // repos reporting different token quantities for one call is its own bug.
-const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai"]);
+const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai", "mistral"]);
 const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
+
+// Gateway SURFACES that re-report every vendor's usage in the OpenAI shape: `input`
+// already contains cache_read AND cache_write, and `output` already contains reasoning,
+// no matter which vendor actually served the call.
+//
+// Keys on `CanonicalUsage.api` rather than the provider because on a gateway it is the
+// SURFACE that decides the shape, and a surface row reuses the live vendor names. A
+// provider="anthropic" row read from Databricks' system table needs the correction; a
+// provider="anthropic" response from Anthropic's own API must NOT get it. The vendor
+// name cannot tell those two apart, so it is the wrong key — unlike "workers-ai" above,
+// which names a vendor reachable through exactly one surface and so works as a provider.
+//
+// Measured on `system.ai_gateway.usage`, 246 rows across 6 vendors: `total_tokens ==
+// input + output` for EVERY vendor group, with cache_read and cache_write inside input
+// and reasoning inside output. Anthropic's own API reports the exact opposite
+// (cache_read=3962 against input=9, additive), which is why keying on the vendor
+// over-billed a real backfill 1.570x — 48,798 tokens reported against 31,091 consumed,
+// the excess being exactly cache_read + cache_write.
+//
+// Cloudflare AI Gateway is deliberately ABSENT: its logs preserve each vendor's native
+// shape instead of normalising them. A real Anthropic entry there reads input=10,
+// output=4, total=14 with input_cached_tokens=3429 sitting OUTSIDE that total —
+// additive, exactly like the native API — so the provider-keyed sets are already right
+// for it and adding it here would UNDER-bill the cached portion.
+const OPENAI_SHAPED_APIS = new Set(["databricks_gateway"]);
+
+// Providers this SDK bills as TOKEN COUNTS by design, even in price mode — because no
+// per-token rate for them exists anywhere the SDK could read it.
+//
+// "databricks" means a Databricks-HOSTED foundation model (`system.ai.*`). Databricks
+// bills those in DBUs at a per-model rate published only as an HTML page — verified
+// absent from every column of all 88 system tables — so there is nothing to look up now
+// and nothing a later refresh could supply. Token counts are the honest, complete answer
+// for them, not a degraded one.
+//
+// This is a deliberate, NARROW exception to "a price miss is reported via onError". It
+// applies only where the miss is *structural and permanent*. A cold table, an unmatched
+// model name, a mistyped provider — all still report, because those are genuine misses a
+// customer can act on. Reporting this one on every call would be a permanent false
+// alarm, and an alarm that always fires is one nobody reads.
+//
+// Note this keys on the PROVIDER, so it only ever covers Databricks-hosted models: BYOK
+// traffic through the same gateway is stamped "openai"/"anthropic" and prices normally
+// (verified exact against Databricks' own metered spend, 38 of 38 buckets).
+export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set(["databricks"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -211,16 +265,40 @@ function alnum(s: string): string {
 }
 
 /**
- * Strip a trailing version/revision marker OpenRouter usually omits from its ids.
+ * Drop a trailing -YYYYMMDD / -YYYY-MM-DD date or -vN version tag.
  *
- * Shapes seen live: Anthropic's compact date ("-20250929"), an explicit "-v2", and
- * Gemini's 3-digit revision ("-002", which `model_version` can report where
- * OpenRouter lists only the bare name). Verified safe against the live 415-model
- * catalog: ZERO ids have a model part ending in exactly three digits, so the
- * "-\d{3}" arm cannot shorten a real listing.
+ * Vendors stamp resolved model names with a date in one of two shapes, and both
+ * must be strippable or the price lookup misses. Anthropic uses a COMPACT date
+ * ("claude-sonnet-4-5-20250929"); OpenAI uses a HYPHENATED one
+ * ("gpt-5-2025-08-07", "o3-2025-04-16"). OpenRouter lists the BARE id
+ * ("openai/gpt-5"), so a name we can't strip back to bare never matches.
+ *
+ * Handling only the compact form silently broke price mode for every current
+ * OpenAI model: `create({model: "gpt-5"})` returns model="gpt-5-2025-08-07", and
+ * `resolveModel` prefers the response's own name over the requested one, so
+ * gpt-4.1 / gpt-4.1-mini / gpt-5 / gpt-5-mini / o3 / o4-mini all fell through to
+ * token events. gpt-4o looked fine only by luck — OpenRouter happens to list
+ * "openai/gpt-4o-2024-08-06" verbatim.
  */
 function stripVersion(model: string): string {
-  return model.replace(/-(?:\d{8}|\d{3}|v\d+)$/, "");
+  return model.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2}|v\d+)$/, "");
+}
+
+/**
+ * `stripVersion`, plus Gemini's 3-digit revision ("-002", which `model_version`
+ * can report where OpenRouter lists only the bare name). OPENROUTER MATCHING ONLY.
+ *
+ * Deliberately not folded into `stripVersion`: that helper also builds the
+ * AWS/Bedrock price keys, where a shortened key does not merely miss but silently
+ * MIS-prices — `bedrockModelKey` feeds a map keyed by model, so two distinct models
+ * collapsing to one key overwrite each other's rate. All four live catalogs are
+ * currently clean (OpenRouter 415 ids, Cloudflare 64, AWS offer 77, captured Bedrock
+ * 39: zero model parts end in exactly three digits), but the arm was only ever
+ * motivated by OpenRouter, and scoping it makes that risk structurally zero instead
+ * of empirically zero. Mirrors `_strip_version_openrouter` in the Python port.
+ */
+function stripVersionOpenrouter(model: string): string {
+  return model.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{3}|v\d+)$/, "");
 }
 
 // ----------------------------------------------------------------------
@@ -249,27 +327,55 @@ export interface CostBreakdown {
 }
 
 /** The priced numeric fields computeCost reads — CanonicalUsage satisfies this. */
-export type CanonicalUsageLike = { [K in PricedField]: number } & { provider?: string };
+export type CanonicalUsageLike = { [K in PricedField]: number } & {
+  provider?: string;
+  api?: string;
+};
+
+/**
+ * Which of a record's subsets are ALREADY inside their parent count.
+ *
+ * Returns `[inputIncludesCacheRead, inputIncludesCacheWrite, outputIncludesReasoning]`,
+ * the three overlaps the billing paths have to remove. The SURFACE wins over the vendor:
+ * a gateway that re-reports usage in its own shape has already decided the convention,
+ * so `api` is checked first and the provider-keyed sets only answer for a native call.
+ *
+ * `cache_write` is surface-only by design and has no provider set to consult: Anthropic
+ * is the one vendor whose native API bills cache writes at all, and it reports them
+ * additively, so no native response needs the correction.
+ */
+function tokenSemantics(usage: CanonicalUsageLike): [boolean, boolean, boolean] {
+  const provider = (usage.provider || "").toLowerCase();
+  const shaped = OPENAI_SHAPED_APIS.has((usage.api || "").toLowerCase());
+  return [
+    shaped || INPUT_INCLUDES_CACHE_READ.has(provider),
+    shaped,
+    shaped || OUTPUT_INCLUDES_REASONING.has(provider),
+  ];
+}
 
 export function computeCost(
   usage: CanonicalUsageLike,
   price: ModelPrice,
   markupScaled: bigint,
 ): CostBreakdown {
-  const provider = (usage.provider || "").toLowerCase();
   const counts = {} as Record<PricedField, number>;
   for (const f of PRICED_FIELDS) counts[f] = Number(usage[f]) || 0;
-  // De-overlap subsets so a token is never billed twice (see the _INCLUDES_ sets):
+  // De-overlap subsets so a token is never billed twice (see `tokenSemantics`):
   //   • reasoning ⊆ output → bill it as output only (drop the separate line).
   //   • cache_read ⊆ input → bill the cached portion at the cache-read rate, so
   //     subtract it from input (only when a cache_read price exists).
-  if (OUTPUT_INCLUDES_REASONING.has(provider)) counts.reasoning = 0;
-  if (
-    INPUT_INCLUDES_CACHE_READ.has(provider) &&
-    price.cache_read !== null &&
-    price.cache_read !== undefined
-  ) {
+  //   • cache_write ⊆ input → same treatment, on the surfaces that report it that
+  //     way. Only one of cache_read/cache_write is non-zero on a given Databricks
+  //     row, but both are subtracted unconditionally so a surface that does report
+  //     both at once still reconciles.
+  const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(usage);
+  if (incReasoning) counts.reasoning = 0;
+  if (incCacheRead && price.cache_read !== null && price.cache_read !== undefined) {
     counts.input = Math.max(0, counts.input - counts.cache_read);
+  }
+  if (incCacheWrite && price.cache_write !== null && price.cache_write !== undefined) {
+    counts.input = Math.max(0, counts.input - counts.cache_write);
   }
 
   let baseScaled = 0n;
@@ -309,15 +415,18 @@ function finalizeBreakdown(
 }
 
 /**
- * Total tokens a call actually consumed, with per-provider overlaps removed.
+ * Total tokens a call actually consumed, with the reported overlaps removed.
  *
  * Sums the same PRICED_FIELDS the split cost path emits one event each for, so the
  * single-event `unit` equals the sum of the split path's `unit`s instead of
- * reporting a different basis. Both `_INCLUDES_` sets are applied, because a subset
- * counted twice inflates the reported quantity exactly as it would inflate a price:
+ * reporting a different basis. Every overlap `tokenSemantics` reports is applied,
+ * because a subset counted twice inflates the reported quantity exactly as it would
+ * inflate a price:
  *
- *   - reasoning ⊆ output for providers in OUTPUT_INCLUDES_REASONING
- *   - cache_read ⊆ input  for providers in INPUT_INCLUDES_CACHE_READ
+ *   - reasoning   ⊆ output — providers in OUTPUT_INCLUDES_REASONING, or any row
+ *     from a surface in OPENAI_SHAPED_APIS
+ *   - cache_read  ⊆ input  — providers in INPUT_INCLUDES_CACHE_READ, likewise
+ *   - cache_write ⊆ input  — surfaces in OPENAI_SHAPED_APIS only
  *
  * NOT gated on a unit price existing (unlike `computeCost`'s subtraction): a published
  * rate cannot change how many tokens were consumed. The two still agree in the case
@@ -328,11 +437,12 @@ function finalizeBreakdown(
  * and `cache_write_5m`/`_1h` are a breakdown OF `cache_write`.
  */
 export function deoverlappedTokenTotal(usage: CanonicalUsageLike): number {
-  const provider = (usage.provider || "").toLowerCase();
   const counts: Record<string, number> = {};
   for (const f of PRICED_FIELDS) counts[f] = Number((usage as any)[f] ?? 0) || 0;
-  if (OUTPUT_INCLUDES_REASONING.has(provider)) counts.reasoning = 0;
-  if (INPUT_INCLUDES_CACHE_READ.has(provider)) counts.cache_read = 0;
+  const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(usage);
+  if (incReasoning) counts.reasoning = 0;
+  if (incCacheRead) counts.cache_read = 0;
+  if (incCacheWrite) counts.cache_write = 0;
   return Object.values(counts).reduce((a, b) => a + b, 0);
 }
 
@@ -428,7 +538,7 @@ export function lookupOpenRouter(table: OpenRouterTable, provider: string, model
   return (
     table.exact.get(`${vendor}/${model}`) ??
     table.norm.get(`${vendor}\n${norm(model)}`) ??
-    table.norm.get(`${vendor}\n${norm(stripVersion(model))}`) ??
+    table.norm.get(`${vendor}\n${norm(stripVersionOpenrouter(model))}`) ??
     null
   );
 }

@@ -236,3 +236,102 @@ describe("OpenAI native adapter — synthetic edge cases", () => {
     expect(extractOpenAINative(null, "x").input).toBe(0);
   });
 });
+
+describe("nested drift sweep + total_tokens consistency guard", () => {
+  it("surfaces cache_write_tokens in extras but does NOT map it to cache_write", () => {
+    // Real captured `gpt-5.6-sol` shape. Two assertions, and the second matters
+    // most. The field must be SURFACED (it used to vanish entirely: extras swept
+    // only top-level keys and prompt_tokens_details is itself a known top-level
+    // key, so nothing nested was ever inspected). But it must NOT be mapped to
+    // cache_write — for OpenAI these tokens sit INSIDE prompt_tokens and bill at
+    // the plain input rate, while OpenRouter publishes a separate cache_write
+    // rate, so mapping them would charge the same 3022 tokens twice ($0.0341
+    // against a true $0.0152, 2.24x). Anthropic is the opposite case, which is
+    // why mapping is right there.
+    const resp = {
+      model: "gpt-5.6-sol",
+      usage: {
+        prompt_tokens: 3025,
+        completion_tokens: 4,
+        total_tokens: 3029,
+        prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 3022, audio_tokens: 0 },
+        completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0 },
+      },
+    };
+    const u = extractOpenAINative(resp);
+    expect(u.extras["prompt_tokens_details.cache_write_tokens"]).toBe(3022);
+    expect(u.cache_write).toBe(0);
+    expect(u.input).toBe(3025);
+  });
+
+  it("surfaces Predicted Outputs detail counts in extras", () => {
+    // The module doc promised customers could read these from extras. They never
+    // arrived, for the same nested-sweep reason. Now they do.
+    const u = extractOpenAINative({
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        completion_tokens_details: {
+          reasoning_tokens: 0,
+          accepted_prediction_tokens: 7,
+          rejected_prediction_tokens: 3,
+        },
+      },
+    });
+    expect(u.extras["completion_tokens_details.accepted_prediction_tokens"]).toBe(7);
+    expect(u.extras["completion_tokens_details.rejected_prediction_tokens"]).toBe(3);
+  });
+
+  it("recovers unaccounted output tokens from total_tokens", () => {
+    // Measured against Gemini through Google's own OpenAI-compatible layer:
+    // prompt=57, completion=47, total=1253. The 1149 thinking tokens are in
+    // NEITHER named bucket and there is no completion_tokens_details to recover
+    // them from — only total_tokens proves they exist. Billing prompt+completion
+    // drops 92% of the call, at the output rate.
+    //
+    // The remainder folds into `output`, deliberately NOT into `reasoning`:
+    // computeCost zeroes reasoning whenever provider is in
+    // OUTPUT_INCLUDES_REASONING, and an OpenAI-shaped payload is stamped
+    // provider="openai" by definition, so that would recover nothing.
+    const u = extractOpenAINative({
+      model: "gemini-2.5-flash",
+      usage: { prompt_tokens: 57, completion_tokens: 47, total_tokens: 1253 },
+    });
+    expect(u.input).toBe(57);
+    expect(u.output).toBe(1196);
+    expect(u.extras.unaccounted_output_tokens).toBe(1149);
+  });
+
+  it("is a no-op for genuine OpenAI responses", () => {
+    // For real OpenAI total_tokens == prompt + completion always holds, because
+    // reasoning is a SUBSET of completion rather than additive. Verified across
+    // every captured real response — zero deltas.
+    const cases: Record<string, unknown>[] = [
+      {
+        prompt_tokens: 31,
+        completion_tokens: 220,
+        total_tokens: 251,
+        completion_tokens_details: { reasoning_tokens: 220 },
+      },
+      {
+        prompt_tokens: 3026,
+        completion_tokens: 2,
+        total_tokens: 3028,
+        prompt_tokens_details: { cached_tokens: 2816 },
+      },
+      { prompt_tokens: 16, total_tokens: 16 }, // embeddings: no completion_tokens at all
+    ];
+    for (const usage of cases) {
+      const u = extractOpenAINative({ usage });
+      expect(u.output).toBe((usage.completion_tokens as number) ?? 0);
+      expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+    }
+  });
+
+  it("ignores a negative delta", () => {
+    // A total SMALLER than the parts is nonsense, not drift — never subtract.
+    const u = extractOpenAINative({ usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 10 } });
+    expect(u.output).toBe(50);
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+  });
+});

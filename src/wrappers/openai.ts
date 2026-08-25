@@ -127,12 +127,48 @@ function ensureStreamOptionsIncludeUsage(opts: Record<string, unknown> | undefin
   }
 }
 
+// A Databricks-HOSTED foundation model answers on the unified mlflow surface. It
+// has to be told apart from an OpenAI-BYOK call, which uses the SAME OpenAI class
+// against `/ai-gateway/openai/v1` — and the response gives no clue: a hosted call
+// echoes a served-entity name ("meta-llama-4-maverick-040225") with no
+// distinguishing marker, so inferProvider's model-string rule cannot see it.
+// `baseURL` is the only signal, and only the wrapper has it.
+//
+// Matching `/ai-gateway/mlflow/` specifically, NOT `/ai-gateway/`, is the whole
+// point: the openai and anthropic surfaces live under the same prefix and must keep
+// their real vendor provider so they price against OpenRouter.
+const DATABRICKS_HOSTED_PATH = "/ai-gateway/mlflow/";
+
+/**
+ * Return a provider override implied by the client's baseURL, or "".
+ *
+ * "databricks" matches no vendor in pricing's VENDOR_MAP, so a hosted call CANNOT
+ * hit a price table. `emit()` then emits token counts via TOKEN_BILLED_PROVIDERS with
+ * no error reported — that is the complete answer for these models, not a fallback.
+ * Deliberate: Databricks bills them in DBUs
+ * against its own rate card, which is published only as HTML and exists in no
+ * system table, while OpenRouter DOES list bare `openai/gpt-oss-20b` and
+ * `meta-llama/llama-4-maverick` at 0.2-0.4x of Databricks' real rate. Left as
+ * "openai", a rename of the served entity to an 8-digit date suffix would let
+ * stripVersion strip it into a match and silently under-bill 2.5-5x. Stamping
+ * "databricks" turns that accident into a guaranteed honest miss.
+ */
+export function providerHintFor(client: unknown): string {
+  try {
+    const url = String((client as { baseURL?: unknown })?.baseURL ?? "");
+    return url.includes(DATABRICKS_HOSTED_PATH) ? "databricks" : "";
+  } catch {
+    return "";
+  }
+}
+
 export function wrapOpenAIClient<T extends OpenAILike>(
   sdk: SDKLike,
   client: T,
   opts: WrapOpenAIOptions = {},
 ): T {
   const c = client as unknown as Record<symbol, unknown>;
+  const providerHint = providerHintFor(client);
   if (c[INSTRUMENTED]) return client;
 
   const baseDims = { ...(opts.dimensions || {}) };
@@ -147,7 +183,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
 
   const emitFrom = (payload: unknown, modelId: string, emitOpts: EmitOpts) => {
     try {
-      const usage = extractOpenAINative(payload, modelId);
+      const usage = extractOpenAINative(payload, modelId, providerHint);
       sdk.emit(usage, emitOpts);
     } catch (err) {
       if (typeof console !== "undefined") {
@@ -213,7 +249,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                       emitOnce(value);
                     }
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
+                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
                   }
                 } catch {
                   /* never break the call */
@@ -304,6 +340,16 @@ async function* wrapAsyncIterableStream(
   sdk: SDKLike,
   modelId: string,
   opts: EmitOpts,
+  // Deliberately NOT defaulted. "" is a legitimate value here — it is what every
+  // non-Databricks client resolves to — so a forgotten argument is indistinguishable
+  // at runtime from a real answer: the stream silently emits provider="openai" for a
+  // Databricks-HOSTED model, which drops it out of TOKEN_BILLED_PROVIDERS and lets a
+  // served-entity rename strip into OpenRouter's price for the same open-weight model
+  // (measured at 0.2-0.4x of the DBU rate). Requiring it makes a second stream surface
+  // a compile error instead of a wrong invoice. The Python port gets the same guarantee
+  // for free: its stream wrapper is nested inside `wrap_openai_client` and closes over
+  // `provider_hint`, so there is no argument to forget.
+  providerHint: string,
 ): AsyncIterable<unknown> {
   let lastUsage: Record<string, unknown> | null = null;
   try {
@@ -324,7 +370,7 @@ async function* wrapAsyncIterableStream(
   } finally {
     if (lastUsage) {
       try {
-        const usage = extractOpenAINative(lastUsage, modelId);
+        const usage = extractOpenAINative(lastUsage, modelId, providerHint);
         sdk.emit(usage, opts);
       } catch {
         /* swallow */

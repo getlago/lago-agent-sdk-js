@@ -37,6 +37,40 @@ const KNOWN_USAGE_FIELDS = new Set<string>([
   "output_tokens_details",
 ]);
 
+/**
+ * Nested keys inside the *_tokens_details sub-objects that we actually MAP onto a
+ * CanonicalUsage field. Anything nested that isn't listed here is drift and gets
+ * surfaced in `extras` under a dotted key.
+ *
+ * Sweeping only top-level keys was a real hole: `prompt_tokens_details` is itself
+ * a KNOWN top-level key, so nothing inside it was ever inspected. A live
+ * gpt-5.6-sol response carries `prompt_tokens_details.cache_write_tokens: 3022`
+ * and those 3022 tokens vanished with no error — a silent violation of the drift
+ * contract drift.test.ts exists to pin, which passed only because it never looked
+ * one level down.
+ *
+ * NOTE the billing subtlety: cache_write_tokens must NOT be mapped to
+ * CanonicalUsage.cache_write. For OpenAI it sits INSIDE prompt_tokens (measured:
+ * prompt_tokens=3025 with cache_write_tokens=3022) and bills at the plain input
+ * rate — Databricks charged exactly what billing all 3025 as input produces. But
+ * OpenRouter does publish a separate cache_write rate for the model, so mapping it
+ * would charge those tokens twice: $0.0341 against a true $0.0152, a 2.24x
+ * over-bill. Anthropic is the opposite — its cache_creation_input_tokens sits
+ * OUTSIDE input_tokens, which is why mapping is correct there and wrong here.
+ * Surfacing in extras keeps the field visible without touching the money.
+ */
+const MAPPED_DETAIL_FIELDS: Record<string, Set<string>> = {
+  prompt_tokens_details: new Set(["cached_tokens", "audio_tokens"]),
+  input_tokens_details: new Set(["cached_tokens", "audio_tokens"]),
+  completion_tokens_details: new Set(["reasoning_tokens", "audio_tokens"]),
+  // NOTE `output_tokens_details` deliberately omits `audio_tokens`: the Responses branch
+  // hardcodes `audioOutput = 0` because the API does not expose it today, so listing it
+  // here would exclude a real, unmapped count from `extras` — 500 audio tokens vanishing
+  // with no error, the exact hole this table closes. Add it back only together with a
+  // Responses branch that reads it.
+  output_tokens_details: new Set(["reasoning_tokens"]),
+};
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
@@ -91,8 +125,19 @@ function inferProvider(resolvedModel: string): string {
  *
  * Accepts the SDK's pydantic-like objects, dicts (e.g. captured fixtures), or
  * a synthetic `{ usage: {...} }` blob produced by the streaming wrapper.
+ *
+ * `providerHint` overrides the model-string inference. Only the wrapper can supply
+ * it, because the only reliable signal for some gateways is the client's `baseURL`
+ * — which the response never carries. Databricks is the case that forced it: a
+ * Databricks-HOSTED model answers on `/ai-gateway/mlflow/v1` but echoes a
+ * served-entity name ("meta-llama-4-maverick-040225") with no marker of its own, so
+ * no rule based on the model string can identify it. See `wrappers/openai.ts`.
  */
-export function extractOpenAINative(response: unknown, modelId: string = ""): CanonicalUsage {
+export function extractOpenAINative(
+  response: unknown,
+  modelId: string = "",
+  providerHint: string = "",
+): CanonicalUsage {
   const resp: Record<string, unknown> = isObject(response) ? response : {};
   const usage: Record<string, unknown> = isObject(resp.usage) ? resp.usage : {};
 
@@ -147,6 +192,57 @@ export function extractOpenAINative(response: unknown, modelId: string = ""): Ca
     if (!KNOWN_USAGE_FIELDS.has(k)) extras[k] = v;
   }
 
+  // Drift sweep one level down, into the *_tokens_details sub-objects. Without
+  // this, an unrecognized nested field is silently dropped (see
+  // MAPPED_DETAIL_FIELDS) because its container is a known top-level key.
+  for (const [container, mapped] of Object.entries(MAPPED_DETAIL_FIELDS)) {
+    const sub = usage[container];
+    if (!isObject(sub)) continue;
+    for (const [k, v] of Object.entries(sub)) {
+      if (!mapped.has(k)) extras[`${container}.${k}`] = v;
+    }
+  }
+
+  // Consistency guard: for genuine OpenAI, total_tokens always equals
+  // prompt + completion (reasoning is a SUBSET of completion, never additive).
+  // Verified across every captured real OpenAI-shaped response — zero deltas.
+  // So a POSITIVE delta means tokens exist that neither named bucket accounts
+  // for, which only happens behind an OpenAI-COMPATIBLE proxy that under-reports.
+  //
+  // Measured on Gemini through Google's own OpenAI-compat layer:
+  // prompt_tokens=57, completion_tokens=47, total_tokens=1253 — 1149 real
+  // thinking tokens reported nowhere, and no completion_tokens_details to
+  // recover them from. Billing prompt+completion drops 92% of the call, at the
+  // output rate. Folding the remainder into `output` is the honest read: the
+  // provider's own total proves those tokens were generated.
+  //
+  // Deliberately NOT assigned to `reasoning`: computeCost zeroes reasoning for
+  // providers in OUTPUT_INCLUDES_REASONING, so for real OpenAI that would set the
+  // field and immediately discard it, recovering nothing.
+  //
+  // `reasoning` is subtracted from the accounted total, and that subtraction is
+  // load-bearing rather than cosmetic. This adapter no longer only ever emits
+  // provider="openai" — it also emits "workers-ai" (Cloudflare `/compat`) and
+  // "databricks" (via providerHint), and for those computeCost bills reasoning
+  // ADDITIVELY. A payload reporting both `reasoning_tokens` and an inflated
+  // `total_tokens` would then be charged for them twice: once inside the grown
+  // `output` and again as a separate reasoning line. Subtracting first means a
+  // provider that already broke reasoning out gets no second bill, while the case
+  // this guard exists for — a thinking model behind a proxy that reports NO
+  // breakdown at all (measured: prompt 57, completion 47, total 1253) — still
+  // recovers its 1,149 tokens, because reasoning is 0 there.
+  //
+  // A no-op for real OpenAI either way: total always equals prompt + completion.
+  const declaredTotal = safeInt(usage.total_tokens);
+  if (declaredTotal) {
+    const unaccounted =
+      declaredTotal - (extracted.inputTokens + extracted.outputTokens + extracted.reasoning);
+    if (unaccounted > 0) {
+      extracted.outputTokens += unaccounted;
+      extras.unaccounted_output_tokens = unaccounted;
+    }
+  }
+
   const resolvedModel = resolveModel(resp.model, modelId);
 
   return makeCanonicalUsage({
@@ -158,7 +254,7 @@ export function extractOpenAINative(response: unknown, modelId: string = ""): Ca
     audio_output: extracted.audioOutput,
     tool_calls: extracted.toolCalls,
     model: resolvedModel,
-    provider: inferProvider(resolvedModel),
+    provider: providerHint || inferProvider(resolvedModel),
     api: extracted.api,
     extras,
   });
