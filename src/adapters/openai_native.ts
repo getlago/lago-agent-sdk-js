@@ -232,11 +232,43 @@ export function extractOpenAINative(
   // breakdown at all (measured: prompt 57, completion 47, total 1253) — still
   // recovers its 1,149 tokens, because reasoning is 0 there.
   //
+  // The cache counts are subtracted for the SAME reason as reasoning, and this was
+  // the half that was missing. The guard assumed every OpenAI-shaped surface reports
+  // cache_read INSIDE prompt_tokens, which held for all three surfaces that existed
+  // when it was written (native OpenAI: zero deltas; Databricks: 112/112 rows with
+  // total == input + output; Cloudflare: cache outside `input` but outside `total`
+  // too, so it never inflated the delta). Snowflake Cortex is the surface that broke
+  // it — an OpenAI-WIRE endpoint with Anthropic's ADDITIVE convention: measured
+  // 2026-08-25, prompt_tokens=7, cached_tokens=4805, completion_tokens=6,
+  // total_tokens=4818, i.e. the cached block sits OUTSIDE prompt_tokens and INSIDE
+  // total_tokens. Accounting for only input+output+reasoning made those 4,805 cached
+  // tokens look unaccounted, so they were folded into `output` — 4,811 reported for a
+  // call that generated 6, while the same tokens also shipped as cache_read. 2.0x on
+  // the call, 800x on the output line. See 09_snowflake_cortex_cache_chat.json.
+  //
+  // `cache_write_tokens` is read straight from the payload rather than from a
+  // canonical field because it is deliberately NOT mapped to CanonicalUsage.cache_write
+  // (for OpenAI it sits inside prompt_tokens and billing it separately over-charges
+  // 2.24x — see MAPPED_DETAIL_FIELDS). It still has to be accounted for here, or an
+  // additive cache WRITE would inflate `output` exactly the way the read did.
+  //
+  // Subtracting them cannot suppress a genuine fold on a subtractive surface: there
+  // the cache counts are already inside `input`, so removing them again only drives
+  // the delta further negative, where the `> 0` guard already no-ops. Verified against
+  // every captured OpenAI, Databricks and Cloudflare fixture — all still 0.
+  //
   // A no-op for real OpenAI either way: total always equals prompt + completion.
   const declaredTotal = safeInt(usage.total_tokens);
   if (declaredTotal) {
+    const promptDetails = isObject(usage.prompt_tokens_details) ? usage.prompt_tokens_details : {};
+    const cacheWrite = safeInt(promptDetails.cache_write_tokens);
     const unaccounted =
-      declaredTotal - (extracted.inputTokens + extracted.outputTokens + extracted.reasoning);
+      declaredTotal -
+      (extracted.inputTokens +
+        extracted.outputTokens +
+        extracted.reasoning +
+        extracted.cacheRead +
+        cacheWrite);
     if (unaccounted > 0) {
       extracted.outputTokens += unaccounted;
       extras.unaccounted_output_tokens = unaccounted;
