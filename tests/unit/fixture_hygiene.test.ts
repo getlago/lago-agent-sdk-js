@@ -4,8 +4,9 @@
  * These fixtures are captured from live provider and gateway calls, and both repos
  * publish to a PUBLIC package registry. A capture therefore arrives carrying whatever
  * the provider chose to log about the operator who made it — `system.ai_gateway.usage`
- * records the caller's account email and source IP on every row, neither of which any
- * adapter reads. Twenty-two Databricks fixtures shipped with a personal Gmail address,
+ * records the caller's account email and source IP on every row, and Snowflake's Cortex
+ * views name the caller in ROLE_NAMES and carry a customer-controlled QUERY_TAG — none of
+ * which any adapter reads. Twenty-two Databricks fixtures shipped with a personal Gmail address,
  * a residential IP, a real workspace subdomain and one live Lago subscription id before
  * this test existed.
  *
@@ -27,8 +28,15 @@ const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 // A Databricks workspace subdomain is a real, addressable host.
 const DBX_HOST = /\bdbc-[0-9a-f]{4,}-[0-9a-f]{4,}\b/g;
 
+// Snowflake's ACCOUNT_USAGE views name the caller in ROLE_NAMES as `USER$<login>`, and
+// a Snowflake account hostname is a real, addressable host. No adapter reads either.
+const SF_USER_ROLE = /\bUSER\$[A-Za-z0-9_]+/g;
+const SF_HOST = /\b[A-Za-z0-9][A-Za-z0-9-]*\.snowflakecomputing\.com\b/g;
+
 const ALLOWED_EMAIL_DOMAINS = new Set(["example.com", "example.org", "example.net"]);
 const PLACEHOLDER_DBX_HOST = "dbc-00000000-0000";
+const PLACEHOLDER_SF_USER = "USER$EXAMPLE_USER";
+const PLACEHOLDER_SF_HOST = "example-account.snowflakecomputing.com";
 
 function fixtures(dir: string = FIXTURE_ROOT): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
@@ -89,5 +97,15 @@ describe("fixture hygiene", () => {
   it("names no real Databricks workspace hosts", () => {
     const offenders = scan(DBX_HOST, (m) => (m[0] === PLACEHOLDER_DBX_HOST ? null : m[0]));
     expect(offenders, `fixtures name a real Databricks workspace — use ${PLACEHOLDER_DBX_HOST}`).toEqual([]);
+  });
+
+  it("names no real Snowflake users", () => {
+    const offenders = scan(SF_USER_ROLE, (m) => (m[0] === PLACEHOLDER_SF_USER ? null : m[0]));
+    expect(offenders, `fixtures name a real Snowflake user — use ${PLACEHOLDER_SF_USER}`).toEqual([]);
+  });
+
+  it("names no real Snowflake account hosts", () => {
+    const offenders = scan(SF_HOST, (m) => (m[0] === PLACEHOLDER_SF_HOST ? null : m[0]));
+    expect(offenders, `fixtures name a real Snowflake account — use ${PLACEHOLDER_SF_HOST}`).toEqual([]);
   });
 });

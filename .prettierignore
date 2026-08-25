@@ -3,3 +3,8 @@ node_modules/
 package-lock.json
 # Captured provider responses — preserve original whitespace
 tests/unit/adapters/fixtures/
+# Same for captured gateway rows. These are byte-compared against the Python port's
+# copies (`diff -r` must be clean), so prettier must not reserialize them — it rewrites
+# number literals (7.513e-06 -> 7.513e-6) and object spacing, which silently breaks
+# parity on every recapture even though no value changes.
+tests/unit/gateway/adapters/fixtures/
