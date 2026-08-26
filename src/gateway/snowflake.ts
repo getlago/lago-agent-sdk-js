@@ -78,6 +78,7 @@ import { createHash } from "node:crypto";
 
 import { type CanonicalUsage, nonzeroNumeric } from "../canonical.js";
 import {
+  column,
   extractSnowflakeFunctionsLog,
   extractSnowflakeRestLog,
   resolveSnowflakeSubscription,
@@ -813,21 +814,6 @@ export class SnowflakeSource {
 // ----------------------------------------------------------------------
 // helpers
 // ----------------------------------------------------------------------
-
-/**
- * Read a column by name, tolerating the case Snowflake actually returned.
- *
- * Same rule as the adapter's own `column()`: unquoted identifiers fold to UPPERCASE,
- * which is what the SQL API yields, but a quoted lowercase alias survives and a caller who
- * normalized keys themselves would otherwise read zeros out of a row that has every value.
- */
-function column(row: Record<string, unknown>, name: string): unknown {
-  if (name in row) return row[name];
-  const upper = name.toUpperCase();
-  if (upper in row) return row[upper];
-  const lower = name.toLowerCase();
-  return lower in row ? row[lower] : undefined;
-}
 
 /** A string value, or "" for anything else. Never coerces a number. */
 function str(value: unknown): string {
