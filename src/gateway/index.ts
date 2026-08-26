@@ -16,3 +16,17 @@ export * from "./adapters/index.js";
 // adapters stay pure; this is their sibling, not their replacement.
 export { DatabricksSource, DatabricksUsageRow, floorHour, timestampSql, windowBounds } from "./databricks.js";
 export type { DatabricksSourceOptions } from "./databricks.js";
+// Snowflake is the same situation as Databricks and for the same reason: no logs API,
+// only ACCOUNT_USAGE views over the SQL Statement Execution API. Its window helpers are
+// deliberately NOT re-exported under the Databricks names — `floorHour` above is
+// Databricks', and one shared spelling would hide which reader's rules apply.
+export {
+  FUNCTIONS_COLUMNS,
+  REST_COLUMNS,
+  SnowflakeSource,
+  SnowflakeUsageRow,
+  floorHour as snowflakeFloorHour,
+  timestampSql as snowflakeTimestampSql,
+  windowBounds as snowflakeWindowBounds,
+} from "./snowflake.js";
+export type { DeferredRow, ReadUsageOptions, SnowflakeSourceOptions, SnowflakeView } from "./snowflake.js";
