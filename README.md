@@ -252,7 +252,7 @@ for (const row of await source.readUsage("7 days")) {
 }
 ```
 
-Reading the system tables needs a PAT with the **`sql`** scope plus a SQL warehouse — the live calls above need neither. The Python repo's `examples/databricks_gateway_demo.ipynb` is a complete worked example of both halves. The pure `extractDatabricksLog(row)` / `resolveDatabricksSubscription(row)` functions stay available from `lago-agent-sdk/gateway/adapters` if you already have rows from `@databricks/sql` or your own warehouse job.
+Reading the system tables needs a PAT with the **`sql`** scope plus a SQL warehouse — the live calls above need neither. The pure `extractDatabricksLog(row)` / `resolveDatabricksSubscription(row)` functions stay available from `lago-agent-sdk/gateway/adapters` if you already have rows from `@databricks/sql` or your own warehouse job.
 
 **One cost note:** a SQL warehouse is a real cost centre. Measured on a test workspace, the warehouse queries cost roughly 1,500× the model-serving usage they were reporting on. Run the backfill as one query over a wide window, never as a tight polling loop.
 
@@ -353,7 +353,7 @@ Error code `003001` has four distinct causes — account entitlement, unknown mo
 
 **One cost note:** a SQL warehouse is a real cost centre. Measured on the equivalent Databricks setup, warehouse queries cost roughly 1,500× the model-serving usage they reported on. Run the backfill as one query over a wide window, never as a tight polling loop.
 
-The pure `extractSnowflakeFunctionsLog(row)` / `extractSnowflakeRestLog(row)` / `resolveSnowflakeSubscription(row)` functions stay available from `lago-agent-sdk/gateway/adapters` if you already have rows from your own warehouse job. The Python repo's `examples/snowflake_cortex_demo.ipynb` is a complete worked example of both halves.
+The pure `extractSnowflakeFunctionsLog(row)` / `extractSnowflakeRestLog(row)` / `resolveSnowflakeSubscription(row)` functions stay available from `lago-agent-sdk/gateway/adapters` if you already have rows from your own warehouse job.
 
 ## Multi-tenant — pick a subscription per call
 
