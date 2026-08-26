@@ -127,36 +127,69 @@ function ensureStreamOptionsIncludeUsage(opts: Record<string, unknown> | undefin
   }
 }
 
-// A Databricks-HOSTED foundation model answers on the unified mlflow surface. It
-// has to be told apart from an OpenAI-BYOK call, which uses the SAME OpenAI class
-// against `/ai-gateway/openai/v1` — and the response gives no clue: a hosted call
-// echoes a served-entity name ("meta-llama-4-maverick-040225") with no
-// distinguishing marker, so inferProvider's model-string rule cannot see it.
-// `baseURL` is the only signal, and only the wrapper has it.
+// Provider overrides implied by the client's `baseURL`, in match order — the first
+// substring found wins. A TABLE rather than a chain of `if`s: this is the second
+// surface to need the mechanism and a third (Ramp) is already coming, and each extra
+// `if` is one more place to get the try/catch and the ordering wrong. Order matters
+// only where one entry's substring is a prefix of another's; keep the more specific
+// entry first.
 //
-// Matching `/ai-gateway/mlflow/` specifically, NOT `/ai-gateway/`, is the whole
-// point: the openai and anthropic surfaces live under the same prefix and must keep
-// their real vendor provider so they price against OpenRouter.
-const DATABRICKS_HOSTED_PATH = "/ai-gateway/mlflow/";
+// Every entry matches a PATH, never a host, and that is the whole design: both of
+// these vendors serve plenty of non-inference APIs from the very same host.
+export const PROVIDER_BY_BASE_URL_PATH: ReadonlyArray<readonly [string, string]> = [
+  // A Databricks-HOSTED foundation model answers on the unified mlflow surface. It
+  // has to be told apart from an OpenAI-BYOK call, which uses the SAME OpenAI class
+  // against `/ai-gateway/openai/v1` — and the response gives no clue: a hosted call
+  // echoes a served-entity name ("meta-llama-4-maverick-040225") with no
+  // distinguishing marker, so inferProvider's model-string rule cannot see it.
+  // Matching `/ai-gateway/mlflow/`, NOT `/ai-gateway/`, is the point: the openai and
+  // anthropic BYOK surfaces live under that same prefix and must keep their real
+  // vendor provider so they price against OpenRouter.
+  ["/ai-gateway/mlflow/", "databricks"],
+  // Snowflake Cortex is OpenAI-WIRE-compatible, so customers reach it with the OpenAI
+  // client pointed at `https://<account>.snowflakecomputing.com/api/v2/cortex/…`. The
+  // response is an ordinary OpenAI chat completion naming `claude-sonnet-4-5` or
+  // `openai-gpt-5`, so without this row inferProvider reads the model string and
+  // answers "openai" — and every event for the call goes out labelled as OpenAI usage.
+  // Measured against the live OpenRouter catalogue on 2026-08-25, none of the ids this
+  // surface actually serves match a price key, so today the mislabelling also costs a
+  // permanent price-miss report on every single request. Both halves are fixed by
+  // stamping the provider that really served the call: "snowflake" is absent from
+  // VENDOR_MAP by design, so it cannot match a price at all, and TOKEN_BILLED_PROVIDERS
+  // carries it to token events with no error. That also forecloses the accident the
+  // docstring below describes — Snowflake renaming a model to a bare `gpt-4.1` would
+  // otherwise let it match OpenAI's own rate while Snowflake bills in credits.
+  //
+  // `/api/v2/cortex/` and not the `snowflakecomputing.com` host: the host also serves
+  // `/api/v2/statements` (the SQL API this SDK's own gateway reader drives) and every
+  // other Snowflake API, none of which is model inference.
+  ["/api/v2/cortex/", "snowflake"],
+];
 
 /**
  * Return a provider override implied by the client's baseURL, or "".
  *
- * "databricks" matches no vendor in pricing's VENDOR_MAP, so a hosted call CANNOT
- * hit a price table. `emit()` then emits token counts via TOKEN_BILLED_PROVIDERS with
- * no error reported — that is the complete answer for these models, not a fallback.
- * Deliberate: Databricks bills them in DBUs
- * against its own rate card, which is published only as HTML and exists in no
- * system table, while OpenRouter DOES list bare `openai/gpt-oss-20b` and
+ * Every provider named in the table above is deliberately ABSENT from pricing's
+ * VENDOR_MAP, so a hinted call CANNOT hit a price table. `emit()` then emits token
+ * counts via TOKEN_BILLED_PROVIDERS with no error reported — that is the complete
+ * answer for these models, not a fallback.
+ *
+ * Deliberate, and the reason a hint exists at all: Databricks bills hosted models in
+ * DBUs against a rate card published only as HTML and present in no system table, and
+ * Snowflake bills Cortex in credits at an edition/region/contract rate that is
+ * machine-readable nowhere — while OpenRouter DOES list bare `openai/gpt-oss-20b` and
  * `meta-llama/llama-4-maverick` at 0.2-0.4x of Databricks' real rate. Left as
  * "openai", a rename of the served entity to an 8-digit date suffix would let
- * stripVersion strip it into a match and silently under-bill 2.5-5x. Stamping
- * "databricks" turns that accident into a guaranteed honest miss.
+ * stripVersion strip it into a match and silently under-bill 2.5-5x. Stamping the real
+ * provider turns that accident into a guaranteed honest miss.
  */
 export function providerHintFor(client: unknown): string {
   try {
     const url = String((client as { baseURL?: unknown })?.baseURL ?? "");
-    return url.includes(DATABRICKS_HOSTED_PATH) ? "databricks" : "";
+    for (const [path, provider] of PROVIDER_BY_BASE_URL_PATH) {
+      if (url.includes(path)) return provider;
+    }
+    return "";
   } catch {
     return "";
   }

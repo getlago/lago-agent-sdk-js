@@ -1,6 +1,7 @@
 /** OpenAI wrapper tests — fake client, no live API. */
 import { describe, expect, it } from "vitest";
-import { providerHintFor } from "../../src/wrappers/openai.js";
+import { PROVIDER_BY_BASE_URL_PATH, providerHintFor } from "../../src/wrappers/openai.js";
+import { TOKEN_BILLED_PROVIDERS } from "../../src/pricing.js";
 
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -727,5 +728,211 @@ describe("Databricks: baseURL decides the provider", () => {
     await sdk.shutdown(1000);
     const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
     expect(map.llm_output_tokens).toBe(7); // partial cumulative count at abandonment
+  });
+});
+
+// ---------------------------------------------------------------------
+// Snowflake Cortex: an OpenAI-WIRE endpoint that is not OpenAI
+//
+// Cortex answers chat completions at
+// `https://<account>.snowflakecomputing.com/api/v2/cortex/v1/chat/completions`, so a
+// customer reaches it with the ordinary OpenAI client and a baseURL. The response body
+// is an ordinary chat completion — nothing in it names Snowflake — so baseURL is again
+// the only signal.
+// ---------------------------------------------------------------------
+const SNOW = "https://example-account.snowflakecomputing.com";
+const SNOW_CORTEX = `${SNOW}/api/v2/cortex/v1`;
+
+/**
+ * A Cortex chat-completions endpoint. Streaming and non-streaming report the SAME usage
+ * on purpose — the QA scenario is that the two paths agree — and the numbers are an
+ * UNCACHED call so they read the same whether or not the additive-cache fix for
+ * `total_tokens` is on the branch. The cached shape is pinned by that fix's own adapter
+ * fixtures (11/12_snowflake_cortex_*.json), not here.
+ */
+const CORTEX_USAGE = {
+  prompt_tokens: 42,
+  completion_tokens: 7,
+  total_tokens: 49,
+  prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+  completion_tokens_details: { reasoning_tokens: 0 },
+};
+
+class CortexCompletions {
+  lastKwargs: Record<string, unknown> | null = null;
+
+  async create(args: any) {
+    this.lastKwargs = { ...args };
+    // Note it is Anthropic's model name arriving on an OpenAI wire.
+    const model = args?.model ?? "claude-sonnet-4-5";
+    if (args?.stream === true) {
+      const chunks = [
+        { model, choices: [{ delta: { content: "hi" } }], usage: null },
+        { model, choices: [], usage: { ...CORTEX_USAGE } },
+      ];
+      return (async function* () {
+        for (const c of chunks) yield c;
+      })();
+    }
+    return {
+      model,
+      choices: [{ message: { role: "assistant", content: "hi" } }],
+      usage: { ...CORTEX_USAGE },
+    };
+  }
+}
+
+class CortexOpenAI {
+  chat: { completions: CortexCompletions };
+  baseURL: string;
+
+  constructor(baseURL: string = SNOW_CORTEX) {
+    this.chat = { completions: new CortexCompletions() };
+    this.baseURL = baseURL;
+  }
+}
+Object.defineProperty(CortexOpenAI, "name", { value: "OpenAI" });
+
+describe("Snowflake Cortex: baseURL decides the provider", () => {
+  it.each([
+    // The OpenAI-compatible wire, i.e. what a wrapped client is actually pointed at.
+    [SNOW_CORTEX, "snowflake"],
+    [`${SNOW_CORTEX}/`, "snowflake"],
+    // The Anthropic wire and the native inference endpoint live under the same path,
+    // and both are model inference billed in credits.
+    [`${SNOW}/api/v2/cortex/v1/messages`, "snowflake"],
+    [`${SNOW}/api/v2/cortex/inference:complete`, "snowflake"],
+    // NOT the host: the SQL API on the same host is what this SDK's own gateway reader
+    // drives, and a warehouse query is not model inference.
+    [`${SNOW}/api/v2/statements`, ""],
+    [SNOW, ""],
+    [`${SNOW}/`, ""],
+    // No segment after `cortex` is not a reachable OpenAI baseURL — the client would
+    // POST `/api/v2/cortex/chat/completions`, which Cortex does not serve. Requiring the
+    // trailing slash is what keeps `/api/v2/cortexsomething` out.
+    [`${SNOW}/api/v2/cortex`, ""],
+  ])("providerHintFor(%s) -> %s", (baseURL, expected) => {
+    expect(providerHintFor({ baseURL })).toBe(expected);
+  });
+
+  it("resolves the first matching row, and every row it can produce bills as tokens", () => {
+    // The shape, not the rows: a baseURL matching two entries resolves to the first, so
+    // entries stay ordered most-specific-first. Pinned because the next row (Ramp) is
+    // added by someone reading the table, not this test.
+    expect(
+      providerHintFor({
+        baseURL: "https://dbc-0223ef70-2638.cloud.databricks.com/ai-gateway/mlflow/v1/api/v2/cortex/v1",
+      }),
+    ).toBe("databricks");
+    // Every provider a hint can produce must be one `emit()` bills as token counts, or
+    // the hint silently turns a priceable call into a permanent price miss.
+    for (const [, provider] of PROVIDER_BY_BASE_URL_PATH) {
+      expect(TOKEN_BILLED_PROVIDERS.has(provider)).toBe(true);
+    }
+  });
+
+  it("stamps a Cortex call snowflake end to end", async () => {
+    // The stamp asserted on a WRAPPED call, not on providerHintFor in isolation: the
+    // stream-hint bug survived a green suite precisely because this repo only pinned the
+    // helper. Without the hint every one of these events says provider="openai" for usage
+    // Snowflake billed in credits.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI() as any);
+    await client.chat.completions.create({ model: "claude-sonnet-4-5", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBeGreaterThan(0);
+    expect(received.every((e) => e.properties.provider === "snowflake")).toBe(true);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map).toEqual({ llm_input_tokens: 42, llm_output_tokens: 7 });
+  });
+
+  it("streams the same usage and the same stamp as the non-streaming call", async () => {
+    // Same usage, same stamp, and the model comes from the response rather than the
+    // requested string — the streaming path takes the hint as an ARGUMENT rather than
+    // through a closure, so it needs its own assertion.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI() as any);
+    const stream = (await client.chat.completions.create({
+      model: "claude-sonnet-4-5",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map).toEqual({ llm_input_tokens: 42, llm_output_tokens: 7 });
+    expect(received.every((e) => e.properties.provider === "snowflake")).toBe(true);
+    expect(received.every((e) => e.properties.model === "claude-sonnet-4-5")).toBe(true);
+  });
+
+  it("does not stamp a Snowflake host that is not Cortex", async () => {
+    // The mirror of the BYOK case: same host, same client class, not model inference. A
+    // host-only match would stamp "snowflake" on it and make it unpriceable forever.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI(`${SNOW}/api/v2/statements`) as any);
+    await client.chat.completions.create({ model: "gpt-4o", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.every((e) => e.properties.provider === "openai")).toBe(true);
+  });
+
+  it("leaves a plain OpenAI client behaviourally unchanged", async () => {
+    // The regression the table refactor could break: no row matches api.openai.com, so
+    // an ordinary client must emit exactly what it emitted before.
+    const { sdk, received } = newSdk();
+    const fake = new FakeOpenAI() as any;
+    fake.baseURL = "https://api.openai.com/v1";
+    const client = sdk.wrap(fake);
+    await client.chat.completions.create({ model: "gpt-4o-mini", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const map = Object.fromEntries(received.map((e) => [e.code, parseInt(String(e.properties.value), 10)]));
+    expect(map).toEqual({ llm_input_tokens: 8, llm_output_tokens: 16 });
+    expect(received.every((e) => e.properties.provider === "openai")).toBe(true);
+  });
+
+  it("does not mutate the caller's params across calls", async () => {
+    // `stream_options` is the one nested object the wrapper writes to. Mutating the
+    // caller's copy would leak `include_usage` into a later non-streaming call and, worse,
+    // make a params dict reused across two clients carry the first one's settings.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI() as any);
+    const params: Record<string, unknown> = {
+      model: "claude-sonnet-4-5",
+      messages: [],
+      stream: true,
+      stream_options: {},
+    };
+    for (let i = 0; i < 2; i++) {
+      const stream = (await client.chat.completions.create(params as any)) as AsyncIterable<unknown>;
+      for await (const _ of stream) {
+        /* drain */
+      }
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(params.stream_options).toEqual({}); // the caller's nested object must be untouched
+    expect(received.every((e) => e.properties.provider === "snowflake")).toBe(true);
+    expect(received.filter((e) => e.code === "llm_input_tokens")).toHaveLength(2);
+  });
+
+  it("keeps the customer's spelling of a fully-qualified Cortex model", async () => {
+    // A fine-tuned Cortex model is named `database.schema.model`. CanonicalUsage.model
+    // reports it verbatim — normalizing it here would misreport what the customer ran, and
+    // there is nothing to normalize it FOR: "snowflake" reaches no price table at all.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI() as any);
+    await client.chat.completions.create({
+      model: "LAGO_DB.CORTEX.my_tuned_mistral7b",
+      messages: [],
+    } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.every((e) => e.properties.model === "LAGO_DB.CORTEX.my_tuned_mistral7b")).toBe(true);
+    expect(received.every((e) => e.properties.provider === "snowflake")).toBe(true);
   });
 });
