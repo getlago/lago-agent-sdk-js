@@ -3,10 +3,17 @@
  *
  * Verified against real rows read from a live Snowflake account over the SQL API
  * (`POST /api/v2/statements`). Two views report Cortex usage and this module serves
- * both; only the REST one is implemented here.
+ * both:
  *
  *   CORTEX_REST_API_USAGE_HISTORY      one row per request -> extractSnowflakeRestLog
- *   CORTEX_AI_FUNCTIONS_USAGE_HISTORY  one row per query   -> (INT-225)
+ *   CORTEX_AI_FUNCTIONS_USAGE_HISTORY  one row per query   -> extractSnowflakeFunctionsLog
+ *
+ * They are two extractors rather than one because almost nothing about them lines up:
+ * tokens arrive in `TOKENS_GRANULAR` (an OBJECT, four keys, cache ADDITIVE) against
+ * `METRICS` (an ARRAY of metric/unit/value records, no cache key at all), the functions
+ * view alone carries `FUNCTION_NAME`, `CREDITS`, `IS_COMPLETED`, `QUERY_ID` and
+ * `ROLE_NAMES`, and the two views' timestamps are different Snowflake types. One function
+ * over both would branch on every one of those.
  *
  * A row reaches this function as a plain object of `{COLUMN_NAME: value}`, whichever
  * way the caller read it: the SQL API returns columnar `data` the caller zips against
@@ -109,9 +116,13 @@ const EXTRA_COLUMNS = [
 // caller emits nothing — and without this marker that 100% under-bill is
 // indistinguishable from a correctly-ignored failed row, which is precisely the shape of
 // silent loss this codebase keeps paying for. Unobserved on the live view (0 of 24 rows),
-// so the marker is a guard rather than a workaround: what to DO about such a row (bill
-// `TOKENS` as input, report it, drop it) is the same open question as the functions
-// view's `total`-only rows, and is decided in INT-225, not here.
+// so the marker is a guard rather than a workaround.
+//
+// It is a MARKER here and a MAPPING on the functions view, where a `total`-only row is
+// billed as `input` under `METRICS_TOTAL_ONLY_KEY`. The difference is not taste:
+// `METRICS.total` is a plain token count, while `TOKENS` INCLUDES the cached block, so
+// billing it as `input` on a cached row re-bills that block a second time — 2.0x on the
+// call, which is worse than the zero this marker reports.
 const MISSING_GRANULAR_KEY = "tokens_granular_missing";
 
 // Attribution sources, in the order `resolveSnowflakeSubscription` tries them by default.
@@ -238,6 +249,256 @@ export function extractSnowflakeRestLog(row: Record<string, unknown>): Canonical
   // same 100% loss, and the drift sweep alone would let it pass quietly.
   if (Object.keys(nonzeroNumeric(usage)).length === 0 && safeInt(column(row, "TOKENS")) > 0) {
     extras[MISSING_GRANULAR_KEY] = true;
+  }
+
+  return usage;
+}
+
+// ---------------------------------------------------------------------------
+// CORTEX_AI_FUNCTIONS_USAGE_HISTORY — the AI SQL functions view
+// ---------------------------------------------------------------------------
+
+// `METRICS` metrics this adapter MAPS onto a CanonicalUsage field, keyed by an entry's
+// `key.metric`. Anything else in the array is drift and reaches `extras` under a dotted
+// key.
+//
+// `total` is in this set, and putting it there is the billing decision this view forces.
+// Measured across all 42 captured rows: `AI_COMPLETE` reports `{input, output}`, and
+// every other function — `AI_SUMMARIZE`, `AI_TRANSLATE`, `AI_SENTIMENT`, `AI_CLASSIFY`,
+// `AI_EMBED` — reports `{total}` ALONE, never both. `CanonicalUsage` has no `total` field
+// and does not get one (11 numeric fields, every pricing and emit path keyed off them),
+// so an adapter that maps `input`/`output` and leaves `total` to the drift sweep extracts
+// all-zero for five of the six function types and bills NOTHING for them: a 100%
+// under-bill on every task-specific AI SQL function, and silent, because `extras` is
+// never sent to Lago.
+const MAPPED_METRICS = new Set(["input", "output", "total"]);
+
+// `key.unit` values this adapter is willing to read as a token count. Every captured row
+// says "tokens"; the empty string covers an entry that omits the unit.
+//
+// The guard exists because a `METRICS` entry is a metric NAME plus a UNIT, and only the
+// pair means anything: Cortex meters some functions in units that are not tokens at all
+// (AI_PARSE_DOCUMENT is documented per page), so `{"metric": "input", "unit": "pages"}` is
+// a shape this array can express. Billing 12 pages as 12 tokens is the kind of wrong no
+// later test can see, so a foreign unit goes to the drift sweep under
+// `extras["metrics.<metric>.<unit>"]` — and if it was the row's only figure it trips
+// `METRICS_UNMAPPED_KEY`, so the unbilled row is loud instead of a zero.
+const TOKEN_UNITS = new Set(["tokens", ""]);
+
+// Columns lifted into `extras` verbatim, lower-cased. Three are here for a reason rather
+// than for completeness:
+//
+//   CREDITS       what a customer sees in Snowflake's own cost view, so it is the figure
+//                 they reconcile a Lago invoice against. Read, NEVER billed: there is no
+//                 price mode on the Snowflake path and no credit rate anywhere in this
+//                 SDK. It is evidence, not a billing input.
+//   QUERY_ID      the per-row id the caller builds the idempotency key from. Rows are per
+//                 query, so it is a genuine property of its row — it stays in `extras` and
+//                 out of the dimensions on CARDINALITY grounds: one dimension value per
+//                 query is a group-by nobody can use.
+//   IS_COMPLETED  handed over rather than acted on — see the doc comment. Whether a FALSE
+//                 row is restated later decides the backfill's closed-window rule, and
+//                 that is not a decision a pure extractor gets to make.
+const FUNCTIONS_EXTRA_COLUMNS = [
+  "FUNCTION_NAME",
+  "MODEL_NAME",
+  "CREDITS",
+  "IS_COMPLETED",
+  "QUERY_ID",
+  "QUERY_TAG",
+  "ROLE_NAMES",
+  "USER_ID",
+  "WAREHOUSE_ID",
+  "START_TIME",
+  "END_TIME",
+] as const;
+
+// `total`'s value, recorded whenever the array carries one — exactly as `extras["tokens"]`
+// records the REST view's additive total, and for the same reason: it is what a
+// reconciliation compares against, and on a row that ALSO reports `input`/`output` it must
+// never be added to a numeric field or the row bills twice.
+const METRICS_TOTAL_KEY = "metrics_total";
+
+// Set when `total` was the row's ONLY token figure and was therefore billed as `input`.
+//
+// The COUNT is exact — `total` is every token the call consumed, and it is the only figure
+// Snowflake reports for these functions. The SPLIT is the guess: `input` is chosen because
+// it is right by construction for `AI_EMBED` (nothing is generated) and close for the
+// classifiers (`AI_SENTIMENT`/`AI_CLASSIFY` return a label), while `AI_SUMMARIZE`/
+// `AI_TRANSLATE` genuinely generate and are the case this understates. `output` was
+// rejected as the default because it errs the other way on every function and over-bills a
+// customer, which is not a recoverable direction.
+//
+// So the marker is the honest part: the row is billed at its true token count under one
+// field, and a customer reconciling against Snowflake's own figures can see which rows
+// carry a split this SDK invented. If the view ever reports both, the mapping below prefers
+// the real split with no code change.
+const METRICS_TOTAL_ONLY_KEY = "metrics_total_only";
+
+// The functions-view twin of `MISSING_GRANULAR_KEY`: real usage that extracted to
+// all-zero, so the caller emits nothing. Set when a metric could not be mapped (unknown
+// name, or a unit that is not tokens) or when `CREDITS` says Snowflake charged the account
+// for a row this adapter found nothing billable in. Without it, that 100% loss is
+// indistinguishable from a correctly-ignored failed row — which is the exact shape of
+// silent under-bill this connector keeps being audited for.
+const METRICS_UNMAPPED_KEY = "metrics_unmapped";
+
+/**
+ * Coerce to a non-negative number.
+ *
+ * `CREDITS` arrives as "0.000068400" over the SQL API and as a number from a typed
+ * connector. It is read ONLY as evidence that a row consumed something (see
+ * `METRICS_UNMAPPED_KEY`) and never as a billing input — nothing on the Snowflake path
+ * turns credits into money.
+ */
+function safeFloat(v: unknown): number {
+  if (v === null || v === undefined || typeof v === "boolean") return 0;
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Fold a `METRICS` ARRAY into mapped token counts plus the drift leftovers.
+ *
+ * The column is an ARRAY of `{"key": {"metric": ..., "unit": ...}, "value": N}` — not the
+ * flat `{input, output}` object the connector brief assumed. Measured, it arrives over the
+ * SQL API as '[\n  {\n    "key": {\n      "metric": "input",\n      "unit": "tokens"\n
+ * },\n    "value": 13\n  }, ...]' and as a real array from a typed connector; both are
+ * accepted, same as `safeObj` for the REST view.
+ *
+ * Nothing is dropped: an entry this adapter cannot bill is a token count nobody has
+ * classified yet, and this view is months old on an actively-extended surface — the REST
+ * one grew two token keys and a whole column inside a single day.
+ */
+function readMetrics(v: unknown): {
+  counts: Record<string, number>;
+  drift: Record<string, unknown>;
+} {
+  const counts: Record<string, number> = {};
+  const drift: Record<string, unknown> = {};
+  safeArray(v).forEach((entry, index) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      // Not the documented entry shape at all. Kept under its position in the array so
+      // two of them cannot collide and neither disappears.
+      drift[`metrics.${index}`] = entry;
+      return;
+    }
+    const record = entry as Record<string, unknown>;
+    const key = safeObj(record.key);
+    const metric = safeStr(key.metric).trim().toLowerCase();
+    const unit = safeStr(key.unit).trim().toLowerCase();
+    if (MAPPED_METRICS.has(metric) && TOKEN_UNITS.has(unit)) {
+      // Summed, not last-wins: one metric appearing twice is a shape this array can
+      // express (it is a list, not an object), and keeping only the last value would
+      // under-bill by the first with nothing to show for it.
+      counts[metric] = (counts[metric] ?? 0) + safeInt(record.value);
+      return;
+    }
+    // The unit joins the key only when it is NOT a token unit, so an unrecognized metric
+    // reads as `metrics.<metric>` while a known metric in a foreign unit reads as
+    // `metrics.input.pages` and cannot overwrite the token-counted one.
+    const suffix = TOKEN_UNITS.has(unit) ? "" : `.${unit}`;
+    drift[`metrics.${metric || index}${suffix}`] = record.value;
+  });
+  return { counts, drift };
+}
+
+/**
+ * Translate one `CORTEX_AI_FUNCTIONS_USAGE_HISTORY` row -> CanonicalUsage.
+ *
+ * Pure: no HTTP, no SDK state, no import from `adapters/`. Missing or malformed fields
+ * degrade to zero/empty rather than throwing, so one bad row cannot take down a window.
+ *
+ * Field mapping, each line labelled LIVE (a captured row proves it) or ASSUMED:
+ *
+ *   METRICS[metric=input]   -> input     functions_ai_complete.json        LIVE
+ *   METRICS[metric=output]  -> output    functions_ai_complete.json        LIVE
+ *   METRICS[metric=total]   -> input     functions_total_only_*.json       LIVE figure,
+ *                                        ASSUMED split, marked — see
+ *                                        `METRICS_TOTAL_ONLY_KEY`
+ *   METRICS[anything else]  -> extras["metrics.<metric>[.<unit>]"]         ASSUMED
+ *                                        (no captured row carries one; 0 of 42)
+ *   MODEL_NAME              -> model     empty on the task functions,      LIVE
+ *                                        populated for AI_EMBED
+ *   CREDITS, IS_COMPLETED, QUERY_ID, QUERY_TAG, ROLE_NAMES, USER_ID, WAREHOUSE_ID,
+ *   START_TIME, END_TIME    -> extras (lower-cased keys)                   LIVE
+ *   provider                -> constant "snowflake"
+ *   api                     -> constant "snowflake_cortex_functions"
+ *
+ * ONE ROW PER QUERY, not per hour — measured, and it decides the caller's idempotency key.
+ * Twelve identical `AI_COMPLETE` calls produced twelve rows sharing one
+ * `START_TIME`/`END_TIME` pair: only the TIMESTAMPS are hour-bucketed. So the key is built
+ * from `QUERY_ID`; a bucket-derived key collapses twelve billable calls into one event and
+ * bills a twelfth of the traffic.
+ *
+ * TIMESTAMPS ARE NOT PARSED HERE, and they are not the REST view's shape: these columns
+ * are `timestamp_ltz` and arrive as a bare "1787162400" where REST's `timestamp_tz` arrive
+ * as "1787162400.000000000 1440". One parser does not serve both, and an offset-less epoch
+ * has to be read as UTC in both ports or the same row bills hours apart in each. The
+ * caller stamps the event; this function only hands the value over.
+ *
+ * NO CACHE AND NO REASONING METRIC EXISTS ON THIS VIEW — 0 of 42 rows, across all six
+ * function types. So `"snowflake_cortex_functions"` must NOT be added to pricing's
+ * `OPENAI_SHAPED_APIS`: that set exists to stop a cached block being subtracted twice, and
+ * here there is nothing to subtract. Adding it can only remove counts that were billed
+ * correctly.
+ *
+ * A FAILED CALL PRODUCES NO ROW, same as the REST view: driven live, a 403 and a 400
+ * alongside a success, and only the success ever appeared. The all-zero path below is
+ * therefore written and tested from hand-made rows — it guards a shape nobody has seen.
+ *
+ * `IS_COMPLETED` IS REPORTED, NOT ACTED ON. All 42 captured rows are `true`; a FALSE row
+ * has never been observed, and since a failure produces no row at all the plausible
+ * reading is "query still in flight" rather than "query failed" — UNVERIFIED, and the open
+ * question is whether such a row is later RESTATED with final counts. That decides the
+ * backfill's window rule (billing a row that is restated later burns its idempotency key,
+ * so the corrected re-run is rejected as a duplicate and the remainder never bills), which
+ * is why the flag is passed through to the caller who owns that rule.
+ */
+export function extractSnowflakeFunctionsLog(row: Record<string, unknown>): CanonicalUsage {
+  const { counts, drift } = readMetrics(column(row, "METRICS"));
+
+  const extras: Record<string, unknown> = {};
+  for (const name of FUNCTIONS_EXTRA_COLUMNS) extras[name.toLowerCase()] = column(row, name);
+  Object.assign(extras, drift);
+
+  let inputTokens = counts.input ?? 0;
+  const outputTokens = counts.output ?? 0;
+  const total = counts.total ?? 0;
+  if ("total" in counts) extras[METRICS_TOTAL_KEY] = total;
+
+  // The `{total}`-only row: five of the six function types, and the whole reason `total`
+  // is a mapped key. Conditioned on there being no split to prefer, so a row reporting
+  // both bills its real `input`/`output` and keeps `total` as evidence only.
+  if (total > 0 && inputTokens === 0 && outputTokens === 0) {
+    inputTokens = total;
+    extras[METRICS_TOTAL_ONLY_KEY] = true;
+  }
+
+  const usage = makeCanonicalUsage({
+    input: inputTokens,
+    output: outputTokens,
+    // Empty on `AI_SUMMARIZE`/`AI_TRANSLATE`/`AI_SENTIMENT`/`AI_CLASSIFY` — those
+    // functions take no model argument — and populated for `AI_EMBED` and `AI_COMPLETE`.
+    // Empty is a fact about the row, not a failure to read it, and the two vary
+    // independently of the token shape.
+    model: safeStr(column(row, "MODEL_NAME")),
+    provider: "snowflake",
+    api: "snowflake_cortex_functions",
+    extras,
+  });
+
+  // Nothing billable came out, yet something says the call really ran: a metric this
+  // adapter could not map, or CREDITS Snowflake charged the account for. Both are real
+  // usage billing zero, and unmarked they are indistinguishable from the failed row above,
+  // which SHOULD bill zero. `CREDITS` is the better witness of the two here — this view
+  // has no `TOKENS` column to fall back on, and credits are non-zero on every captured
+  // row.
+  if (
+    Object.keys(nonzeroNumeric(usage)).length === 0 &&
+    (Object.values(drift).some((value) => safeInt(value) > 0) || safeFloat(column(row, "CREDITS")) > 0)
+  ) {
+    extras[METRICS_UNMAPPED_KEY] = true;
   }
 
   return usage;
