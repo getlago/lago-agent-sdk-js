@@ -1322,6 +1322,80 @@ describe("SDK price mode", () => {
     expect(errors).toEqual([]);
   });
 
+  it("emits tokens for snowflake in price mode without reporting an error", async () => {
+    // Snowflake bills Cortex in CREDITS, at an edition/region/contract rate published in
+    // no API, view or table the SDK can read — so this miss is structural and permanent
+    // in exactly the way the Databricks one is, and reporting it per call would be a
+    // permanent false alarm. The customer prices these token counts with a Lago charge.
+    //
+    // Note the global mode here is "price": the provider set is what decides, so nothing
+    // on the Snowflake path forces mode "tokens" per call.
+    const errors: string[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    sdk.emit(
+      makeCanonicalUsage({
+        input: 42,
+        output: 7,
+        model: "claude-sonnet-4-5",
+        provider: "snowflake",
+        api: "chat_completions",
+      }),
+    );
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(received.find((e) => e.code === "llm_output_tokens")?.properties.value).toBe("7");
+    expect(errors).toEqual([]);
+  });
+
+  it("never prices a Cortex model named like a vendor's own", async () => {
+    // The reason "snowflake" is absent from VENDOR_MAP, made concrete.
+    //
+    // Cortex serves Anthropic's and OpenAI's models under their real names, so the SAME
+    // model string is priceable under the vendor and must NOT be under Snowflake — the
+    // vendor's public rate is not what Snowflake charged. Giving "snowflake" a vendor
+    // prefix would turn every one of these calls into a confident mispricing.
+    const errors: string[] = [];
+    const received: LagoEvent[] = [];
+    const sdk = new LagoSDK({
+      apiKey: "x",
+      defaultSubscriptionId: "sub_default",
+      config: { pricingMode: "price", onError: (e) => errors.push((e as Error).constructor.name) },
+    });
+    sdk._setPricingProvider(await warmProvider());
+    sdk._setSender(async (b) => {
+      received.push(...b);
+    });
+    const fields = { input: 1000, output: 500, model: "claude-opus-4.8", api: "x" };
+    sdk.emit(makeCanonicalUsage({ ...fields, provider: "anthropic" }), { eventId: "evt_vendor" });
+    sdk.emit(makeCanonicalUsage({ ...fields, provider: "snowflake" }), { eventId: "evt_cortex" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    const codesFor = (prefix: string) =>
+      [...new Set(received.filter((e) => e.transaction_id.startsWith(prefix)).map((e) => e.code))].sort();
+    expect(codesFor("evt_vendor")).toEqual(["llm_cost"]);
+    expect(codesFor("evt_cortex")).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(errors).toEqual([]);
+  });
+
+  it("has no snowflake entry in the vendor map", async () => {
+    // Pinned as a decision, not left as an accident: the absence IS the guard against the
+    // mispricing above, so a later "why isn't snowflake in the map?" cleanup has to delete
+    // a test that says why.
+    const provider = await warmProvider();
+    expect(provider.lookup("snowflake", "claude-opus-4.8", "chat_completions")).toBeNull();
+    expect(provider.lookup("anthropic", "claude-opus-4.8", "native")).not.toBeNull();
+  });
+
   it("still reports a real price miss", async () => {
     // The narrow exception above must not become a blanket silence: an unmatched model
     // on a provider that DOES publish rates is a genuine miss the customer can act on.
