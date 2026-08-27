@@ -348,7 +348,7 @@ await client.messages.create({
 
 ## Error policy
 
-The SDK never breaks your LLM call. If anything in instrumentation fails (adapter bug, Lago down, network error), it's swallowed, logged, and your call returns normally. Wire your own observability via `onError`:
+The SDK never breaks your LLM call. If anything in instrumentation fails (adapter bug, Lago down, network error), your call returns normally — and the failure is reported through `onError` and logged, so it never passes in silence. Wire your own observability there:
 
 ```typescript
 new LagoSDK({
@@ -358,6 +358,17 @@ new LagoSDK({
   },
 });
 ```
+
+`where` names the stage, so you can tell the failures apart:
+
+| `where` | What happened |
+| --- | --- |
+| `adapter.<provider>` | The provider's response could not be parsed — its usage shape changed. Nothing was billed for that call. |
+| `wrapper.<provider>` | Interception itself failed, so the call went uninstrumented. |
+| `emit` / `pricing` / `timestamp` | The usage was read, but the event could not be built or priced. |
+| `send_batch` / `overflow` / `shutdown_drain` | Delivery: a batch failed, the buffer is full, or events were still owed at exit. |
+
+A drifted provider is the one to alert on: it bills nothing for that provider until it is fixed, and it looks like silence rather than an error anywhere else.
 
 ## Setting up Lago
 
