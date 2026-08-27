@@ -1,6 +1,12 @@
 # Releasing
 
-This SDK is published to **npm** as [`lago-agent-sdk`](https://www.npmjs.com/package/lago-agent-sdk) — an unscoped package, matching Lago's other public SDKs (`lago-javascript-client`, `lago-nodejs-client`) and the Python package name.
+This SDK is published to **npm** as [`@getlago/agent-sdk`](https://www.npmjs.com/package/@getlago/agent-sdk) — the scoped name the docs and README instruct. Versions 0.1.0 and 0.2.0 shipped under the old unscoped name [`lago-agent-sdk`](https://www.npmjs.com/package/lago-agent-sdk); after the first scoped release, a maintainer should deprecate the old package:
+
+```bash
+npm deprecate lago-agent-sdk "Renamed: npm install @getlago/agent-sdk"
+```
+
+The Python package on PyPI stays `lago-agent-sdk` — that name is consistent with its docs.
 
 Releases are triggered by pushing a `v*.*.*` git tag. The publish workflow:
 
@@ -65,7 +71,7 @@ git push --tags
 Within ~5 minutes the workflow lands the package on npm and opens a GitHub Release. Customers can then:
 
 ```bash
-npm install lago-agent-sdk@X.Y.Z
+npm install @getlago/agent-sdk@X.Y.Z
 ```
 
 ## If something goes wrong mid-release
