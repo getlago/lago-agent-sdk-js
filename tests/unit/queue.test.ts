@@ -618,6 +618,196 @@ describe("EventQueue — a slow pricing refresh does not delay event delivery", 
 });
 
 // ----------------------------------------------------------------------
+// `flush()` resolving `true` has one meaning: the events are in Lago.
+//
+// `takeBatch` removes a batch from the buffer BEFORE the send is attempted, so for the
+// duration of a send — and for the whole of a retry backoff, up to 60s — the events sit
+// in a local variable, in neither the buffer nor Lago. `flush()` read `buffer.length`
+// alone, so it reported success on events that had not been sent yet and on events whose
+// send then failed. A caller that flushes before exiting acted on that answer.
+// ----------------------------------------------------------------------
+describe("EventQueue — flush() waits for delivery, not for an empty buffer", () => {
+  it("does not report success while a batch is still in flight", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let delivered = 0;
+    const q = new EventQueue(
+      async (b) => {
+        await gate;
+        delivered += b.length;
+      },
+      20,
+      100,
+    );
+    for (let i = 0; i < 100; i++) q.push(ev(i));
+
+    // The send is started and parked. The buffer is empty and nothing has arrived.
+    expect(await q.flush(300)).toBe(false);
+    expect(delivered).toBe(0);
+
+    release();
+    expect(await q.flush(2000)).toBe(true);
+    expect(delivered).toBe(100);
+    await q.shutdown(1000);
+  });
+
+  it("true means the events have actually arrived, not that they were handed over", async () => {
+    // The assertion is the pairing: at the instant flush() says true, the sender must
+    // already have received every event. A send slow enough to be observed is the only
+    // way to tell the two apart.
+    let delivered = 0;
+    const q = new EventQueue(
+      async (b) => {
+        await sleep(200);
+        delivered += b.length;
+      },
+      20,
+      100,
+    );
+    for (let i = 0; i < 100; i++) q.push(ev(i));
+    expect(await q.flush(5000)).toBe(true);
+    expect(delivered).toBe(100);
+    await q.shutdown(1000);
+  });
+
+  it("does not report success on events whose send then fails", async () => {
+    let attempts = 0;
+    const q = new EventQueue(
+      async () => {
+        attempts++;
+        await sleep(150);
+        throw new Error("network blip");
+      },
+      20,
+      100,
+      10_000,
+      60_000,
+    );
+    for (let i = 0; i < 100; i++) q.push(ev(i));
+
+    expect(await q.flush(400)).toBe(false);
+    expect(attempts).toBeGreaterThanOrEqual(1);
+    // Nothing was delivered and nothing was dropped — the events are still owed.
+    // @ts-expect-error — private: the events must be accounted for somewhere.
+    expect(q.buffer.length + q.inFlight).toBe(100);
+    q.push(ev(999)); // keep the queue from looking idle while it winds down
+    await q.shutdown(500);
+  });
+
+  it("does not report success while events are parked in a retry backoff", async () => {
+    // The widest form of the hole. After a transient failure the batch is re-prepended,
+    // then re-taken and held in a local for the whole backoff — so the buffer reads
+    // empty again, for a full second on the first retry and up to `maxRetryMs` later.
+    let attempts = 0;
+    let delivered = 0;
+    const q = new EventQueue(
+      async (b) => {
+        attempts++;
+        if (attempts === 1) throw new Error("transient");
+        delivered += b.length;
+      },
+      20,
+      100,
+      10_000,
+      60_000,
+    );
+    for (let i = 0; i < 100; i++) q.push(ev(i));
+
+    // The first backoff is 1s, so nothing can have been delivered yet inside 500ms —
+    // and the buffer is empty for most of that window.
+    expect(await q.flush(500)).toBe(false);
+    expect(delivered).toBe(0);
+
+    // It resolves once the retry lands.
+    expect(await q.flush(3000)).toBe(true);
+    expect(delivered).toBe(100);
+    expect(attempts).toBe(2);
+    await q.shutdown(1000);
+  });
+});
+
+// ----------------------------------------------------------------------
+// A queue that has been shut down must let the process go.
+//
+// `flush()` and `shutdown()` used the module-level `sleep()`, whose timer is NOT
+// `unref`'d — unlike the loop's own `waitWake` and `sleepUnlessStopping`, which are,
+// with a comment saying exactly why. `Promise.race([loopPromise, sleep(timeoutMs)])`
+// leaves the loser running, so `await shutdown()` resolved and then held the event loop
+// open for the whole budget. And the `beforeExit`/signal listeners were never removed,
+// so exit ran a SECOND full shutdown on top.
+//
+// Measured on the defaults before the fix: `await sdk.shutdown()` resolved in 0ms and
+// the process exited 7003ms later (5000 for the timer, then `beforeExit` firing
+// `shutdown(2000)`). After: 2ms.
+//
+// The assertions here are handle and listener counts, not elapsed time — both are
+// properties of the code rather than of the machine the suite runs on.
+// ----------------------------------------------------------------------
+describe("EventQueue — shutdown releases the process", () => {
+  /** Resources currently keeping the event loop alive; `unref`'d ones do not appear. */
+  const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+
+  const hookCounts = () => ({
+    beforeExit: process.listenerCount("beforeExit"),
+    SIGINT: process.listenerCount("SIGINT"),
+    SIGTERM: process.listenerCount("SIGTERM"),
+    SIGHUP: process.listenerCount("SIGHUP"),
+  });
+
+  it("leaves no timer holding the event loop open", async () => {
+    // Relative to the ambient baseline, since the test runner has timers of its own.
+    //
+    // This is the branch where the LOOP finishes first, and it is the only one a test
+    // can catch: when the timeout wins instead, its timer has by definition already
+    // fired, so the old code left nothing behind there either. The timeout's timer is
+    // `unref`'d as well, but that belt is not observable as a regression and is not
+    // pinned here rather than pinned by a case that would pass either way.
+    const before = liveTimers();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    await q.shutdown(1000);
+    expect(liveTimers()).toBe(before);
+  });
+
+  it("removes its process listeners", async () => {
+    const before = hookCounts();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    const during = hookCounts();
+    // Registered on construction — each one is a route that would otherwise lose
+    // buffered events.
+    expect(during.beforeExit).toBe(before.beforeExit + 1);
+    expect(during.SIGINT).toBe(before.SIGINT + 1);
+    expect(during.SIGTERM).toBe(before.SIGTERM + 1);
+    // SIGHUP is what a closing terminal and a detaching container send. Measured
+    // before it was added: every buffered event lost on that route.
+    expect(during.SIGHUP).toBe(before.SIGHUP + 1);
+
+    await q.shutdown(1000);
+    expect(hookCounts()).toEqual(before);
+  });
+
+  it("does not leak a listener set per queue", async () => {
+    // The shape a per-request SDK produces. Each surviving listener also keeps its
+    // queue — and its whole buffer — reachable for the life of the process, and lets
+    // `beforeExit` re-drain a queue that was already shut down.
+    const before = hookCounts();
+    const queues = Array.from({ length: 12 }, () => new EventQueue(async () => {}, 1000, 100));
+    expect(hookCounts().SIGTERM).toBe(before.SIGTERM + 12);
+    await Promise.all(queues.map((q) => q.shutdown(500)));
+    expect(hookCounts()).toEqual(before);
+  });
+
+  it("stays idempotent across a second shutdown", async () => {
+    const before = hookCounts();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    await q.shutdown(500);
+    await q.shutdown(500);
+    expect(hookCounts()).toEqual(before);
+  });
+});
+
+// ----------------------------------------------------------------------
 // The background loop must never take the host process down.
 //
 // `this.loopPromise = this.run()` had no rejection handler, and nothing awaits it until

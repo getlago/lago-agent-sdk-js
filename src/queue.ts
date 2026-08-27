@@ -83,11 +83,17 @@ function isPermanentFailure(exc: unknown): boolean {
 
 export class EventQueue {
   private buffer: LagoEvent[] = [];
+  /** Events that have left `buffer` but are not yet delivered — in flight, or parked in
+   * a retry backoff waiting to be. Without this they are counted nowhere, and `flush()`
+   * reads an empty buffer as "everything arrived". */
+  private inFlight = 0;
   private wakeResolvers: Array<() => void> = [];
   private stopResolvers: Array<() => void> = [];
   private stopping = false;
   private backoffMs = 0;
   private loopPromise: Promise<void>;
+  /** Detaches this queue's `process` listeners. Set by `installShutdownHook`. */
+  private releaseShutdownHook: () => void = () => {};
   /** for tests */
   public httpCalls = 0;
 
@@ -136,14 +142,32 @@ export class EventQueue {
     if (this.buffer.length >= this.maxBatchSize) this.wake();
   }
 
+  /** Wait until every event pushed so far has actually reached Lago.
+   *
+   * `true` means delivered. It must not mean "the buffer looks empty": `takeBatch`
+   * removes a batch from `buffer` BEFORE the send is attempted, so for the duration of
+   * a send — and for the whole of a retry backoff, which reaches 60s — the events are
+   * in neither `buffer` nor Lago. Reading `buffer.length` alone therefore reported
+   * success on events that had not been sent yet, and on events whose send then failed.
+   *
+   * `outstanding()` closes that window. A batch put back by `replayFailed` is briefly
+   * counted twice, in `buffer` and in `inFlight`; over-counting only ever makes this
+   * wait longer, which is the safe direction for a caller that is about to exit. */
   async flush(timeoutMs: number = 5000): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (this.buffer.length === 0) return true;
+      if (this.outstanding() === 0) return true;
       this.wake();
       await sleep(10);
     }
-    return false;
+    // Re-checked rather than a bare `false`: the last sleep can straddle the deadline
+    // and the delivery it was waiting for may have landed inside it.
+    return this.outstanding() === 0;
+  }
+
+  /** Events pushed but not yet delivered — buffered plus in flight. */
+  private outstanding(): number {
+    return this.buffer.length + this.inFlight;
   }
 
   async shutdown(timeoutMs: number = 5000): Promise<void> {
@@ -153,8 +177,36 @@ export class EventQueue {
     // Release anything parked in a backoff sleep, so shutdown reaches the exit drain
     // instead of waiting out a backoff that can be a full minute long.
     for (const fn of this.stopResolvers.splice(0, this.stopResolvers.length)) fn();
-    // Best effort wait for the loop to complete
-    await Promise.race([this.loopPromise, sleep(timeoutMs)]);
+    await this.awaitLoop(timeoutMs);
+    // This queue is finished, so its `process` listeners must go. Left attached they
+    // did two things: kept every dead queue (and its buffer) reachable for the life of
+    // the process, and let `beforeExit` run a SECOND full shutdown after an explicit
+    // one had already completed.
+    this.releaseShutdownHook();
+  }
+
+  /** Wait for the background loop to finish, giving up after `timeoutMs`.
+   *
+   * Deliberately not `Promise.race([this.loopPromise, sleep(timeoutMs)])`. The loser of
+   * a race keeps running, and that `sleep` was a REF'D timer, so `await shutdown()`
+   * resolved immediately and then held the event loop open for the whole budget —
+   * measured on the defaults, `shutdown()` resolved in 0ms and the process exited
+   * 7003ms later: 5000ms for this timer, then `beforeExit` firing a second
+   * `shutdown(2000)` for the rest. The loop's own timers were already `unref`'d for
+   * exactly this reason; these two were missed.
+   *
+   * Cleared when the loop finishes, and `unref`'d as well so it cannot hold the loop
+   * open even in the branch where the timeout is the one that wins. */
+  private awaitLoop(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const id = setTimeout(resolve, timeoutMs);
+      (id as unknown as { unref?: () => void }).unref?.();
+      const done = () => {
+        clearTimeout(id);
+        resolve();
+      };
+      this.loopPromise.then(done, done);
+    });
   }
 
   /** Nudge the background loop to run its tick (drain + pricing
@@ -288,47 +340,56 @@ export class EventQueue {
     while (true) {
       const batch = this.takeBatch();
       if (batch.length === 0) return;
-      // Re-checked every iteration, not only when backing off. `return`, never a
-      // path that abandons the batch: the exit drain is what reports whatever it
-      // cannot send, so the events must be back on the buffer before leaving.
-      if (this.stopping) {
-        this.replayFailed(batch);
-        return;
-      }
-      if (this.backoffMs > 0) {
-        await this.sleepUnlessStopping(this.backoffMs);
+      // Counted from the instant the batch leaves the buffer, not from the instant the
+      // send starts. The gap between the two is the backoff sleep below, which reaches
+      // a full minute — the longest stretch over which these events used to exist
+      // nowhere `flush()` could see them.
+      this.inFlight += batch.length;
+      try {
+        // Re-checked every iteration, not only when backing off. `return`, never a
+        // path that abandons the batch: the exit drain is what reports whatever it
+        // cannot send, so the events must be back on the buffer before leaving.
         if (this.stopping) {
           this.replayFailed(batch);
           return;
         }
-      }
-      try {
-        this.httpCalls++;
-        await this.sender(batch);
-        this.backoffMs = 0;
-      } catch (exc) {
-        if (isPermanentFailure(exc)) {
-          // Lago's batch endpoint is all-or-nothing: one bad transaction_id fails the
-          // WHOLE batch. Re-queuing as-is would re-fail forever; dropping outright
-          // would lose the valid events with it. Isolate one-by-one, this batch only.
-          const requeued = await this.sendIndividually(batch, exc);
-          if (requeued === 0) {
-            // Batch fully resolved — the buffer shrank, so keep draining immediately.
-            this.backoffMs = 0;
-            continue;
+        if (this.backoffMs > 0) {
+          await this.sleepUnlessStopping(this.backoffMs);
+          if (this.stopping) {
+            this.replayFailed(batch);
+            return;
           }
-          // Some isolated sends failed transiently and went back on the buffer.
-          // `continue` here re-takes them with no delay and re-fails at the speed of
-          // the failure — an unbounded spin that starves the event loop. They must go
-          // through the normal backoff path.
+        }
+        try {
+          this.httpCalls++;
+          await this.sender(batch);
+          this.backoffMs = 0;
+        } catch (exc) {
+          if (isPermanentFailure(exc)) {
+            // Lago's batch endpoint is all-or-nothing: one bad transaction_id fails the
+            // WHOLE batch. Re-queuing as-is would re-fail forever; dropping outright
+            // would lose the valid events with it. Isolate one-by-one, this batch only.
+            const requeued = await this.sendIndividually(batch, exc);
+            if (requeued === 0) {
+              // Batch fully resolved — the buffer shrank, so keep draining immediately.
+              this.backoffMs = 0;
+              continue;
+            }
+            // Some isolated sends failed transiently and went back on the buffer.
+            // `continue` here re-takes them with no delay and re-fails at the speed of
+            // the failure — an unbounded spin that starves the event loop. They must go
+            // through the normal backoff path.
+            this.backoffMs = this.nextBackoff();
+            return;
+          }
+          this.replayFailed(batch);
+          this.reportError(exc);
+          warn("[lago] send_batch failed:", exc);
           this.backoffMs = this.nextBackoff();
           return;
         }
-        this.replayFailed(batch);
-        this.reportError(exc);
-        warn("[lago] send_batch failed:", exc);
-        this.backoffMs = this.nextBackoff();
-        return;
+      } finally {
+        this.inFlight -= batch.length;
       }
     }
   }
@@ -370,6 +431,9 @@ export class EventQueue {
     while (Date.now() < drainDeadline) {
       const batch = this.takeBatch();
       if (batch.length === 0) break;
+      // Same accounting as the main drain: `shutdown()` calls `flush()` first, so the
+      // two can overlap and a flush must not read this batch as delivered.
+      this.inFlight += batch.length;
       try {
         await this.sender(batch);
       } catch (exc) {
@@ -382,6 +446,8 @@ export class EventQueue {
             exc,
           );
         }
+      } finally {
+        this.inFlight -= batch.length;
       }
     }
     if (this.buffer.length > 0) {
@@ -390,30 +456,47 @@ export class EventQueue {
   }
 
   private installShutdownHook(): void {
-    if (typeof process !== "undefined" && typeof process.on === "function") {
-      let ran = false;
-      const drain = async () => {
-        if (ran) return;
-        ran = true;
-        try {
-          await this.shutdown(2000);
-        } catch {
-          /* ignore */
-        }
-      };
-      // `beforeExit` alone was not enough: it does not fire on SIGINT, SIGTERM or
-      // an explicit `process.exit()` — i.e. the normal ways a containerized poller
-      // dies — so buffered events were silently lost in exactly those cases, where
-      // Python's `atexit` drained them. Signals re-raise after draining so the
-      // caller's own handlers and the process's exit code are unaffected.
-      process.once("beforeExit", drain);
-      for (const sig of ["SIGINT", "SIGTERM"] as const) {
-        process.once(sig, async () => {
-          await drain();
-          if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
-        });
+    if (typeof process === "undefined" || typeof process.on !== "function") return;
+    let ran = false;
+    const drain = async () => {
+      if (ran) return;
+      ran = true;
+      try {
+        await this.shutdown(2000);
+      } catch {
+        /* ignore */
       }
+    };
+    // `beforeExit` alone was not enough: it does not fire on a signal or on an explicit
+    // `process.exit()` — i.e. the normal ways a containerized poller dies — so buffered
+    // events were silently lost in exactly those cases, where Python's `atexit` drained
+    // them. Signals re-raise after draining so the caller's own handlers and the
+    // process's exit code are unaffected.
+    //
+    // What this covers and what it cannot, measured route by route: natural exit,
+    // SIGINT, SIGTERM and SIGHUP drain; `process.exit()`, an uncaught exception, an
+    // unhandled rejection and SIGQUIT do not. `process.exit()` is synchronous, so no
+    // async drain can exist there. The two error routes are deliberate: a library that
+    // installs `uncaughtException` or `unhandledRejection` SUPPRESSES the host's own
+    // crash, and no billing SDK should change that. SIGQUIT's default is an immediate
+    // core dump and is meant not to be intercepted.
+    const onBeforeExit = () => void drain();
+    const signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
+    process.once("beforeExit", onBeforeExit);
+    // SIGHUP is what a closing terminal and a detaching container send; it was dropping
+    // every buffered event, and it takes the same treatment as its two neighbours.
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      const handler = async () => {
+        await drain();
+        if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+      };
+      signalHandlers.push([sig, handler]);
+      process.once(sig, handler);
     }
+    this.releaseShutdownHook = () => {
+      process.removeListener("beforeExit", onBeforeExit);
+      for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
+    };
   }
 }
 
