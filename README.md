@@ -277,6 +277,11 @@ await client.send(cmd);
 sdk.withSubscription("sub_acme", async () => {
   await client.send(...);  // bills sub_acme
 });
+// The subscription is captured when the CALL is made, so the result can leave the
+// scope — a stream returned from a helper and iterated by the caller still bills
+// sub_acme.
+const stream = await sdk.withSubscription("sub_acme", () => client.chat.completions.create({ ..., stream: true }));
+for await (const chunk of stream) { /* still bills sub_acme */ }
 // or at the top of a request handler:
 sdk.setSubscription("sub_acme");
 
