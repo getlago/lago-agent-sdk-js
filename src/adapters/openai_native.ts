@@ -3,15 +3,18 @@
  * shape of `usage` (they carry the same concepts under different field names).
  *
  * Billing semantics that are NOT visible from the field names:
- *   - `cache_read` is counted INSIDE `input`, and `reasoning` INSIDE `output`. Summing
- *     them as separate metrics double-counts — see `_INPUT_INCLUDES_CACHE_READ` /
- *     `_OUTPUT_INCLUDES_REASONING` in pricing.
+ *   - For OpenAI itself, `cache_read` is counted INSIDE `input`, and `reasoning` INSIDE
+ *     `output`. Summing them as separate metrics double-counts — see
+ *     `INPUT_INCLUDES_CACHE_READ` / `OUTPUT_INCLUDES_REASONING` in token_semantics.ts.
+ *     Other providers answer on the same wire with the OPPOSITE convention; the
+ *     total_tokens reconciliation below keys off that table per provider.
  *   - No cache_write counts exist: OpenAI auto-caches without surfacing creation.
  *   - `accepted_prediction_tokens` is a subset of `completion_tokens` and is skipped to
  *     avoid double-counting. `rejected_prediction_tokens` is real extra cost we do not
  *     bill; a customer using Predicted Outputs must read it off the response.
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
+import { tokenSemantics } from "../token_semantics.js";
 import { resolveModel } from "./_common.js";
 
 // Cloudflare Workers AI names every model "@cf/<vendor>/<model>". Reaching one
@@ -149,6 +152,13 @@ export function extractOpenAINative(
     inputTokens: number;
     outputTokens: number;
     cacheRead: number;
+    // The RAW reported cache-write count, kept out of CanonicalUsage (see
+    // MAPPED_DETAIL_FIELDS) and read per-branch from that branch's own details
+    // container — the Responses API spells it input_tokens_details, so a single
+    // prompt_tokens_details lookup would leave the Responses branch answering the
+    // total_tokens reconciliation below differently from the chat branch for the
+    // same convention.
+    cacheWrite: number;
     reasoning: number;
     audioInput: number;
     audioOutput: number;
@@ -164,6 +174,7 @@ export function extractOpenAINative(
       inputTokens: safeInt(usage.input_tokens),
       outputTokens: safeInt(usage.output_tokens),
       cacheRead: safeInt(inputDetails.cached_tokens),
+      cacheWrite: safeInt(inputDetails.cache_write_tokens),
       reasoning: safeInt(outputDetails.reasoning_tokens),
       audioInput: safeInt(inputDetails.audio_tokens),
       audioOutput: 0, // not exposed by Responses API today
@@ -179,6 +190,7 @@ export function extractOpenAINative(
       inputTokens: safeInt(usage.prompt_tokens),
       outputTokens: safeInt(usage.completion_tokens),
       cacheRead: safeInt(promptDetails.cached_tokens),
+      cacheWrite: safeInt(promptDetails.cache_write_tokens),
       reasoning: safeInt(completionDetails.reasoning_tokens),
       audioInput: safeInt(promptDetails.audio_tokens),
       audioOutput: safeInt(completionDetails.audio_tokens),
@@ -203,11 +215,14 @@ export function extractOpenAINative(
     }
   }
 
+  const resolvedModel = resolveModel(resp.model, modelId);
+  const provider = providerHint || inferProvider(resolvedModel);
+
   // Consistency guard: for genuine OpenAI, total_tokens always equals
   // prompt + completion (reasoning is a SUBSET of completion, never additive).
-  // Verified across every captured real OpenAI-shaped response — zero deltas.
-  // So a POSITIVE delta means tokens exist that neither named bucket accounts
-  // for, which only happens behind an OpenAI-COMPATIBLE proxy that under-reports.
+  // Verified across every fixture under openai_native/ — zero deltas. So a
+  // POSITIVE delta means tokens exist that neither named bucket accounts for,
+  // which only happens behind an OpenAI-COMPATIBLE proxy that under-reports.
   //
   // Measured on Gemini through Google's own OpenAI-compat layer:
   // prompt_tokens=57, completion_tokens=47, total_tokens=1253 — 1149 real
@@ -220,62 +235,62 @@ export function extractOpenAINative(
   // providers in OUTPUT_INCLUDES_REASONING, so for real OpenAI that would set the
   // field and immediately discard it, recovering nothing.
   //
-  // `reasoning` is subtracted from the accounted total, and that subtraction is
-  // load-bearing rather than cosmetic. This adapter no longer only ever emits
-  // provider="openai" — it also emits "workers-ai" (Cloudflare `/compat`) and
-  // "databricks" (via providerHint), and for those computeCost bills reasoning
-  // ADDITIVELY. A payload reporting both `reasoning_tokens` and an inflated
-  // `total_tokens` would then be charged for them twice: once inside the grown
-  // `output` and again as a separate reasoning line. Subtracting first means a
-  // provider that already broke reasoning out gets no second bill, while the case
-  // this guard exists for — a thinking model behind a proxy that reports NO
-  // breakdown at all (measured: prompt 57, completion 47, total 1253) — still
-  // recovers its 1,149 tokens, because reasoning is 0 there.
-  //
-  // The cache counts are subtracted for the SAME reason as reasoning, and this was
-  // the half that was missing. The guard assumed every OpenAI-shaped surface reports
-  // cache_read INSIDE prompt_tokens, which held for all three surfaces that existed
-  // when it was written (native OpenAI: zero deltas; Databricks: 112/112 rows with
-  // total == input + output; Cloudflare: cache outside `input` but outside `total`
-  // too, so it never inflated the delta). Snowflake Cortex is the surface that broke
-  // it — an OpenAI-WIRE endpoint with Anthropic's ADDITIVE convention: measured
+  // WHAT COUNTS AS ACCOUNTED is a per-provider fact, not a payload fact. The
+  // wire is one shape, but the convention behind it splits: OpenAI puts the
+  // cache and reasoning counts INSIDE prompt/completion, while Snowflake Cortex
+  // answers on the same wire with Anthropic's ADDITIVE convention — measured
   // 2026-08-25, prompt_tokens=7, cached_tokens=4805, completion_tokens=6,
-  // total_tokens=4818, i.e. the cached block sits OUTSIDE prompt_tokens and INSIDE
-  // total_tokens. Accounting for only input+output+reasoning made those 4,805 cached
-  // tokens look unaccounted, so they were folded into `output` — 4,811 reported for a
-  // call that generated 6, while the same tokens also shipped as cache_read. 2.0x on
-  // the call, 800x on the output line. See 09_snowflake_cortex_cache_chat.json.
+  // total_tokens=4818: the cached block sits OUTSIDE prompt_tokens and INSIDE
+  // total_tokens. Accounting for input+output only made those 4,805 cached
+  // tokens look unaccounted, so they were folded into `output` — 4,811 reported
+  // for a call that generated 6, while the same tokens also shipped as
+  // cache_read. 2.0x on the call, 800x on the output line. See
+  // 12_snowflake_cortex_cache_chat.json.
   //
-  // `cache_write_tokens` is read straight from the payload rather than from a
-  // canonical field because it is deliberately NOT mapped to CanonicalUsage.cache_write
-  // (for OpenAI it sits inside prompt_tokens and billing it separately over-charges
-  // 2.24x — see MAPPED_DETAIL_FIELDS). It still has to be accounted for here, or an
-  // additive cache WRITE would inflate `output` exactly the way the read did.
+  // So the accounted sum adds each subset field exactly when the provider
+  // reports it OUTSIDE its parent count, read from the same tokenSemantics
+  // table computeCost and deoverlappedTokenTotal bill from — the guard and the
+  // money paths cannot answer the convention question differently. It cannot be
+  // decided from the payload instead: `accounted <= total` admits a small
+  // subtractive cache (folds too little), `cacheRead > inputTokens` rejects a
+  // small additive one (folds tokens never generated) — both were tried against
+  // real shapes and both leak. And subtracting unconditionally disarms the
+  // guard where it is load-bearing: on a SUBSET surface the cache is already
+  // inside `input`, so also adding it to the accounted sum eats a genuine
+  // remainder — Gemini-compat's own cached+thinking payload would under-fold by
+  // exactly the cached count, silently, with no onError.
   //
-  // Subtracting them cannot suppress a genuine fold on a subtractive surface: there
-  // the cache counts are already inside `input`, so removing them again only drives
-  // the delta further negative, where the `> 0` guard already no-ops. Verified against
-  // every captured OpenAI, Databricks and Cloudflare fixture — all still 0.
+  // `cacheWrite` is the raw prompt/input_tokens_details count because it is
+  // deliberately NOT mapped to CanonicalUsage.cache_write (for OpenAI it sits
+  // inside prompt_tokens and billing it separately over-charges 2.24x — see
+  // MAPPED_DETAIL_FIELDS), yet an additive cache WRITE would inflate `output`
+  // exactly the way the read did. `cache_write_tokens` is the only spelling
+  // accounted for — an OpenAI-compat proxy re-reporting Anthropic's
+  // `cache_creation_input_tokens` (or `cache_creation.*`) inside a details
+  // block would still fold. Known limit: those spellings land in `extras` via
+  // the drift sweep, which is the signal to add them HERE, deliberately —
+  // deriving the accounting from the sweep itself would assume every unmapped
+  // count is additive, the same payload-only guess ruled out above.
+  //
+  // The residual: an UNRECOGNIZED additive proxy arrives as provider="openai"
+  // and folds its cached block, exactly as Cortex did before its baseURL rule
+  // existed. The payload carries no convention, so identification (a
+  // providerHintFor entry) is the fix — not loosening this arithmetic.
   //
   // A no-op for real OpenAI either way: total always equals prompt + completion.
   const declaredTotal = safeInt(usage.total_tokens);
   if (declaredTotal) {
-    const promptDetails = isObject(usage.prompt_tokens_details) ? usage.prompt_tokens_details : {};
-    const cacheWrite = safeInt(promptDetails.cache_write_tokens);
-    const unaccounted =
-      declaredTotal -
-      (extracted.inputTokens +
-        extracted.outputTokens +
-        extracted.reasoning +
-        extracted.cacheRead +
-        cacheWrite);
+    const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(provider, extracted.api);
+    let accounted = extracted.inputTokens + extracted.outputTokens;
+    if (!incReasoning) accounted += extracted.reasoning;
+    if (!incCacheRead) accounted += extracted.cacheRead;
+    if (!incCacheWrite) accounted += extracted.cacheWrite;
+    const unaccounted = declaredTotal - accounted;
     if (unaccounted > 0) {
       extracted.outputTokens += unaccounted;
       extras.unaccounted_output_tokens = unaccounted;
     }
   }
-
-  const resolvedModel = resolveModel(resp.model, modelId);
 
   return makeCanonicalUsage({
     input: extracted.inputTokens,
@@ -286,7 +301,7 @@ export function extractOpenAINative(
     audio_output: extracted.audioOutput,
     tool_calls: extracted.toolCalls,
     model: resolvedModel,
-    provider: providerHint || inferProvider(resolvedModel),
+    provider,
     api: extracted.api,
     extras,
   });
