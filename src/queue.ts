@@ -264,10 +264,7 @@ export class EventQueue {
           retry.push(event);
         } else {
           this.reportError(exc, "shutdown_drain");
-          warn(
-            `[lago] event LOST on shutdown — no retry left: transaction_id=${event.transaction_id}:`,
-            exc,
-          );
+          warn(`[lago] event LOST on shutdown — no retry left: transaction_id=${event.transaction_id}:`, exc);
         }
       }
     }
