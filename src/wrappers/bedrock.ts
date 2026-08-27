@@ -33,6 +33,10 @@ interface EmitOpts {
 
 interface SDKLike {
   emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 interface CommandLike {
@@ -120,10 +124,9 @@ export function wrapBedrockClient(
           return response;
       }
     } catch (err) {
-      // Instrumentation must never break the customer's call.
-      if (typeof console !== "undefined" && console.warn) {
-        console.warn("[lago] bedrock instrumentation failed:", (err as Error).message);
-      }
+      // Instrumentation must never break the customer's call — but it must not go
+      // unreported either: reaching here means this call was not billed.
+      sdk.reportError(err, "wrapper.bedrock");
       return response;
     }
   };
@@ -157,8 +160,8 @@ async function* wrapConverseStream(
       try {
         const usage = extractBedrockConverse(captured, modelId);
         sdk.emit(usage, emitOpts);
-      } catch {
-        /* swallow */
+      } catch (err) {
+        sdk.reportError(err, "adapter.bedrock_converse");
       }
     }
   }
@@ -213,8 +216,8 @@ async function* wrapInvokeStream(
         const usage = extractBedrockInvoke(synthetic, modelId);
         sdk.emit(usage, emitOpts);
       }
-    } catch {
-      /* swallow */
+    } catch (err) {
+      sdk.reportError(err, "adapter.bedrock_invoke");
     }
   }
 }

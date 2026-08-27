@@ -37,6 +37,10 @@ interface EmitOpts {
 
 interface SDKLike {
   emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 interface ModelsLike {
@@ -102,9 +106,7 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
       const usage = extractGeminiNative(payload, modelId);
       sdk.emit(usage, emitOpts);
     } catch (err) {
-      if (typeof console !== "undefined") {
-        console.warn("[lago] gemini emit failed:", (err as Error).message);
-      }
+      sdk.reportError(err, "adapter.gemini");
     }
   };
 
