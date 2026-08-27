@@ -584,7 +584,18 @@ export class LagoSDK {
     );
   }
 
-  private reportError(err: unknown, where: string): void {
+  /**
+   * The SDK's single error channel: `config.onError` if set, and a `console.warn` floor
+   * either way.
+   *
+   * Reachable from the wrappers on purpose, not private. A wrapper runs the ADAPTER that
+   * parses a provider response, and that ran outside this boundary — so when a provider
+   * drifted, the wrapper logged a line and stopped. Public in the sense that the package
+   * calls it across module boundaries; not part of the supported API.
+   *
+   * @internal
+   */
+  reportError(err: unknown, where: string): void {
     if (this.config.onError) {
       try {
         this.config.onError(err, where);

@@ -42,6 +42,10 @@ interface EmitOpts {
 
 interface SDKLike {
   emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 interface CompletionsLike {
@@ -186,9 +190,10 @@ export function wrapOpenAIClient<T extends OpenAILike>(
       const usage = extractOpenAINative(payload, modelId, providerHint);
       sdk.emit(usage, emitOpts);
     } catch (err) {
-      if (typeof console !== "undefined") {
-        console.warn("[lago] openai emit failed:", (err as Error).message);
-      }
+      // A drifted response shape is a total billing outage for this provider, so it goes
+      // to `onError`, not just to a log. `reportError` logs as well, so this is one line
+      // per gap rather than two.
+      sdk.reportError(err, "adapter.openai");
     }
   };
 
@@ -251,8 +256,10 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                   } else if (isAsyncIterable(value)) {
                     next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
                   }
-                } catch {
-                  /* never break the call */
+                } catch (err) {
+                  // Never break the call — but reaching here means the call went
+                  // uninstrumented, which is the same lost revenue as a failed extract.
+                  sdk.reportError(err, "wrapper.openai");
                 }
                 return onfulfilled ? onfulfilled(next) : next;
               }, onrejected);
@@ -274,8 +281,8 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                 if (looksLikeResponse(result?.data) && !(await isCacheHit(target))) {
                   emitOnce(result.data);
                 }
-              } catch {
-                /* never break the call */
+              } catch (err) {
+                sdk.reportError(err, "wrapper.openai");
               }
               return result;
             };
@@ -372,8 +379,10 @@ async function* wrapAsyncIterableStream(
       try {
         const usage = extractOpenAINative(lastUsage, modelId, providerHint);
         sdk.emit(usage, opts);
-      } catch {
-        /* swallow */
+      } catch (err) {
+        // The streaming paths were the worst of the set: they swallowed without even a
+        // log, so a drifted stream shape produced no signal anywhere at all.
+        sdk.reportError(err, "adapter.openai");
       }
     }
   }

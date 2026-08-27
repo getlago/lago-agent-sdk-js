@@ -31,6 +31,10 @@ interface SDKLike {
       markup?: number;
     },
   ) => void;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 export interface WrapMistralOptions {
@@ -91,9 +95,7 @@ export function wrapMistralClient<T extends MistralLike>(
         const usage = extractMistralNative(response, modelId);
         sdk.emit(usage, resolveOpts(lagoOpts));
       } catch (err) {
-        if (typeof console !== "undefined") {
-          console.warn("[lago] mistral.chat.complete instrumentation failed:", (err as Error).message);
-        }
+        sdk.reportError(err, "adapter.mistral");
       }
       return response;
     };
@@ -137,8 +139,8 @@ export function wrapMistralClient<T extends MistralLike>(
             try {
               const usage = extractMistralNative(lastUsage, modelId);
               sdk.emit(usage, resolveOpts(lagoOpts));
-            } catch {
-              /* swallow */
+            } catch (err) {
+              sdk.reportError(err, "adapter.mistral");
             }
           }
         }
