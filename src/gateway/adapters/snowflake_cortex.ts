@@ -145,8 +145,13 @@ export type SnowflakeSubscriptionSource = (typeof DEFAULT_SUBSCRIPTION_ORDER)[nu
  * a caller who normalized keys themselves would otherwise silently extract zeros from a
  * row that has every value. Exact match wins so a row carrying both spellings is never
  * ambiguous.
+ *
+ * Exported for `gateway/snowflake.ts`, which reads `START_TIME` off the raw row to stamp
+ * the event and has to tolerate the same two spellings. One implementation rather than
+ * two, matching how the Databricks pair shares `safeStr` — a second copy would be free to
+ * drift from this one, and the drift would read as zeros rather than as an error.
  */
-function column(row: Record<string, unknown>, name: string): unknown {
+export function column(row: Record<string, unknown>, name: string): unknown {
   if (name in row) return row[name];
   return row[name.toLowerCase()];
 }

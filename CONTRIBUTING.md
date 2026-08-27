@@ -66,7 +66,10 @@ npm run build
    gateway is the implicit default.
 4. Add `tests/unit/gateway/adapters/<gateway>.test.ts` against the captured fixtures.
 5. Add a `## <Gateway> AI Gateway` README section and a `CHANGELOG.md` entry.
-6. The Python repo carries the runnable notebook; mirror the README section here.
+6. Mirror the README section here. The Python repo's notebook is a local artefact —
+   `examples/` is gitignored there, because a saved notebook carries account
+   identifiers and live subscription ids in its cells and outputs — so the README
+   section is the reviewable artefact in both repos.
 
 ### A connector is only as good as the comparison
 
