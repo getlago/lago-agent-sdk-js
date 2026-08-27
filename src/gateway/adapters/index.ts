@@ -4,5 +4,9 @@ export { extractCloudflareLog, resolveSubscription } from "./cloudflare_gateway.
 // symmetrically at the call site and neither is the implicit default.
 export { resolveSubscription as resolveCloudflareSubscription } from "./cloudflare_gateway.js";
 export { extractDatabricksLog, resolveDatabricksSubscription } from "./databricks_gateway.js";
-export { extractSnowflakeRestLog, resolveSnowflakeSubscription } from "./snowflake_cortex.js";
+export {
+  extractSnowflakeFunctionsLog,
+  extractSnowflakeRestLog,
+  resolveSnowflakeSubscription,
+} from "./snowflake_cortex.js";
 export type { SnowflakeSubscriptionSource } from "./snowflake_cortex.js";
