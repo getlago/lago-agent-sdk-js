@@ -43,6 +43,10 @@ interface SDKLike {
    * back to the configured default. Wrappers call it while the customer's own call frame
    * is still on the stack, which is the only place the async-local store is readable. */
   resolveSubscription: (override?: string) => string | null;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 interface MessagesLike {
@@ -135,9 +139,7 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
       const usage = extractAnthropicNative(payload, modelId);
       sdk.emit(usage, opts);
     } catch (err) {
-      if (typeof console !== "undefined") {
-        console.warn("[lago] anthropic emit failed:", (err as Error).message);
-      }
+      sdk.reportError(err, "adapter.anthropic");
     }
   };
 
@@ -200,8 +202,8 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
                   } else if (isAsyncIterable(value)) {
                     next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
                   }
-                } catch {
-                  /* never break the call */
+                } catch (err) {
+                  sdk.reportError(err, "wrapper.anthropic");
                 }
                 return onfulfilled ? onfulfilled(next) : next;
               }, onrejected);
@@ -223,8 +225,8 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
                 if (looksLikeMessage(result?.data) && !(await isCacheHit(target))) {
                   emitOnce(result.data);
                 }
-              } catch {
-                /* never break the call */
+              } catch (err) {
+                sdk.reportError(err, "wrapper.anthropic");
               }
               return result;
             };
@@ -343,25 +345,45 @@ async function* wrapAsyncIterableStream(
   const accumulated: Record<string, unknown> = {};
   let sawUsage = false;
   let resolvedModel: string | null = null;
+  // Set if reading a chunk's usage ever throws. Two reasons it is a latch rather than a
+  // per-chunk report. First, this generator IS the customer's stream: unlike every other
+  // wrapper here, the accumulation is EAGER — `mergeStreamUsage` does
+  // `Object.assign(accumulated, message.usage)`, which reads each property — so a
+  // response object whose usage access throws propagated straight out of the customer's
+  // `for await` and aborted their call. Second, once one chunk cannot be read,
+  // `accumulated` holds a PARTIAL total, and Anthropic's stream reports usage
+  // cumulatively; billing a partial total is a silent under-bill, so nothing is emitted
+  // and the gap is reported once instead.
+  let readFailure: unknown = null;
   try {
     for await (const event of src) {
-      // Each event is a RawMessageStreamEvent — most carry a payload with snake_case fields.
-      const payload =
-        isObject(event) && "model_dump" in (event as object)
-          ? (event as { model_dump: () => unknown }).model_dump()
-          : event;
-      const { merged, model } = mergeStreamUsage(accumulated, payload);
-      if (merged) sawUsage = true;
-      resolvedModel = model ?? resolvedModel;
+      if (readFailure === null) {
+        try {
+          // Each event is a RawMessageStreamEvent — most carry a payload with snake_case fields.
+          const payload =
+            isObject(event) && "model_dump" in (event as object)
+              ? (event as { model_dump: () => unknown }).model_dump()
+              : event;
+          const { merged, model } = mergeStreamUsage(accumulated, payload);
+          if (merged) sawUsage = true;
+          resolvedModel = model ?? resolvedModel;
+        } catch (err) {
+          readFailure = err;
+        }
+      }
+      // Outside the guard on purpose: a `return` or `throw` sent into this generator by
+      // the consumer must not be swallowed by instrumentation.
       yield event;
     }
   } finally {
-    if (sawUsage) {
+    if (readFailure !== null) {
+      sdk.reportError(readFailure, "adapter.anthropic");
+    } else if (sawUsage) {
       try {
         const usage = extractAnthropicNative({ usage: accumulated, model: resolvedModel }, modelId);
         sdk.emit(usage, opts);
-      } catch {
-        /* swallow */
+      } catch (err) {
+        sdk.reportError(err, "adapter.anthropic");
       }
     }
   }

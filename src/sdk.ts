@@ -595,7 +595,18 @@ export class LagoSDK {
     );
   }
 
-  private reportError(err: unknown, where: string): void {
+  /**
+   * The SDK's single error channel: `config.onError` if set, and a `console.warn` floor
+   * either way.
+   *
+   * Reachable from the wrappers on purpose, not private. A wrapper runs the ADAPTER that
+   * parses a provider response, and that ran outside this boundary — so when a provider
+   * drifted, the wrapper logged a line and stopped. Public in the sense that the package
+   * calls it across module boundaries; not part of the supported API.
+   *
+   * @internal
+   */
+  reportError(err: unknown, where: string): void {
     if (this.config.onError) {
       try {
         this.config.onError(err, where);
@@ -745,6 +756,13 @@ export class LagoSDK {
     return counts;
   }
 
+  /**
+   * Wait for every event emitted so far to reach Lago.
+   *
+   * `true` means delivered. `false` means the timeout ran out with events still owed —
+   * buffered, in flight, or waiting out a retry backoff — and they are still queued,
+   * not lost; `shutdown()` gets one more bounded attempt at them.
+   */
   flush(timeoutMs: number = 5000): Promise<boolean> {
     return this.queue.flush(timeoutMs);
   }

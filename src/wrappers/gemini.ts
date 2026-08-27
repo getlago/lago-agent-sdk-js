@@ -41,6 +41,10 @@ interface SDKLike {
    * back to the configured default. Wrappers call it while the customer's own call frame
    * is still on the stack, which is the only place the async-local store is readable. */
   resolveSubscription: (override?: string) => string | null;
+  /** The SDK's error channel. Wrappers report through it rather than logging, so a
+   * provider whose response shape drifts surfaces on the hook customers actually watch
+   * — a log line alone is a silent billing outage for that provider. */
+  reportError: (err: unknown, where: string) => void;
 }
 
 interface ModelsLike {
@@ -117,9 +121,7 @@ export function wrapGeminiClient<T extends GoogleGenAILike>(
       const usage = extractGeminiNative(payload, modelId);
       sdk.emit(usage, emitOpts);
     } catch (err) {
-      if (typeof console !== "undefined") {
-        console.warn("[lago] gemini emit failed:", (err as Error).message);
-      }
+      sdk.reportError(err, "adapter.gemini");
     }
   };
 
