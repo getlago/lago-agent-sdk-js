@@ -24,6 +24,8 @@
  * Python port's Decimal path, which `money_golden.json` pins in both repos.
  */
 
+import { tokenSemantics } from "./token_semantics.js";
+
 export const OPENROUTER_URL = "https://openrouter.ai/api/v1/models";
 export const AWS_PRICING_HOST = "https://pricing.us-east-1.amazonaws.com";
 export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/AmazonBedrock/current/region_index.json`;
@@ -43,83 +45,11 @@ const FETCH_RETRY_MAX_MS = 60_000;
 export const PRICED_FIELDS = ["input", "output", "cache_read", "cache_write", "reasoning"] as const;
 export type PricedField = (typeof PRICED_FIELDS)[number];
 
-// MEMBERSHIP IS BILLING-CRITICAL. These two sets say whether a subset metric is already
-// counted inside its parent; pricing the parent at full count AND the subset separately
-// double-bills the overlap. Getting a provider's side wrong over-bills real customers,
-// and the error scales with cache hit rate.
-//
-//   openai, gemini    — cache_read is INSIDE input (`prompt_tokens_details.cached_tokens`)
-//   anthropic         — cache_read/cache_write are ADDITIVE to input, hence absent
-//   workers-ai        — only ever reached through Cloudflare's OpenAI-COMPATIBLE
-//                       endpoint, so the payload is the OpenAI shape and the OpenAI
-//                       semantics apply on BOTH axes: `cached_tokens` inside
-//                       `prompt_tokens`, and `reasoning_tokens` inside
-//                       `completion_tokens`. It is a separate provider only because it
-//                       prices against Cloudflare's catalog (see inferProvider in
-//                       adapters/openai_native.ts).
-//   mistral           — OpenAI-shaped API reporting `prompt_tokens_details.cached_tokens`
-//                       as a SUBSET of `prompt_tokens`. Mistral's own documented example
-//                       settles it: prompt=1013, cached=1008, total=1043 = prompt +
-//                       completion, which only reconciles if the cached tokens sit inside
-//                       the prompt count. Omitting it over-billed that payload by 6.15x,
-//                       and 13 of 18 Mistral models on OpenRouter publish a cache-read
-//                       rate, so the wrong path was reachable for most of them —
-//                       including Mistral routed through a Cloudflare gateway, since the
-//                       gateway adapter leaves provider="mistral" as-is.
-//   snowflake         — ABSENT despite Cortex answering on an OpenAI-WIRE endpoint, and
-//                       this is the case a wire-shape assumption gets wrong: measured
-//                       live 2026-08-25, prompt=7, cached=8745, completion=6, total=8758
-//                       — the cached block sits OUTSIDE prompt_tokens and INSIDE total,
-//                       Anthropic's ADDITIVE convention on OpenAI's wire. Adding it would
-//                       subtract 8,745 tokens that were never in `input`. Nothing on this
-//                       path reaches computeCost today (TOKEN_BILLED_PROVIDERS
-//                       short-circuits first); the note is for whoever completes the set
-//                       by wire shape rather than by measurement.
-//
-// Workers AI's reasoning membership is latent, not live: measured against the real
-// gateway, `/compat` returns `completion_tokens_details: null` even for reasoning
-// models (gpt-oss-120b, deepseek-r1-distill-qwen-32b, qwq-32b), and Cloudflare's
-// catalog publishes no per-M-reasoning-tokens unit. It is here because the day either
-// changes, the overlap has to already be known — and because the Python port
-// (_OUTPUT_INCLUDES_REASONING) has carried it since the same review, and the two
-// repos reporting different token quantities for one call is its own bug.
-const INPUT_INCLUDES_CACHE_READ = new Set(["openai", "gemini", "workers-ai", "mistral"]);
-const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
-
-// Gateway SURFACES that re-report every vendor's usage in the OpenAI shape: `input`
-// already contains cache_read AND cache_write, and `output` already contains reasoning,
-// no matter which vendor actually served the call.
-//
-// Keys on `CanonicalUsage.api` rather than the provider because on a gateway it is the
-// SURFACE that decides the shape, and a surface row reuses the live vendor names. A
-// provider="anthropic" row read from Databricks' system table needs the correction; a
-// provider="anthropic" response from Anthropic's own API must NOT get it. The vendor
-// name cannot tell those two apart, so it is the wrong key — unlike "workers-ai" above,
-// which names a vendor reachable through exactly one surface and so works as a provider.
-//
-// Measured on `system.ai_gateway.usage`, 246 rows across 6 vendors: `total_tokens ==
-// input + output` for EVERY vendor group, with cache_read and cache_write inside input
-// and reasoning inside output. Anthropic's own API reports the exact opposite
-// (cache_read=3962 against input=9, additive), which is why keying on the vendor
-// over-billed a real backfill 1.570x — 48,798 tokens reported against 31,091 consumed,
-// the excess being exactly cache_read + cache_write.
-//
-// Cloudflare AI Gateway is deliberately ABSENT: its logs preserve each vendor's native
-// shape instead of normalising them. A real Anthropic entry there reads input=10,
-// output=4, total=14 with input_cached_tokens=3429 sitting OUTSIDE that total —
-// additive, exactly like the native API — so the provider-keyed sets are already right
-// for it and adding it here would UNDER-bill the cached portion.
-//
-// Neither Snowflake Cortex surface qualifies, established from real rows in INT-224 and
-// left out on purpose. The REST view is additive: `TOKENS` equals the sum of every
-// `TOKENS_GRANULAR` value on 24 of 24 captured rows, so `input` EXCLUDES the cached
-// block (`rest_cache_read.json`, and the wire agrees — see INPUT_INCLUDES_CACHE_READ
-// above). It also spells its cache keys `cache_read_input` / `cache_write_input`, which
-// no other surface in this tree uses. The functions view reports no cache keys at all.
-// Adding either would drop a cached row from 4,698 tokens to 14; INT-221's
-// reconciliation test asserts the sum against Snowflake's own TOKENS column and fails if
-// someone does.
-const OPENAI_SHAPED_APIS = new Set(["databricks_gateway"]);
+// The subset-vs-additive convention sets (INPUT_INCLUDES_CACHE_READ and friends) used
+// to live here. They moved to token_semantics.ts the day the total_tokens guard in
+// adapters/openai_native.ts needed the same answers: the guard, the cost split and the
+// token total are three readings of one convention, and keeping the sets in this module
+// would have forced the adapter layer to import pricing's HTTP machinery to reach them.
 
 // Providers this SDK bills as TOKEN COUNTS by design, even in price mode — because no
 // per-token rate for them exists anywhere the SDK could read it.
@@ -364,25 +294,13 @@ export type CanonicalUsageLike = { [K in PricedField]: number } & {
 };
 
 /**
- * Which of a record's subsets are ALREADY inside their parent count.
+ * `tokenSemantics` read off a CanonicalUsage — see token_semantics.ts.
  *
- * Returns `[inputIncludesCacheRead, inputIncludesCacheWrite, outputIncludesReasoning]`,
- * the three overlaps the billing paths have to remove. The SURFACE wins over the vendor:
- * a gateway that re-reports usage in its own shape has already decided the convention,
- * so `api` is checked first and the provider-keyed sets only answer for a native call.
- *
- * `cache_write` is surface-only by design and has no provider set to consult: Anthropic
- * is the one vendor whose native API bills cache writes at all, and it reports them
- * additively, so no native response needs the correction.
+ * Kept as the module-internal spelling so the billing paths keep reading the convention
+ * from the record they are billing, not from loose strings.
  */
-function tokenSemantics(usage: CanonicalUsageLike): [boolean, boolean, boolean] {
-  const provider = (usage.provider || "").toLowerCase();
-  const shaped = OPENAI_SHAPED_APIS.has((usage.api || "").toLowerCase());
-  return [
-    shaped || INPUT_INCLUDES_CACHE_READ.has(provider),
-    shaped,
-    shaped || OUTPUT_INCLUDES_REASONING.has(provider),
-  ];
+function usageTokenSemantics(usage: CanonicalUsageLike): [boolean, boolean, boolean] {
+  return tokenSemantics(usage.provider || "", usage.api || "");
 }
 
 export function computeCost(
@@ -400,7 +318,7 @@ export function computeCost(
   //     way. Only one of cache_read/cache_write is non-zero on a given Databricks
   //     row, but both are subtracted unconditionally so a surface that does report
   //     both at once still reconciles.
-  const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(usage);
+  const [incCacheRead, incCacheWrite, incReasoning] = usageTokenSemantics(usage);
   if (incReasoning) counts.reasoning = 0;
   if (incCacheRead && price.cache_read !== null && price.cache_read !== undefined) {
     counts.input = Math.max(0, counts.input - counts.cache_read);
@@ -457,7 +375,8 @@ function finalizeBreakdown(
  *   - reasoning   ⊆ output — providers in OUTPUT_INCLUDES_REASONING, or any row
  *     from a surface in OPENAI_SHAPED_APIS
  *   - cache_read  ⊆ input  — providers in INPUT_INCLUDES_CACHE_READ, likewise
- *   - cache_write ⊆ input  — surfaces in OPENAI_SHAPED_APIS only
+ *   - cache_write ⊆ input  — providers in INPUT_INCLUDES_CACHE_WRITE, likewise
+ *     (all in token_semantics.ts)
  *
  * NOT gated on a unit price existing (unlike `computeCost`'s subtraction): a published
  * rate cannot change how many tokens were consumed. The two still agree in the case
@@ -470,7 +389,7 @@ function finalizeBreakdown(
 export function deoverlappedTokenTotal(usage: CanonicalUsageLike): number {
   const counts: Record<string, number> = {};
   for (const f of PRICED_FIELDS) counts[f] = Number((usage as any)[f] ?? 0) || 0;
-  const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(usage);
+  const [incCacheRead, incCacheWrite, incReasoning] = usageTokenSemantics(usage);
   if (incReasoning) counts.reasoning = 0;
   if (incCacheRead) counts.cache_read = 0;
   if (incCacheWrite) counts.cache_write = 0;

@@ -131,6 +131,23 @@ describe("OpenAI native adapter — model attribution (bill on what answered, no
     expect(u.model).toBe("gpt-4o-mini-2024-07-18"); // the resolved model that actually answered
   });
 
+  it("keeps the customer's spelling of a fully-qualified Cortex model id", () => {
+    // A Cortex fine-tune answers as `database.schema.model`. CanonicalUsage.model
+    // keeps it verbatim — normalising here would report a model the customer cannot
+    // find in their own Snowflake account. (The hint is what a wrapped client whose
+    // baseURL matches the Cortex path supplies — see providerHintFor.)
+    const u = extractOpenAINative(
+      {
+        model: "mydb.myschema.my_tuned_model",
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      },
+      "mydb.myschema.my_tuned_model",
+      "snowflake",
+    );
+    expect(u.model).toBe("mydb.myschema.my_tuned_model");
+    expect(u.provider).toBe("snowflake");
+  });
+
   it("falls back to the requested model when the response is silent about it", () => {
     // The synthetic usage blob the streaming wrapper builds carries no
     // top-level `model` — fall back to the requested model rather than
@@ -237,6 +254,89 @@ describe("OpenAI native adapter — synthetic edge cases", () => {
   });
 });
 
+describe("Snowflake Cortex — an OpenAI-wire endpoint with ADDITIVE cache", () => {
+  // Cortex answers on `/api/v2/cortex/v1/chat/completions` with OpenAI's exact
+  // payload shape, so this adapter serves it — but it does NOT follow OpenAI's
+  // token convention. Captured live 2026-08-25 by capture_snowflake_cortex.py;
+  // never hand-edit these numbers, recapture instead.
+
+  it("plain call — no cache, total reconciles to prompt + completion", () => {
+    const { modelId, response } = load("11_snowflake_cortex_plain_chat.json");
+    const u = extractOpenAINative(response, modelId, "snowflake");
+    expect(u.input).toBe(21);
+    expect(u.output).toBe(4);
+    expect(u.cache_read).toBe(0);
+    expect(u.provider).toBe("snowflake");
+    expect(u.api).toBe("chat_completions");
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+  });
+
+  it("cached call — cached_tokens sit OUTSIDE prompt_tokens and INSIDE total_tokens", () => {
+    // THE regression. 7 + 4805 + 6 = 4818, so under the old accounting (input +
+    // output + reasoning only) the 4,805 cached tokens looked unaccounted and were
+    // folded into `output`: 4,811 reported for a call that generated 6, while the
+    // same tokens also shipped as cache_read — 2.0x on the call, 800x on the output
+    // line. Revert the cache accounting in openai_native.ts and this test fails on
+    // `output`.
+    //
+    // This exact hazard was raised in review on PY #14 (2026-08-17) and answered
+    // "measured 0 on all three surfaces we have" — true then. Cortex is the surface
+    // that did not exist yet.
+    const { modelId, response } = load("12_snowflake_cortex_cache_chat.json");
+    const usage = (
+      response as {
+        usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } & Record<
+          string,
+          Record<string, number>
+        >;
+      }
+    ).usage;
+    // Read the cached count off the fixture rather than pinning a literal: the
+    // assertion is the additive IDENTITY, so a recapture with a different cached
+    // count must keep passing instead of nudging someone toward the hand-edit the
+    // header above forbids.
+    const cached = usage.prompt_tokens_details.cached_tokens;
+    expect(cached).toBeGreaterThan(0);
+    expect(usage.prompt_tokens + cached + usage.completion_tokens).toBe(usage.total_tokens);
+
+    const u = extractOpenAINative(response, modelId, "snowflake");
+    expect(u.input).toBe(usage.prompt_tokens);
+    expect(u.output).toBe(usage.completion_tokens); // NOT completion + cached
+    expect(u.cache_read).toBe(cached);
+    // cache_write stays unmapped BY DESIGN (u.cache_write is 0 on every path, so
+    // asserting it proves nothing) — the load-bearing check is that the raw key is
+    // still visible in extras rather than silently consumed by the guard.
+    expect(u.extras["prompt_tokens_details.cache_write_tokens"]).toBe(0);
+    expect(u.reasoning).toBe(0);
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+  });
+
+  it("without a hint is stamped openai and folds — identification is load-bearing", () => {
+    // Pins what REAL traffic does until the wrapper carries a Cortex baseURL rule
+    // (PR #26's twin adds `/api/v2/cortex/` → "snowflake" to providerHintFor): the
+    // response body has no marker of its own, so an unhinted Cortex payload is
+    // stamped "openai", whose SUBSET convention folds the additive cached block into
+    // `output` again. This is deliberate — the payload cannot carry the convention,
+    // so identification is the fix, not looser arithmetic. If this test starts
+    // failing because the fold stopped, the guard has been loosened for every
+    // genuine OpenAI-compat proxy; if it fails on `provider`, the hint now reaches
+    // this adapter by default and the test should assert the fixed behaviour
+    // instead.
+    const { modelId, response } = load("12_snowflake_cortex_cache_chat.json");
+    const usage = (
+      response as {
+        usage: { completion_tokens: number } & Record<string, Record<string, number>>;
+      }
+    ).usage;
+    const cached = usage.prompt_tokens_details.cached_tokens;
+
+    const u = extractOpenAINative(response, modelId);
+    expect(u.provider).toBe("openai");
+    expect(u.output).toBe(usage.completion_tokens + cached);
+    expect(u.extras.unaccounted_output_tokens).toBe(cached);
+  });
+});
+
 describe("nested drift sweep + total_tokens consistency guard", () => {
   it("surfaces cache_write_tokens in extras but does NOT map it to cache_write", () => {
     // Real captured `gpt-5.6-sol` shape. Two assertions, and the second matters
@@ -300,6 +400,120 @@ describe("nested drift sweep + total_tokens consistency guard", () => {
     expect(u.input).toBe(57);
     expect(u.output).toBe(1196);
     expect(u.extras.unaccounted_output_tokens).toBe(1149);
+  });
+
+  it("does not fold an ADDITIVE cache_write into output", () => {
+    // The payload shape raised in review on PY #14: a proxy reporting cache-creation
+    // tokens outside `prompt_tokens` but inside `total_tokens`. It was answered
+    // "unreachable on the three surfaces we have", which was true at the time —
+    // Snowflake Cortex then shipped the same class of payload with `cached_tokens`.
+    // The write is accounted for from the raw payload because `cache_write_tokens`
+    // is deliberately never mapped to CanonicalUsage.cache_write and so has no
+    // other route into the accounting — but only under a provider whose convention
+    // IS additive: for OpenAI itself the write sits inside prompt_tokens (see the
+    // "keeps the guard armed" test below).
+    const u = extractOpenAINative(
+      {
+        usage: {
+          prompt_tokens: 13,
+          completion_tokens: 4,
+          total_tokens: 1829,
+          prompt_tokens_details: { cache_write_tokens: 1812 },
+        },
+      },
+      "",
+      "snowflake",
+    );
+    expect(u.output).toBe(4); // was 1816
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+    expect(u.extras["prompt_tokens_details.cache_write_tokens"]).toBe(1812);
+  });
+
+  it("handles an ADDITIVE cache_write on the Responses shape too", () => {
+    // Same convention, other API branch: the Responses shape spells the container
+    // `input_tokens_details`, so a chat-only `prompt_tokens_details` lookup would
+    // leave this exact payload folding 1,812 cached-write tokens into `output` —
+    // the two API shapes must not disagree about one provider's convention.
+    const u = extractOpenAINative(
+      {
+        usage: {
+          input_tokens: 13,
+          output_tokens: 4,
+          total_tokens: 1829,
+          input_tokens_details: { cache_write_tokens: 1812 },
+        },
+      },
+      "",
+      "snowflake",
+    );
+    expect(u.api).toBe("responses");
+    expect(u.output).toBe(4); // was 1816
+    expect(u.extras.unaccounted_output_tokens).toBeUndefined();
+    expect(u.extras["input_tokens_details.cache_write_tokens"]).toBe(1812);
+  });
+
+  it("still recovers a genuine remainder when a cache count is present", () => {
+    // The two corrections must not cancel each other: an additive cache block AND
+    // hidden thinking tokens in the same payload. 20 + 5 + 100 = 125 accounted,
+    // total 200, so 75 are real unreported output and must still fold.
+    const u = extractOpenAINative(
+      {
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 5,
+          total_tokens: 200,
+          prompt_tokens_details: { cached_tokens: 100 },
+        },
+      },
+      "",
+      "snowflake",
+    );
+    expect(u.output).toBe(80);
+    expect(u.extras.unaccounted_output_tokens).toBe(75);
+  });
+
+  it("keeps a subtractive surface's fold intact beside a cache count", () => {
+    // The case that rules out subtracting the cache unconditionally, raised in
+    // review on #38: a SUBSET-convention surface reporting a cached block AND a
+    // genuine remainder. Gemini through Google's own OpenAI-compat layer reports
+    // `cached_tokens` inside `prompt_tokens` (that is why "gemini"/"openai" are in
+    // INPUT_INCLUDES_CACHE_READ) while thinking tokens appear only in the total —
+    // so the 1,000 cached tokens are ALREADY accounted for by prompt_tokens, and
+    // also adding them to the accounted sum would shrink the fold to 149: 1,000
+    // generated tokens unbilled, silently, with no onError. The full 1,149 must
+    // fold.
+    const u = extractOpenAINative({
+      model: "gemini-2.5-flash",
+      usage: {
+        prompt_tokens: 1200,
+        completion_tokens: 47,
+        total_tokens: 2396,
+        prompt_tokens_details: { cached_tokens: 1000 },
+      },
+    });
+    expect(u.provider).toBe("openai"); // no hint: OpenAI-compat traffic is stamped openai
+    expect(u.cache_read).toBe(1000);
+    expect(u.output).toBe(1196); // 47 reported + 1149 unaccounted — NOT 196
+    expect(u.extras.unaccounted_output_tokens).toBe(1149);
+  });
+
+  it("keeps the guard armed on OpenAI's own cache_write shape", () => {
+    // The documented-real OpenAI shape (see the NOTE on MAPPED_DETAIL_FIELDS:
+    // prompt_tokens=3025 measured WITH cache_write_tokens=3022 inside it) behind a
+    // proxy that under-reports 1,171 tokens. OpenAI's write sits inside
+    // prompt_tokens, so it must NOT join the accounted sum — subtracting it
+    // unconditionally would swallow the delta and disarm the guard on the one
+    // payload shape this file documents as measured.
+    const u = extractOpenAINative({
+      usage: {
+        prompt_tokens: 3025,
+        completion_tokens: 4,
+        total_tokens: 4200,
+        prompt_tokens_details: { cache_write_tokens: 3022 },
+      },
+    });
+    expect(u.output).toBe(1175); // 4 reported + 1171 unaccounted — NOT 4
+    expect(u.extras.unaccounted_output_tokens).toBe(1171);
   });
 
   it("is a no-op for genuine OpenAI responses", () => {
