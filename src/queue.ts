@@ -88,6 +88,8 @@ export class EventQueue {
   private stopping = false;
   private backoffMs = 0;
   private loopPromise: Promise<void>;
+  /** Detaches this queue's `process` listeners. Set by `installShutdownHook`. */
+  private releaseShutdownHook: () => void = () => {};
   /** for tests */
   public httpCalls = 0;
 
@@ -138,8 +140,36 @@ export class EventQueue {
     // Release anything parked in a backoff sleep, so shutdown reaches the exit drain
     // instead of waiting out a backoff that can be a full minute long.
     for (const fn of this.stopResolvers.splice(0, this.stopResolvers.length)) fn();
-    // Best effort wait for the loop to complete
-    await Promise.race([this.loopPromise, sleep(timeoutMs)]);
+    await this.awaitLoop(timeoutMs);
+    // This queue is finished, so its `process` listeners must go. Left attached they
+    // did two things: kept every dead queue (and its buffer) reachable for the life of
+    // the process, and let `beforeExit` run a SECOND full shutdown after an explicit
+    // one had already completed.
+    this.releaseShutdownHook();
+  }
+
+  /** Wait for the background loop to finish, giving up after `timeoutMs`.
+   *
+   * Deliberately not `Promise.race([this.loopPromise, sleep(timeoutMs)])`. The loser of
+   * a race keeps running, and that `sleep` was a REF'D timer, so `await shutdown()`
+   * resolved immediately and then held the event loop open for the whole budget —
+   * measured on the defaults, `shutdown()` resolved in 0ms and the process exited
+   * 7003ms later: 5000ms for this timer, then `beforeExit` firing a second
+   * `shutdown(2000)` for the rest. The loop's own timers were already `unref`'d for
+   * exactly this reason; these two were missed.
+   *
+   * Cleared when the loop finishes, and `unref`'d as well so it cannot hold the loop
+   * open even in the branch where the timeout is the one that wins. */
+  private awaitLoop(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const id = setTimeout(resolve, timeoutMs);
+      (id as unknown as { unref?: () => void }).unref?.();
+      const done = () => {
+        clearTimeout(id);
+        resolve();
+      };
+      this.loopPromise.then(done, done);
+    });
   }
 
   /** Nudge the background loop to run its tick (drain + pricing
@@ -378,30 +408,47 @@ export class EventQueue {
   }
 
   private installShutdownHook(): void {
-    if (typeof process !== "undefined" && typeof process.on === "function") {
-      let ran = false;
-      const drain = async () => {
-        if (ran) return;
-        ran = true;
-        try {
-          await this.shutdown(2000);
-        } catch {
-          /* ignore */
-        }
-      };
-      // `beforeExit` alone was not enough: it does not fire on SIGINT, SIGTERM or
-      // an explicit `process.exit()` — i.e. the normal ways a containerized poller
-      // dies — so buffered events were silently lost in exactly those cases, where
-      // Python's `atexit` drained them. Signals re-raise after draining so the
-      // caller's own handlers and the process's exit code are unaffected.
-      process.once("beforeExit", drain);
-      for (const sig of ["SIGINT", "SIGTERM"] as const) {
-        process.once(sig, async () => {
-          await drain();
-          if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
-        });
+    if (typeof process === "undefined" || typeof process.on !== "function") return;
+    let ran = false;
+    const drain = async () => {
+      if (ran) return;
+      ran = true;
+      try {
+        await this.shutdown(2000);
+      } catch {
+        /* ignore */
       }
+    };
+    // `beforeExit` alone was not enough: it does not fire on a signal or on an explicit
+    // `process.exit()` — i.e. the normal ways a containerized poller dies — so buffered
+    // events were silently lost in exactly those cases, where Python's `atexit` drained
+    // them. Signals re-raise after draining so the caller's own handlers and the
+    // process's exit code are unaffected.
+    //
+    // What this covers and what it cannot, measured route by route: natural exit,
+    // SIGINT, SIGTERM and SIGHUP drain; `process.exit()`, an uncaught exception, an
+    // unhandled rejection and SIGQUIT do not. `process.exit()` is synchronous, so no
+    // async drain can exist there. The two error routes are deliberate: a library that
+    // installs `uncaughtException` or `unhandledRejection` SUPPRESSES the host's own
+    // crash, and no billing SDK should change that. SIGQUIT's default is an immediate
+    // core dump and is meant not to be intercepted.
+    const onBeforeExit = () => void drain();
+    const signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
+    process.once("beforeExit", onBeforeExit);
+    // SIGHUP is what a closing terminal and a detaching container send; it was dropping
+    // every buffered event, and it takes the same treatment as its two neighbours.
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      const handler = async () => {
+        await drain();
+        if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+      };
+      signalHandlers.push([sig, handler]);
+      process.once(sig, handler);
     }
+    this.releaseShutdownHook = () => {
+      process.removeListener("beforeExit", onBeforeExit);
+      for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
+    };
   }
 }
 
