@@ -39,6 +39,10 @@ interface EmitOpts {
 
 interface SDKLike {
   emit: (usage: CanonicalUsage, opts?: EmitOpts) => void;
+  /** Reads the subscription bound by `withSubscription()` / `setSubscription()`, falling
+   * back to the configured default. Wrappers call it while the customer's own call frame
+   * is still on the stack, which is the only place the async-local store is readable. */
+  resolveSubscription: (override?: string) => string | null;
   /** The SDK's error channel. Wrappers report through it rather than logging, so a
    * provider whose response shape drifts surfaces on the hook customers actually watch
    * — a log line alone is a silent billing outage for that provider. */
@@ -113,7 +117,18 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
   const originalStream = messages.stream?.bind(messages);
 
   const resolveOpts = (lagoOpts: LagoOpts): EmitOpts => ({
-    subscription: lagoOpts.subscription || baseSub,
+    // Resolved HERE, at the moment the customer makes the call, rather than left to
+    // `emit()` once the response comes back. `withSubscription()` binds the id in
+    // `AsyncLocalStorage`, and the store is only readable INSIDE the `run()` callback —
+    // so a promise or a stream created inside `withSubscription()` and consumed outside
+    // it read no subscription at all and the event was dropped. Measured: 0 events for
+    // both shapes, and `const s = await helper()` — where the helper wraps the call in
+    // `withSubscription` — then iterating `s` is an ordinary way to write it.
+    //
+    // Capturing at call time is also the more defensible rule on its own: the
+    // subscription that owns a call is the one that was active when the call was made,
+    // not whatever happens to be active whenever the provider answers.
+    subscription: lagoOpts.subscription || baseSub || sdk.resolveSubscription() || undefined,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
     mode: lagoOpts.mode,
     markup: lagoOpts.markup,

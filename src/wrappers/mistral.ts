@@ -31,6 +31,10 @@ interface SDKLike {
       markup?: number;
     },
   ) => void;
+  /** Reads the subscription bound by `withSubscription()` / `setSubscription()`, falling
+   * back to the configured default. Wrappers call it while the customer's own call frame
+   * is still on the stack, which is the only place the async-local store is readable. */
+  resolveSubscription: (override?: string) => string | null;
   /** The SDK's error channel. Wrappers report through it rather than logging, so a
    * provider whose response shape drifts surfaces on the hook customers actually watch
    * — a log line alone is a silent billing outage for that provider. */
@@ -70,7 +74,18 @@ export function wrapMistralClient<T extends MistralLike>(
   const originalStream = chat.stream?.bind(chat);
 
   const resolveOpts = (lagoOpts: LagoOpts) => ({
-    subscription: lagoOpts.subscription || baseSub,
+    // Resolved HERE, at the moment the customer makes the call, rather than left to
+    // `emit()` once the response comes back. `withSubscription()` binds the id in
+    // `AsyncLocalStorage`, and the store is only readable INSIDE the `run()` callback —
+    // so a promise or a stream created inside `withSubscription()` and consumed outside
+    // it read no subscription at all and the event was dropped. Measured: 0 events for
+    // both shapes, and `const s = await helper()` — where the helper wraps the call in
+    // `withSubscription` — then iterating `s` is an ordinary way to write it.
+    //
+    // Capturing at call time is also the more defensible rule on its own: the
+    // subscription that owns a call is the one that was active when the call was made,
+    // not whatever happens to be active whenever the provider answers.
+    subscription: lagoOpts.subscription || baseSub || sdk.resolveSubscription() || undefined,
     dimensions: { ...baseDims, ...(lagoOpts.dimensions || {}) },
     mode: lagoOpts.mode,
     markup: lagoOpts.markup,
@@ -90,10 +105,13 @@ export function wrapMistralClient<T extends MistralLike>(
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      // Built BEFORE the await, like every other wrapper here: `resolveOpts` reads the
+      // async-local subscription, and after the await the customer's frame is gone.
+      const emitOpts = resolveOpts(lagoOpts);
       const response = await originalComplete(...forwarded);
       try {
         const usage = extractMistralNative(response, modelId);
-        sdk.emit(usage, resolveOpts(lagoOpts));
+        sdk.emit(usage, emitOpts);
       } catch (err) {
         sdk.reportError(err, "adapter.mistral");
       }
@@ -119,6 +137,10 @@ export function wrapMistralClient<T extends MistralLike>(
       if (firstArg && "lago" in firstArg) delete firstArg.lago;
       const modelId = String(firstArg?.model ?? "");
       const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
+      // Same reason as the non-streaming path, and it matters more here: the emit
+      // happens in the generator's `finally`, which runs whenever the CONSUMER finishes
+      // iterating — arbitrarily far from the call.
+      const emitOpts = resolveOpts(lagoOpts);
       const source = (await originalStream(...forwarded)) as AsyncIterable<unknown>;
 
       async function* iterate() {
@@ -138,7 +160,7 @@ export function wrapMistralClient<T extends MistralLike>(
           if (lastUsage) {
             try {
               const usage = extractMistralNative(lastUsage, modelId);
-              sdk.emit(usage, resolveOpts(lagoOpts));
+              sdk.emit(usage, emitOpts);
             } catch (err) {
               sdk.reportError(err, "adapter.mistral");
             }

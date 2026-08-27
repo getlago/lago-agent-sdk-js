@@ -238,7 +238,18 @@ export class LagoSDK {
     subscriptionStore.enterWith(subscriptionId);
   }
 
-  private resolveSubscription(override?: string): string | null {
+  /**
+   * The subscription in effect: an explicit override, else the async-local one bound by
+   * `withSubscription()` / `setSubscription()`, else the configured default.
+   *
+   * Reachable from the wrappers on purpose, not private. The async-local store can only
+   * be read from inside the `withSubscription()` callback, so the wrappers have to
+   * resolve it while the customer's call frame is still on the stack — by the time a
+   * response arrives, that frame is gone.
+   *
+   * @internal
+   */
+  resolveSubscription(override?: string): string | null {
     return override || subscriptionStore.getStore() || this.config.defaultSubscriptionId || null;
   }
 
