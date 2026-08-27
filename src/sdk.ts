@@ -745,6 +745,13 @@ export class LagoSDK {
     return counts;
   }
 
+  /**
+   * Wait for every event emitted so far to reach Lago.
+   *
+   * `true` means delivered. `false` means the timeout ran out with events still owed —
+   * buffered, in flight, or waiting out a retry backoff — and they are still queued,
+   * not lost; `shutdown()` gets one more bounded attempt at them.
+   */
   flush(timeoutMs: number = 5000): Promise<boolean> {
     return this.queue.flush(timeoutMs);
   }

@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import { LagoSDK, makeCanonicalUsage, UnknownClientError } from "../../src/index.js";
 import { makeConfig } from "../../src/config.js";
+import { PricingProvider } from "../../src/pricing.js";
+import { OfflinePricingFetcher } from "../support/offline_pricing.js";
 import type { LagoEvent } from "../../src/lago_client.js";
 
 function newSdk(defaultSub: string | null = "sub_default") {
@@ -220,7 +222,14 @@ describe("LagoSDK.emit", () => {
     const sdk = new LagoSDK({
       apiKey: "x",
       defaultSubscriptionId: "sub",
-      config: { pricingMode: "price", onError: (e: unknown) => errors.push(e) },
+      config: {
+        pricingMode: "price",
+        onError: (e: unknown) => errors.push(e),
+        // A cold table, asked for explicitly. Before, this SDK built the real
+        // provider and its background refresh went to openrouter.ai — the test
+        // passed only because the live catalog happens not to list the model.
+        pricingProvider: new PricingProvider({ fetcher: new OfflinePricingFetcher(), ttlMs: 3_600_000 }),
+      },
     });
     sdk._setSender(async (b) => {
       received.push(...b);

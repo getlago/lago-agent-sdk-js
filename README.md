@@ -367,6 +367,7 @@ new LagoSDK({
 | `wrapper.<provider>` | Interception itself failed, so the call went uninstrumented. |
 | `emit` / `pricing` / `timestamp` | The usage was read, but the event could not be built or priced. |
 | `send_batch` / `overflow` / `shutdown_drain` | Delivery: a batch failed, the buffer is full, or events were still owed at exit. |
+| `queue_loop` | The background delivery loop died. Events stop being delivered; the buffer will start reporting overflow on top. |
 
 A drifted provider is the one to alert on: it bills nothing for that provider until it is fixed, and it looks like silence rather than an error anywhere else.
 
