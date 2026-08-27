@@ -727,3 +727,82 @@ describe("EventQueue — flush() waits for delivery, not for an empty buffer", (
     await q.shutdown(1000);
   });
 });
+
+// ----------------------------------------------------------------------
+// A queue that has been shut down must let the process go.
+//
+// `flush()` and `shutdown()` used the module-level `sleep()`, whose timer is NOT
+// `unref`'d — unlike the loop's own `waitWake` and `sleepUnlessStopping`, which are,
+// with a comment saying exactly why. `Promise.race([loopPromise, sleep(timeoutMs)])`
+// leaves the loser running, so `await shutdown()` resolved and then held the event loop
+// open for the whole budget. And the `beforeExit`/signal listeners were never removed,
+// so exit ran a SECOND full shutdown on top.
+//
+// Measured on the defaults before the fix: `await sdk.shutdown()` resolved in 0ms and
+// the process exited 7003ms later (5000 for the timer, then `beforeExit` firing
+// `shutdown(2000)`). After: 2ms.
+//
+// The assertions here are handle and listener counts, not elapsed time — both are
+// properties of the code rather than of the machine the suite runs on.
+// ----------------------------------------------------------------------
+describe("EventQueue — shutdown releases the process", () => {
+  /** Resources currently keeping the event loop alive; `unref`'d ones do not appear. */
+  const liveTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+
+  const hookCounts = () => ({
+    beforeExit: process.listenerCount("beforeExit"),
+    SIGINT: process.listenerCount("SIGINT"),
+    SIGTERM: process.listenerCount("SIGTERM"),
+    SIGHUP: process.listenerCount("SIGHUP"),
+  });
+
+  it("leaves no timer holding the event loop open", async () => {
+    // Relative to the ambient baseline, since the test runner has timers of its own.
+    //
+    // This is the branch where the LOOP finishes first, and it is the only one a test
+    // can catch: when the timeout wins instead, its timer has by definition already
+    // fired, so the old code left nothing behind there either. The timeout's timer is
+    // `unref`'d as well, but that belt is not observable as a regression and is not
+    // pinned here rather than pinned by a case that would pass either way.
+    const before = liveTimers();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    await q.shutdown(1000);
+    expect(liveTimers()).toBe(before);
+  });
+
+  it("removes its process listeners", async () => {
+    const before = hookCounts();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    const during = hookCounts();
+    // Registered on construction — each one is a route that would otherwise lose
+    // buffered events.
+    expect(during.beforeExit).toBe(before.beforeExit + 1);
+    expect(during.SIGINT).toBe(before.SIGINT + 1);
+    expect(during.SIGTERM).toBe(before.SIGTERM + 1);
+    // SIGHUP is what a closing terminal and a detaching container send. Measured
+    // before it was added: every buffered event lost on that route.
+    expect(during.SIGHUP).toBe(before.SIGHUP + 1);
+
+    await q.shutdown(1000);
+    expect(hookCounts()).toEqual(before);
+  });
+
+  it("does not leak a listener set per queue", async () => {
+    // The shape a per-request SDK produces. Each surviving listener also keeps its
+    // queue — and its whole buffer — reachable for the life of the process, and lets
+    // `beforeExit` re-drain a queue that was already shut down.
+    const before = hookCounts();
+    const queues = Array.from({ length: 12 }, () => new EventQueue(async () => {}, 1000, 100));
+    expect(hookCounts().SIGTERM).toBe(before.SIGTERM + 12);
+    await Promise.all(queues.map((q) => q.shutdown(500)));
+    expect(hookCounts()).toEqual(before);
+  });
+
+  it("stays idempotent across a second shutdown", async () => {
+    const before = hookCounts();
+    const q = new EventQueue(async () => {}, 1000, 100);
+    await q.shutdown(500);
+    await q.shutdown(500);
+    expect(hookCounts()).toEqual(before);
+  });
+});
