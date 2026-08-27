@@ -70,6 +70,11 @@ type Sender = (batch: LagoEvent[]) => Promise<void>;
 // costs a delay, dropping one that would have been accepted costs revenue.
 const PERMANENT_STATUSES: ReadonlySet<number> = new Set([400, 409, 413, 422]);
 
+// While the buffer stays full, at most one overflow report per this interval. A sustained
+// overload must keep saying so — a single report at the start would go stale — but it
+// must not say so once per dropped event.
+const OVERFLOW_REPORT_INTERVAL_MS = 1000;
+
 /** True when re-sending this exact batch can never succeed.
  *
  * Only a malformed or unacceptable BATCH qualifies — see `PERMANENT_STATUSES` for the
@@ -96,6 +101,14 @@ export class EventQueue {
   private releaseShutdownHook: () => void = () => {};
   /** for tests */
   public httpCalls = 0;
+  /** Events dropped to buffer overflow over this queue's life. Cumulative, never reset. */
+  public droppedEvents = 0;
+  /** Dropped but not yet named in a report — see `reportOverflow`. */
+  private droppedSinceReport = 0;
+  /** True while the buffer is full and dropping, so the next report is a continuation
+   * rather than a fresh episode. */
+  private inOverflow = false;
+  private lastOverflowReportAt = 0;
 
   constructor(
     private sender: Sender,
@@ -130,16 +143,52 @@ export class EventQueue {
   push(event: LagoEvent): void {
     if (this.buffer.length >= this.maxBufferSize) {
       this.buffer.shift();
-      if (this.onError) {
-        try {
-          this.onError(new Error(`queue overflow at ${this.maxBufferSize}`), "overflow");
-        } catch {
-          /* ignore */
-        }
+      this.droppedEvents++;
+      this.droppedSinceReport++;
+      const now = Date.now();
+      // Reported at once when the buffer first fills — an operator needs to know while
+      // it still is — and then at most once per second for as long as it stays full.
+      // Everything in between is counted, not reported; see `reportOverflow`.
+      if (!this.inOverflow || now - this.lastOverflowReportAt >= OVERFLOW_REPORT_INTERVAL_MS) {
+        this.inOverflow = true;
+        this.reportOverflow(false);
       }
     }
     this.buffer.push(event);
     if (this.buffer.length >= this.maxBatchSize) this.wake();
+  }
+
+  /** Name the events dropped since the last report, if any.
+   *
+   * Coalescing is the whole point. This used to call `onError` once PER DROPPED EVENT:
+   * measured, a 50,000-event burst against the default 10,000 buffer produced **40,000
+   * separate callbacks** for one root cause — a thundering herd aimed at whatever the
+   * customer wired up, which is usually an error tracker. The queue already refuses to
+   * do this for a failed batch, for exactly this reason; see `sendIndividually`.
+   *
+   * It also LOGS now, which it never did. Coalescing is what makes that affordable, and
+   * without it a customer who set no `onError` got no signal at all for a dropped event
+   * — while the two other places this queue drops one, `sendIndividually` and the exit
+   * drain, both log.
+   *
+   * `endEpisode` marks the buffer as no longer overflowing, so the next drop counts as a
+   * fresh episode and is reported immediately rather than waiting out the interval. */
+  private reportOverflow(endEpisode: boolean): void {
+    if (endEpisode) this.inOverflow = false;
+    const dropped = this.droppedSinceReport;
+    if (dropped === 0) return;
+    this.droppedSinceReport = 0;
+    this.lastOverflowReportAt = Date.now();
+    this.reportError(
+      new Error(
+        `queue overflow: dropped ${dropped} oldest event(s), buffer is full at ${this.maxBufferSize}`,
+      ),
+      "overflow",
+    );
+    warn(
+      `[lago] ${dropped} event(s) DROPPED — buffer full at ${this.maxBufferSize}. ` +
+        `Events are arriving faster than they can be delivered; raise maxBufferSize or lower the emit rate.`,
+    );
   }
 
   /** Wait until every event pushed so far has actually reached Lago.
@@ -154,15 +203,22 @@ export class EventQueue {
    * counted twice, in `buffer` and in `inFlight`; over-counting only ever makes this
    * wait longer, which is the safe direction for a caller that is about to exit. */
   async flush(timeoutMs: number = 5000): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (this.outstanding() === 0) return true;
-      this.wake();
-      await sleep(10);
+    // The running overflow total is named before returning, whichever way this goes: a
+    // caller that flushes is asking what happened, and the tail of an episode would
+    // otherwise wait on a drop that may never come.
+    try {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (this.outstanding() === 0) return true;
+        this.wake();
+        await sleep(10);
+      }
+      // Re-checked rather than a bare `false`: the last sleep can straddle the deadline
+      // and the delivery it was waiting for may have landed inside it.
+      return this.outstanding() === 0;
+    } finally {
+      this.reportOverflow(true);
     }
-    // Re-checked rather than a bare `false`: the last sleep can straddle the deadline
-    // and the delivery it was waiting for may have landed inside it.
-    return this.outstanding() === 0;
   }
 
   /** Events pushed but not yet delivered — buffered plus in flight. */
@@ -339,7 +395,13 @@ export class EventQueue {
   private async drainBuffer(): Promise<void> {
     while (true) {
       const batch = this.takeBatch();
-      if (batch.length === 0) return;
+      if (batch.length === 0) {
+        // Caught up: the buffer has room again, so whatever was dropped is now a closed
+        // episode with a final count. Reported here rather than only on `flush()`,
+        // because a producer that stops pushing would otherwise leave the tail unnamed.
+        this.reportOverflow(true);
+        return;
+      }
       // Counted from the instant the batch leaves the buffer, not from the instant the
       // send starts. The gap between the two is the backoff sleep below, which reaches
       // a full minute — the longest stretch over which these events used to exist
