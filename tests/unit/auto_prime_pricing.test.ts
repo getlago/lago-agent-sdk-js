@@ -12,7 +12,8 @@ import { describe, expect, it } from "vitest";
 
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
-import { HttpPricingFetcher, ModelPrice, PricingProvider, parseMistralAliases } from "../../src/pricing.js";
+import { ModelPrice, PricingProvider, parseMistralAliases } from "../../src/pricing.js";
+import { OfflinePricingFetcher } from "../support/offline_pricing.js";
 
 const MISTRAL_ALIASES = parseMistralAliases({
   data: [{ id: "mistral-small-2603", aliases: ["mistral-small-latest"] }],
@@ -79,7 +80,7 @@ describe("wrap()-triggered auto-prime pricing", () => {
     // session's first Mistral lookup still resolves correctly because
     // wrap() learned the key from the client and kicked off the fetch.
     const seenKeys: Array<string | null | undefined> = [];
-    class StubFetcher extends HttpPricingFetcher {
+    class StubFetcher extends OfflinePricingFetcher {
       async fetchMistralAliases(apiKey?: string | null) {
         seenKeys.push(apiKey);
         return MISTRAL_ALIASES;
@@ -104,7 +105,7 @@ describe("wrap()-triggered auto-prime pricing", () => {
 
   it("wrap(openai client pointed at Cloudflare's gateway) primes workers-ai", async () => {
     let cloudflareCalls = 0;
-    class StubFetcher extends HttpPricingFetcher {
+    class StubFetcher extends OfflinePricingFetcher {
       async fetchCloudflareWorkersAi() {
         cloudflareCalls++;
         return new Map<string, ModelPrice>();
@@ -125,7 +126,7 @@ describe("wrap()-triggered auto-prime pricing", () => {
     // A generic OpenAI client NOT pointed at Cloudflare must not trigger
     // the Workers AI fetch — only the baseURL signal should do that.
     let cloudflareCalls = 0;
-    class StubFetcher extends HttpPricingFetcher {
+    class StubFetcher extends OfflinePricingFetcher {
       async fetchCloudflareWorkersAi() {
         cloudflareCalls++;
         return new Map<string, ModelPrice>();
@@ -148,7 +149,7 @@ describe("wrap()-triggered auto-prime pricing", () => {
     // into price mode — the credential-gated sources should stay
     // completely untouched.
     let mistralCalls = 0;
-    class StubFetcher extends HttpPricingFetcher {
+    class StubFetcher extends OfflinePricingFetcher {
       async fetchMistralAliases() {
         mistralCalls++;
         return new Map<string, string>();
