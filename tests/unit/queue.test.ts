@@ -616,3 +616,81 @@ describe("EventQueue — a slow pricing refresh does not delay event delivery", 
     expect(deliveredBeforeRefresh).toBe(true);
   });
 });
+
+// ----------------------------------------------------------------------
+// The background loop must never take the host process down.
+//
+// `this.loopPromise = this.run()` had no rejection handler, and nothing awaits it until
+// `shutdown()` does. Under Node's default `--unhandled-rejections=throw` that means any
+// throw inside the loop TERMINATES the host application — measured: exit code 1, no
+// `onError`, and nothing in the output naming billing as the cause. An instrumentation
+// SDK crashing the app it instruments is the one failure mode it must never have.
+//
+// The reachable trigger was not a bug in the loop at all: the queue called
+// `console.warn` on paths with no `try` around them, so a logger that throws was enough.
+// ----------------------------------------------------------------------
+describe("EventQueue — the loop's failures stay inside the loop", () => {
+  it("reports a failure inside the loop instead of rejecting to the host", async () => {
+    const errors: Array<{ where: string; message: string }> = [];
+    const q = new EventQueue(
+      async () => {
+        throw new Error("transient");
+      },
+      20,
+      100,
+      10_000,
+      60_000,
+      (err, where) => errors.push({ where, message: (err as Error).message }),
+    );
+    // Stand in for any bug in the loop's own bookkeeping, as opposed to the sender's.
+    // @ts-expect-error — private: reaching in is the only way to inject one.
+    q.replayFailed = () => {
+      throw new Error("bug inside the loop");
+    };
+    q.push(ev(1));
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !errors.some((e) => e.where === "queue_loop")) {
+      await sleep(20);
+    }
+    expect(errors.map((e) => e.where)).toContain("queue_loop");
+    expect(errors.find((e) => e.where === "queue_loop")!.message).toBe("bug inside the loop");
+    await q.shutdown(500);
+  });
+
+  it("keeps delivering when the customer's console.warn throws", async () => {
+    // The realistic trigger. A structured-logger shim can throw, and a test runner's
+    // console throws by design once the test that owns it has finished. On the old code
+    // this turned one retryable network blip into a dead loop: the failure branch logs
+    // outside any `try`, so the throw escaped `drainBuffer` and rejected `run()`.
+    let attempts = 0;
+    let delivered = 0;
+    const original = console.warn;
+    console.warn = () => {
+      throw new Error("logger is down");
+    };
+    try {
+      const q = new EventQueue(
+        async (b) => {
+          attempts++;
+          if (attempts === 1) throw new Error("network blip");
+          delivered += b.length;
+        },
+        20,
+        100,
+        10_000,
+        60_000,
+      );
+      q.push(ev(1));
+      // Polled rather than awaited via `flush()`, so this asserts the loop's survival
+      // and nothing else: the first backoff is 1s, so the retry cannot land sooner.
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline && delivered === 0) await sleep(20);
+      expect(delivered).toBe(1);
+      expect(attempts).toBe(2);
+      await q.shutdown(500);
+    } finally {
+      console.warn = original;
+    }
+  });
+});

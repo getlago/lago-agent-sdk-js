@@ -102,7 +102,22 @@ export class EventQueue {
     // the customer's call is never blocked on pricing.
     private pricing?: { maybeRefresh(): Promise<void> },
   ) {
-    this.loopPromise = this.run();
+    // `.catch` here is not bookkeeping. Nothing awaits `loopPromise` until `shutdown()`
+    // does, and under Node's default `--unhandled-rejections=throw` an unhandled
+    // rejection TERMINATES the host process — measured: a throw inside the loop killed
+    // it with exit code 1, no `onError`, nothing naming billing as the cause. An
+    // instrumentation SDK taking down the customer's application is the one failure it
+    // must never cause, and the asymmetry settles it: one line here against a process
+    // kill.
+    //
+    // The loop does not resume, and cannot do so silently: the buffer keeps filling and
+    // starts reporting overflow on top of this report. Restarting it is a separate
+    // decision — one that keeps dying for the same reason would spin — and not one to
+    // take implicitly here.
+    this.loopPromise = this.run().catch((err) => {
+      this.reportError(err, "queue_loop");
+      warn("[lago] event queue loop stopped — events will stop being delivered:", err);
+    });
     this.installShutdownHook();
   }
 
@@ -240,16 +255,16 @@ export class EventQueue {
         await this.sender([event]);
       } catch (exc) {
         if (isPermanentFailure(exc)) {
-          console.warn(
+          warn(
             `[lago] dropping event (permanent failure, will not retry): transaction_id=${event.transaction_id}:`,
             exc,
           );
         } else if (requeueTransient) {
-          console.warn("[lago] send failed for isolated event, will retry:", exc);
+          warn("[lago] send failed for isolated event, will retry:", exc);
           retry.push(event);
         } else {
           this.reportError(exc, "shutdown_drain");
-          console.warn(
+          warn(
             `[lago] event LOST on shutdown — no retry left: transaction_id=${event.transaction_id}:`,
             exc,
           );
@@ -314,7 +329,7 @@ export class EventQueue {
         }
         this.replayFailed(batch);
         this.reportError(exc);
-        console.warn("[lago] send_batch failed:", exc);
+        warn("[lago] send_batch failed:", exc);
         this.backoffMs = this.nextBackoff();
         return;
       }
@@ -365,7 +380,7 @@ export class EventQueue {
           await this.sendIndividually(batch, exc, false);
         } else {
           this.reportError(exc);
-          console.warn(
+          warn(
             `[lago] ${batch.length} event(s) LOST on shutdown — final drain failed with no more retries possible:`,
             exc,
           );
@@ -373,7 +388,7 @@ export class EventQueue {
       }
     }
     if (this.buffer.length > 0) {
-      console.warn(`[lago] ${this.buffer.length} event(s) LOST on shutdown — drain time budget exhausted`);
+      warn(`[lago] ${this.buffer.length} event(s) LOST on shutdown — drain time budget exhausted`);
     }
   }
 
@@ -407,4 +422,20 @@ export class EventQueue {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** `console.warn` that cannot itself break the send/retry loop.
+ *
+ * The queue logged directly, on paths with no `try` around them — `sendIndividually`,
+ * the drain's failure branch, the exit drain. A `console` that throws is not exotic: a
+ * structured-logger shim can, and a test runner's console throws by design once the test
+ * that owns it has finished ("Cannot log after tests are done"). Any of those turned a
+ * retryable network blip into a rejected background loop, which is what used to take the
+ * host process down with it. */
+function warn(...args: unknown[]): void {
+  try {
+    console.warn(...args);
+  } catch {
+    /* a logger that fails must not cost billing */
+  }
 }
