@@ -5,7 +5,14 @@ import { LagoSDK } from "../../../src/index.js";
 import { extractOpenAINative, RAMP_ROUTER_PROVIDER } from "../../../src/adapters/openai_native.js";
 import { providerHintFor } from "../../../src/wrappers/openai.js";
 import type { LagoEvent } from "../../../src/lago_client.js";
-import { HttpPricingFetcher, ModelPrice, PricingProvider, parseOpenRouter } from "../../../src/pricing.js";
+import {
+  HttpPricingFetcher,
+  ModelPrice,
+  PricingProvider,
+  parseOpenRouter,
+  TOKEN_BILLED_PROVIDERS,
+} from "../../../src/pricing.js";
+import { KNOWN_PROVIDERS, tokenSemantics } from "../../../src/token_semantics.js";
 
 const ROUTER_BASE_URL = "https://api.router.com/v1";
 
@@ -532,5 +539,51 @@ describe("Ramp Router — concurrency", () => {
     const inputs = received.filter((e) => e.code === "llm_input_tokens");
     expect(inputs).toHaveLength(200);
     expect(new Set(received.map((e) => e.transaction_id)).size).toBe(received.length);
+  });
+});
+
+// ------------------------------------------------------------------
+// The two recorded decisions behind "ramp_router", pinned so neither can be
+// reverted silently. The generic roster tests cannot see them: the hint comes
+// from the wrapper's HOST arm, not from PROVIDER_BY_BASE_URL_PATH, so nothing
+// else in the suite fails if either set entry disappears (verified by
+// reverting each — 835 tests stayed green).
+// ------------------------------------------------------------------
+describe("Ramp Router — recorded billing decisions", () => {
+  it("ramp_router is token-billed: a price-mode call emits token events with NO error report", async () => {
+    // Router is structurally unpriceable today (BYOK requests bill $0, tiers have
+    // unpublished rates, overlap semantics unmeasured), so a price miss is permanent —
+    // and a permanent miss must not cry wolf on the error hook per call. Same decision
+    // as Databricks and Snowflake.
+    expect(TOKEN_BILLED_PROVIDERS.has(RAMP_ROUTER_PROVIDER)).toBe(true);
+
+    const errors: unknown[] = [];
+    const provider = new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 });
+    const { sdk, received } = newSdk("sub_test", {
+      config: {
+        pricingMode: "price",
+        pricingProvider: provider,
+        onError: (err: unknown) => errors.push(err),
+      },
+    });
+    const client = sdk.wrap(
+      new FakeRouterClient(ROUTER_BASE_URL, () => routerResponse("openai:gpt-5.4-mini")),
+    );
+    await client.responses.create({ model: "x", input: "ping" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("ramp_router's token convention is a recorded decision: additive on every axis", () => {
+    // Router normalizes the response SCHEMA to OpenAI's but nothing says it normalizes
+    // the NUMBERS, so the overlap convention is unmeasured. Absence from every subset
+    // set means the total_tokens guard treats the counts as additive — the conservative
+    // direction, which can under-fold a subset total but never inflates output with
+    // tokens that were never generated (the Cortex 2.0x shape). KNOWN_PROVIDERS is what
+    // makes that an explicit decision instead of a default nobody made.
+    expect(KNOWN_PROVIDERS.has(RAMP_ROUTER_PROVIDER)).toBe(true);
+    expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_PROVIDER)).toEqual([false, false, false]);
   });
 });

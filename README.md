@@ -46,10 +46,12 @@ const sdk = new LagoSDK({
 });
 const client = sdk.wrap(new BedrockRuntimeClient({ region: "eu-west-1" }));
 
-await client.send(new ConverseCommand({
-  modelId: "eu.amazon.nova-lite-v1:0",
-  messages: [{ role: "user", content: [{ text: "Hello" }] }],
-}));
+await client.send(
+  new ConverseCommand({
+    modelId: "eu.amazon.nova-lite-v1:0",
+    messages: [{ role: "user", content: [{ text: "Hello" }] }],
+  }),
+);
 await sdk.flush();
 ```
 
@@ -140,12 +142,18 @@ import Anthropic from "@anthropic-ai/sdk";
 import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: "...", defaultSubscriptionId: "sub_acme" });
-const client = sdk.wrap(new Anthropic({
-  apiKey: "...",
-  baseURL: `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/anthropic`,
-  defaultHeaders: { "cf-aig-authorization": `Bearer ${gatewayAuth}` },
-}));
-await client.messages.create({ model: "claude-sonnet-4-6", max_tokens: 200, messages: [{ role: "user", content: "Hello" }] });
+const client = sdk.wrap(
+  new Anthropic({
+    apiKey: "...",
+    baseURL: `https://gateway.ai.cloudflare.com/v1/${accountId}/${gatewayId}/anthropic`,
+    defaultHeaders: { "cf-aig-authorization": `Bearer ${gatewayAuth}` },
+  }),
+);
+await client.messages.create({
+  model: "claude-sonnet-4-6",
+  max_tokens: 200,
+  messages: [{ role: "user", content: "Hello" }],
+});
 await sdk.flush();
 ```
 
@@ -157,9 +165,10 @@ For usage that already happened, backfill straight from the gateway's own Logs A
 ```typescript
 import { extractCloudflareLog, resolveSubscription } from "lago-agent-sdk/gateway/adapters";
 
-for (const entry of await fetchGatewayLogs()) {  // GET .../ai-gateway/gateways/{id}/logs
+for (const entry of await fetchGatewayLogs()) {
+  // GET .../ai-gateway/gateways/{id}/logs
   const usage = extractCloudflareLog(entry);
-  if (usage.extras.cached) continue;  // gateway served it from cache — the provider was never called
+  if (usage.extras.cached) continue; // gateway served it from cache — the provider was never called
   const sub = resolveSubscription(entry) ?? "sub_default"; // from the call's cf-aig-metadata, if set
   // Pass `cost` through as-is. Coercing an absent cost to 0 bills a $0.00 event instead
   // of falling back to token counts, which is the one outcome that loses revenue silently.
@@ -168,7 +177,7 @@ for (const entry of await fetchGatewayLogs()) {  // GET .../ai-gateway/gateways/
 await sdk.flush();
 ```
 
-**Gateway-routed calls are billed at the gateway's metered cost.** Cloudflare reports its own `cost` per log entry and the backfill passes that straight through, so Lago reconciles against the dashboard you actually look at. One measured consequence to be aware of: that field excludes additive *reasoning* tokens, so a thinking-heavy Gemini call bills about 4% of what Google charges (verified live at 22.8x on one call, 39.6x on another — the ratio tracks each prompt's thinking-to-output ratio). Cloudflare is exact on input, output, cache-read and cache-write.
+**Gateway-routed calls are billed at the gateway's metered cost.** Cloudflare reports its own `cost` per log entry and the backfill passes that straight through, so Lago reconciles against the dashboard you actually look at. One measured consequence to be aware of: that field excludes additive _reasoning_ tokens, so a thinking-heavy Gemini call bills about 4% of what Google charges (verified live at 22.8x on one call, 39.6x on another — the ratio tracks each prompt's thinking-to-output ratio). Cloudflare is exact on input, output, cache-read and cache-write.
 
 ## Databricks AI Gateway
 
@@ -181,13 +190,15 @@ import OpenAI from "openai";
 import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: "...", defaultSubscriptionId: "sub_acme" });
-const client = sdk.wrap(new OpenAI({
-  apiKey: process.env.DATABRICKS_TOKEN,
-  baseURL: `${process.env.DATABRICKS_HOST}/ai-gateway/mlflow/v1`,
-  defaultHeaders: {
-    "Databricks-Ai-Gateway-Request-Tags": JSON.stringify({ lago_subscription: "sub_acme" }),
-  },
-}));
+const client = sdk.wrap(
+  new OpenAI({
+    apiKey: process.env.DATABRICKS_TOKEN,
+    baseURL: `${process.env.DATABRICKS_HOST}/ai-gateway/mlflow/v1`,
+    defaultHeaders: {
+      "Databricks-Ai-Gateway-Request-Tags": JSON.stringify({ lago_subscription: "sub_acme" }),
+    },
+  }),
+);
 await client.chat.completions.create({
   model: "system.ai.llama-4-maverick",
   messages: [{ role: "user", content: "Hi" }],
@@ -198,28 +209,30 @@ await client.chat.completions.create({
 
 ```typescript
 import Anthropic from "@anthropic-ai/sdk";
-const client = sdk.wrap(new Anthropic({
-  apiKey: "unused",
-  baseURL: `${process.env.DATABRICKS_HOST}/ai-gateway/anthropic`,
-  defaultHeaders: {
-    Authorization: `Bearer ${process.env.DATABRICKS_TOKEN}`,
-    "Databricks-Model-Provider-Service": "workspace.default.anthropickey",
-  },
-}));
+const client = sdk.wrap(
+  new Anthropic({
+    apiKey: "unused",
+    baseURL: `${process.env.DATABRICKS_HOST}/ai-gateway/anthropic`,
+    defaultHeaders: {
+      Authorization: `Bearer ${process.env.DATABRICKS_TOKEN}`,
+      "Databricks-Model-Provider-Service": "workspace.default.anthropickey",
+    },
+  }),
+);
 ```
 
 OpenAI BYOK is the same `OpenAI` class as the hosted example, against `/ai-gateway/openai/v1` with its own `Databricks-Model-Provider-Service`.
 
 ### What gets billed
 
-| Path | Live `wrap()` | Backfill |
-|---|---|---|
+| Path                      | Live `wrap()`                                             | Backfill                                                |
+| ------------------------- | --------------------------------------------------------- | ------------------------------------------------------- |
 | BYOK (OpenAI / Anthropic) | **dollar cost**, priced from the vendor's published rates | dollar cost from Databricks' own `external_model_spend` |
-| Hosted (`system.ai.*`) | **token counts** | **token counts** |
+| Hosted (`system.ai.*`)    | **token counts**                                          | **token counts**                                        |
 
-BYOK prices live because you pay the vendor directly, so the vendor's rate *is* your cost — verified against Databricks' own metered spend on 38 of 38 real buckets, exactly. Hosted models bill in DBUs against a rate card published only as HTML and present in no system table, so there is no rate to look up: those calls emit token counts instead of a dollar cost. That is the complete answer for them, not a degraded one, so it is **not** reported as an error — `TOKEN_BILLED_PROVIDERS` lists the providers this applies to, and the SDK notes it once per model at info level rather than warning on every call. A genuine price miss — a cold table, an unmatched model name — still reports through `onError` as before.
+BYOK prices live because you pay the vendor directly, so the vendor's rate _is_ your cost — verified against Databricks' own metered spend on 38 of 38 real buckets, exactly. Hosted models bill in DBUs against a rate card published only as HTML and present in no system table, so there is no rate to look up: those calls emit token counts instead of a dollar cost. That is the complete answer for them, not a degraded one, so it is **not** reported as an error — `TOKEN_BILLED_PROVIDERS` lists the providers this applies to, and the SDK notes it once per model at info level rather than warning on every call. A genuine price miss — a cold table, an unmatched model name — still reports through `onError` as before.
 
-**Hosted dollars exist, and are deliberately not billed from.** `system.billing.usage` × `list_prices` (or `account_prices` for your contract rate) does yield exact USD per hour and endpoint. It is not used because it comes from a *different Databricks screen* than the gateway view: it carries no `request_tags`, so per-subscription splits would be ours rather than Databricks', and it lags the gateway by roughly a day — measured at ~19h on a live workspace. Every number this connector sends is one you can find on a Databricks **gateway** page, which is the property that makes it checkable.
+**Hosted dollars exist, and are deliberately not billed from.** `system.billing.usage` × `list_prices` (or `account_prices` for your contract rate) does yield exact USD per hour and endpoint. It is not used because it comes from a _different Databricks screen_ than the gateway view: it carries no `request_tags`, so per-subscription splits would be ours rather than Databricks', and it lags the gateway by roughly a day — measured at ~19h on a live workspace. Every number this connector sends is one you can find on a Databricks **gateway** page, which is the property that makes it checkable.
 
 **Grouping matches the Databricks page.** Each backfilled event carries the grouping key of the surface it came from — `endpoint_name` for hosted, `bucket` (the hour) for BYOK. Group Lago by `endpoint_name` and you get the AI Gateway → Usage table row for row. Pass `dimensions={...}` to add your own keys; yours win on a name collision.
 
@@ -267,10 +280,10 @@ Reading the system tables needs a PAT with the **`sql`** scope plus a SQL wareho
 
 Snowflake serves Cortex two ways, and they need two different halves of this SDK. That split is the thing to understand before anything else here.
 
-| Surface | How you call it | How Lago sees it |
-|---|---|---|
-| **Cortex REST** — `/api/v2/cortex/v1` | an OpenAI-compatible client you hand to `wrap()` | live, per call |
-| **AI SQL functions** — `AI_COMPLETE`, `AI_EMBED`, … | SQL, inside the warehouse | **backfill only** — there is no client to wrap |
+| Surface                                             | How you call it                                  | How Lago sees it                               |
+| --------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------- |
+| **Cortex REST** — `/api/v2/cortex/v1`               | an OpenAI-compatible client you hand to `wrap()` | live, per call                                 |
+| **AI SQL functions** — `AI_COMPLETE`, `AI_EMBED`, … | SQL, inside the warehouse                        | **backfill only** — there is no client to wrap |
 
 **Everything on this path bills as token counts.** Snowflake meters Cortex in credits against a rate card that lives in no view, so there is no per-request dollar figure to pass through and no price mode here. `provider` is `"snowflake"`, which is listed in `TOKEN_BILLED_PROVIDERS`, so a customer running `pricingMode: "price"` globally still gets token events for Snowflake rows — with no price-miss error, because a structural absence of a rate card is not a lookup failure.
 
@@ -289,9 +302,9 @@ const client = sdk.wrap(
 
 The `base_url` is what identifies these calls as Snowflake rather than OpenAI — an OpenAI-shaped endpoint says nothing about whose tokens they are. Use `max_completion_tokens`; Cortex rejects `max_tokens` outright.
 
-**Cortex's `cached_tokens` is additive, the opposite of OpenAI's convention.** A cached call reports `prompt_tokens: 7`, `cached_tokens: 8745`, `completion_tokens: 6`, `total_tokens: 8758` — the cached block is *not* inside `prompt_tokens`. Caching also only happens when you send an explicit `cache_control: {type: "ephemeral"}` content part; the same prompt twice without one reports zero cached both times.
+**Cortex's `cached_tokens` is additive, the opposite of OpenAI's convention.** A cached call reports `prompt_tokens: 7`, `cached_tokens: 8745`, `completion_tokens: 6`, `total_tokens: 8758` — the cached block is _not_ inside `prompt_tokens`. Caching also only happens when you send an explicit `cache_control: {type: "ephemeral"}` content part; the same prompt twice without one reports zero cached both times.
 
-**The wire cannot tell a cache creation from a read; the view can.** A creation call reports the same `cached_tokens` with `cache_write_tokens: 0`, so the live `wrap()` path bills a creation as a cache read (`llm_cached_input_tokens`). The REST view records the same call as `cache_write_input`, so a backfilled row bills `llm_cache_creation_tokens` instead. Verified live on a matched pair (INT-230): identical wire usage, one `cache_write_input` row and three `cache_read_input` rows. If you price creation and read differently, know that live-path traffic reports everything at the read metric. It also bounds the REST-view dedup: a backfilled creation row emits its cached block under a *different* transaction id than the live path did (`_tok_cache_write` vs `_tok_cache_read`), so that one component bills on both metrics if you backfill a live-billed window — the call's input and output stay deduplicated.
+**The wire cannot tell a cache creation from a read; the view can.** A creation call reports the same `cached_tokens` with `cache_write_tokens: 0`, so the live `wrap()` path bills a creation as a cache read (`llm_cached_input_tokens`). The REST view records the same call as `cache_write_input`, so a backfilled row bills `llm_cache_creation_tokens` instead. Verified live on a matched pair (INT-230): identical wire usage, one `cache_write_input` row and three `cache_read_input` rows. If you price creation and read differently, know that live-path traffic reports everything at the read metric. It also bounds the REST-view dedup: a backfilled creation row emits its cached block under a _different_ transaction id than the live path did (`_tok_cache_write` vs `_tok_cache_read`), so that one component bills on both metrics if you backfill a live-billed window — the call's input and output stay deduplicated.
 
 ### Backfill — the SQL functions surface
 
@@ -330,7 +343,7 @@ By default the tag is the **only** attribution source: an untagged row falls to 
 
 ### A long-running query is deferred, not guessed at
 
-`IS_COMPLETED` means "did the query finish *in this aggregation window*", and these views are hour-bucketed — Snowflake documents a query running 5:30→8:30 writing **four rows, one per hour, all sharing one `QUERY_ID`**. Two things follow. The key `{prefix}_{kind}_{sub}_{QUERY_ID}` collides across those rows, and whether each row's `METRICS` is incremental or cumulative is unmeasured. On a 3-hour query using 3,800 input tokens, summing four incremental rows bills 3,800 and summing four cumulative ones bills 9,500; billing only the last row gives 3,800 if cumulative and 900 if incremental.
+`IS_COMPLETED` means "did the query finish _in this aggregation window_", and these views are hour-bucketed — Snowflake documents a query running 5:30→8:30 writing **four rows, one per hour, all sharing one `QUERY_ID`**. Two things follow. The key `{prefix}_{kind}_{sub}_{QUERY_ID}` collides across those rows, and whether each row's `METRICS` is incremental or cumulative is unmeasured. On a 3-hour query using 3,800 input tokens, summing four incremental rows bills 3,800 and summing four cumulative ones bills 9,500; billing only the last row gives 3,800 if cumulative and 900 if incremental.
 
 So a `QUERY_ID` that yields more than one row in a window is **not billed**. It is counted in `skipped`, reported through `onError`, listed on `source.deferredRows`, and billable once the shape is settled. Guessing over-bills by 2.5× or under-bills by 76%, neither recoverable once invoiced. Every query ever observed on a real account finished inside one bucket, so this fires on a shape nobody has seen.
 
@@ -366,10 +379,13 @@ import OpenAI from "openai";
 import { LagoSDK } from "lago-agent-sdk";
 
 const sdk = new LagoSDK({ apiKey: process.env.LAGO_API_KEY! });
-const client = sdk.wrap(new OpenAI({
-  apiKey: process.env.RAMP_ROUTER_API_KEY!,
-  baseURL: "https://api.router.com/v1",
-}), { subscription: "sub_acme" });
+const client = sdk.wrap(
+  new OpenAI({
+    apiKey: process.env.RAMP_ROUTER_API_KEY!,
+    baseURL: "https://api.router.com/v1",
+  }),
+  { subscription: "sub_acme" },
+);
 
 // A model id from GET /v1/models — Router's ids are account-specific.
 await client.responses.create({ model: process.env.RAMP_ROUTER_MODEL!, input: "Summarize this invoice." });
@@ -399,15 +415,15 @@ In `pricingMode: "price"`, a Router call currently emits **token events rather t
 
 - **A BYOK-served request costs $0 through Router.** Router's own words: "When a request is served with your provider key, your provider bills you directly and Ramp Router does not charge for that usage." Nothing in the response says which key served it, so pricing at list rate would bill a customer the full amount for usage Router never charged for.
 - **A non-default service tier does not bill at the published base rate.** Router's catalog says outright that "service tiers, long contexts, caching, and other features may use different rates", and that a Fast tier's "pricing may differ from the base rates shown here". Billing flex at the standard rate over-bills.
-- **The token overlap semantics are unverified.** OpenAI counts cached tokens inside `input_tokens` and reasoning inside `output_tokens`; Anthropic counts both additively. Router normalizes the response *schema* to OpenAI's, and nothing documents whether it also normalizes the *numbers*. Guessing wrong misprices every cached call, in one direction or the other.
+- **The token overlap semantics are unverified.** OpenAI counts cached tokens inside `input_tokens` and reasoning inside `output_tokens`; Anthropic counts both additively. Router normalizes the response _schema_ to OpenAI's, and nothing documents whether it also normalizes the _numbers_. Guessing wrong misprices every cached call, in one direction or the other.
 
 So Router is treated as a provider of its own, matching no vendor in the price tables. Token mode — the default — is exact and unaffected: it emits the counts Router reported, the same per-field `llm_*` events a direct provider call produces. Price mode takes a clean miss and falls back to those same token events, with no error on your call path. Bill Router traffic in token mode and price it with a Lago plan.
 
 ### Measured behaviours and limitations
 
 - **There is no backfill path**, because Router exposes no programmatic usage surface. Its only routes are `GET /v1/models`, `POST /v1/responses`, `POST /v1/messages` and `POST /v1/messages/count_tokens`; usage lives in the dashboard's Logs view. An "analytics API" is mentioned once in Router's limits table with no path, auth or record shape. Unlike the Cloudflare connector above, there is no Logs API loop to show you.
-- **Nothing is skipped as a gateway cache hit**, because Router has no response cache: "Self-service Router response caching, which would reuse an entire previous response without calling a model provider, is a separate optimization and is not currently configurable." Provider *prompt* caching does pass through, and those cache-read and cache-write tokens are billed like any other.
-- **Router's Anthropic Messages surface is not instrumented yet.** `POST /v1/messages` exists and routes to the same providers, so pointing a wrapped `Anthropic` client at `https://api.router.com/v1` will *work* as an LLM client but bill nothing. Use the Responses surface until that lands.
+- **Nothing is skipped as a gateway cache hit**, because Router has no response cache: "Self-service Router response caching, which would reuse an entire previous response without calling a model provider, is a separate optimization and is not currently configurable." Provider _prompt_ caching does pass through, and those cache-read and cache-write tokens are billed like any other.
+- **Router's Anthropic Messages surface is not instrumented yet.** `POST /v1/messages` exists and routes to the same providers, so pointing a wrapped `Anthropic` client at `https://api.router.com/v1` will _work_ as an LLM client but bill nothing. Use the Responses surface until that lands.
 - **A proxy in front of Router is not detected.** Detection matches the `api.router.com` host (and `*.router.com`). Reaching Router through your own hostname bills as plain OpenAI, with the wrong provider and an unparsed model id.
 - **`api.router.com` sits behind bot management.** A rejected client can get an HTML challenge page rather than Router's documented JSON error envelope. The SDK degrades to zero usage rather than throwing, either way.
 - **Failures never bill.** Every documented status — including 402 `insufficient_credits`, 429, and 502 `all_candidates_failed` — emits nothing, as does a response reporting zero usage.
@@ -442,35 +458,35 @@ Backed by Node's `AsyncLocalStorage` for safe propagation across promises.
 
 ## Supported providers
 
-| Provider | Access | Status |
-|---|---|---|
-| AWS Bedrock | `ConverseCommand` (sync + stream) | ✓ |
-| AWS Bedrock | `InvokeModelCommand` (sync + stream), 7 model families | ✓ |
-| Anthropic | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`) | ✓ |
-| Mistral | `@mistralai/mistralai` (`chat.complete` + `chat.stream`) | ✓ |
-| OpenAI | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream) | ✓ |
-| Google Gemini | `@google/genai` (`models.generateContent` + `generateContentStream`, sync + stream) | ✓ |
+| Provider      | Access                                                                              | Status |
+| ------------- | ----------------------------------------------------------------------------------- | ------ |
+| AWS Bedrock   | `ConverseCommand` (sync + stream)                                                   | ✓      |
+| AWS Bedrock   | `InvokeModelCommand` (sync + stream), 7 model families                              | ✓      |
+| Anthropic     | `@anthropic-ai/sdk` (`messages.create` sync + stream, `messages.stream`)            | ✓      |
+| Mistral       | `@mistralai/mistralai` (`chat.complete` + `chat.stream`)                            | ✓      |
+| OpenAI        | `openai` (`chat.completions.create` + `responses.create`, sync + async + stream)    | ✓      |
+| Google Gemini | `@google/genai` (`models.generateContent` + `generateContentStream`, sync + stream) | ✓      |
 
 ## Token dimensions captured
 
 `CanonicalUsage` carries 11 numeric fields. Which ones populate depends on the provider:
 
-| Field | Lago metric code | Bedrock | Anthropic | Mistral | OpenAI | Gemini |
-|---|---|---|---|---|---|---|
-| input | `llm_input_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| output | `llm_output_tokens` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| cache_read | `llm_cached_input_tokens` | ✓ (Anthropic) | ✓ | ✓ (when cache hits) | ✓ (auto-cache) | ✓ (CachedContent API) |
-| cache_write | `llm_cache_creation_tokens` | ✓ (Anthropic) | ✓ | ✗ | ✗ | ✗ |
-| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓ | ✗ | ✗ | ✗ |
-| reasoning | `llm_reasoning_tokens` | ✗ (folded into output) | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series, subset)** | **✓ (Gemini 2.5, additive)** |
-| tool_calls | `llm_tool_calls` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| audio_input | `llm_audio_input_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
-| audio_output | `llm_audio_output_tokens` | ✗ | ✗ | ✗ | ✓ (GPT-4o-audio) | ✓ (multimodal AUDIO) |
-| image_input | `llm_image_input_tokens` | ✗ | ✗ | ✗ | ✗ | ✓ (multimodal IMAGE) |
+| Field               | Lago metric code               | Bedrock                   | Anthropic              | Mistral                | OpenAI                   | Gemini                       |
+| ------------------- | ------------------------------ | ------------------------- | ---------------------- | ---------------------- | ------------------------ | ---------------------------- |
+| input               | `llm_input_tokens`             | ✓                         | ✓                      | ✓                      | ✓                        | ✓                            |
+| output              | `llm_output_tokens`            | ✓                         | ✓                      | ✓                      | ✓                        | ✓                            |
+| cache_read          | `llm_cached_input_tokens`      | ✓ (Anthropic)             | ✓                      | ✓ (when cache hits)    | ✓ (auto-cache)           | ✓ (CachedContent API)        |
+| cache_write         | `llm_cache_creation_tokens`    | ✓ (Anthropic)             | ✓                      | ✗                      | ✗                        | ✗                            |
+| cache_write_5m / 1h | `llm_cache_write_5m/1h_tokens` | ✓ (Anthropic InvokeModel) | ✓                      | ✗                      | ✗                        | ✗                            |
+| reasoning           | `llm_reasoning_tokens`         | ✗ (folded into output)    | ✗ (folded into output) | ✗ (folded into output) | **✓ (o-series, subset)** | **✓ (Gemini 2.5, additive)** |
+| tool_calls          | `llm_tool_calls`               | ✓                         | ✓                      | ✓                      | ✓                        | ✓                            |
+| audio_input         | `llm_audio_input_tokens`       | ✗                         | ✗                      | ✗                      | ✓ (GPT-4o-audio)         | ✓ (multimodal AUDIO)         |
+| audio_output        | `llm_audio_output_tokens`      | ✗                         | ✗                      | ✗                      | ✓ (GPT-4o-audio)         | ✓ (multimodal AUDIO)         |
+| image_input         | `llm_image_input_tokens`       | ✗                         | ✗                      | ✗                      | ✗                        | ✓ (multimodal IMAGE)         |
 
-**Reasoning:** OpenAI's `reasoning_tokens` is a *subset* of `output` (already counted in `completion_tokens`). Gemini's `thoughtsTokenCount` is *additive* to `output` (`candidates + thoughts = total billable output`).
+**Reasoning:** OpenAI's `reasoning_tokens` is a _subset_ of `output` (already counted in `completion_tokens`). Gemini's `thoughtsTokenCount` is _additive_ to `output` (`candidates + thoughts = total billable output`).
 
-**Cache/audio/image on OpenAI and Gemini are subsets of `input`, not additive.** Both providers count cached/audio/image tokens *within* their input total, so summing `llm_input_tokens + llm_cached_input_tokens` (or `+ audio/image`) double-counts. Bill on `llm_input_tokens` alone; use the breakdown fields only for cost attribution (e.g. a discounted cache rate).
+**Cache/audio/image on OpenAI and Gemini are subsets of `input`, not additive.** Both providers count cached/audio/image tokens _within_ their input total, so summing `llm_input_tokens + llm_cached_input_tokens` (or `+ audio/image`) double-counts. Bill on `llm_input_tokens` alone; use the breakdown fields only for cost attribution (e.g. a discounted cache rate).
 
 ## Pricing mode — send dollar cost instead of tokens
 
@@ -515,13 +531,13 @@ new LagoSDK({
 
 `where` names the stage, so you can tell the failures apart:
 
-| `where` | What happened |
-| --- | --- |
-| `adapter.<provider>` | The provider's response could not be parsed — its usage shape changed. Nothing was billed for that call. |
-| `wrapper.<provider>` | Interception itself failed, so the call went uninstrumented. |
-| `emit` / `pricing` / `timestamp` | The usage was read, but the event could not be built or priced. |
-| `send_batch` / `overflow` / `shutdown_drain` | Delivery: a batch failed, the buffer is full, or events were still owed at exit. |
-| `queue_loop` | The background delivery loop died. Events stop being delivered; the buffer will start reporting overflow on top. |
+| `where`                                      | What happened                                                                                                    |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `adapter.<provider>`                         | The provider's response could not be parsed — its usage shape changed. Nothing was billed for that call.         |
+| `wrapper.<provider>`                         | Interception itself failed, so the call went uninstrumented.                                                     |
+| `emit` / `pricing` / `timestamp`             | The usage was read, but the event could not be built or priced.                                                  |
+| `send_batch` / `overflow` / `shutdown_drain` | Delivery: a batch failed, the buffer is full, or events were still owed at exit.                                 |
+| `queue_loop`                                 | The background delivery loop died. Events stop being delivered; the buffer will start reporting overflow on top. |
 
 A drifted provider is the one to alert on: it bills nothing for that provider until it is fixed, and it looks like silence rather than an error anywhere else.
 
