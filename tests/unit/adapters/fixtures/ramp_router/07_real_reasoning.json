@@ -1,8 +1,8 @@
 {
-  "_captured": "2026-08-28",
+  "_captured": "real capture against a live Ramp Router account",
   "_probe": "P6",
   "_question": "is reasoning_tokens inside output_tokens?",
-  "_scrubbed": true,
+  "_scrubbed": "credentials, emails, IPs, dashboard URLs; prompt and completion text blanked to \"\"",
   "_requested_models": [
     "o4-mini"
   ],
@@ -57,7 +57,7 @@
             "type": "output_text",
             "annotations": [],
             "logprobs": [],
-            "text": "6"
+            "text": ""
           }
         ],
         "id": "msg_0e76a7cad17577e4006a91877c41a887d2a0da07ebb7cf8044",

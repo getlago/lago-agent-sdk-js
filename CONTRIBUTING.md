@@ -34,7 +34,6 @@ npm run build
 - `src/` — the SDK source
 - `src/adapters/` — one file per (provider, access path); transforms provider responses into `CanonicalUsage`
 - `src/wrappers/` — one file per (provider SDK, access path); patches client objects in place
-- `src/gateway/` — connectors for third-party AI gateways: maps a gateway's own usage-reporting surface into `CanonicalUsage`, consumed by a poller rather than by `wrap()`
 - `src/canonical.ts` — the normalized usage shape sent to Lago
 - `src/queue.ts` — async event queue with backoff
 - `src/lago_client.ts` — thin HTTP client to `/events/batch`

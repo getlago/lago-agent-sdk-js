@@ -1,8 +1,8 @@
 {
-  "_captured": "2026-08-28",
+  "_captured": "real capture against a live Ramp Router account",
   "_probe": "P5b",
   "_question": "does Router forward an explicit cache_control part, and how is the write reported?",
-  "_scrubbed": true,
+  "_scrubbed": "credentials, emails, IPs, dashboard URLs; prompt and completion text blanked to \"\"",
   "_requested_models": [
     "claude-haiku-4-5"
   ],
@@ -39,7 +39,7 @@
         "content": [
           {
             "annotations": [],
-            "text": "21",
+            "text": "",
             "type": "output_text",
             "logprobs": null
           }

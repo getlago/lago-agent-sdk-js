@@ -12,14 +12,16 @@
  *   P2  buffered call   — does the Response's `model` report the requested alias or the
  *                         served `provider:provider-model[:service-tier]`?
  *   P3  models fallback — under a candidate list, does `model` name the SERVED candidate?
- *                         Billing the requested list is wrong.
+ *                         Billing the requested list is wrong. Candidates MUST be the
+ *                         catalog's `provider:model` ids — bare display names 400
+ *                         (measured; the error fixture shows it).
  *   P4  stream: true    — do the SSE events carry usage and the resolved model where
  *                         `extractStreamUsage` already looks (`.response.usage`)?
- *   P5  prompt cache    — the money question. Does Router report PROVIDER-NATIVE token
- *                         semantics (Anthropic: cache_read ADDITIVE to input) or
- *                         OpenAI-normalized ones (cache_read INSIDE input)? `openai` is in
- *                         INPUT_INCLUDES_CACHE_READ and `anthropic` is not, so guessing
- *                         wrong misprices every cached call.
+ *   P5  prompt cache    — the money question, in two probes: `prompt_cache_key` alone
+ *                         does NOT warm a cache (05/06, cached_tokens 0 both calls); an
+ *                         explicit `cache_control` content part DOES, and the warm call
+ *                         answered it (05b/06b): cached INSIDE input — Router normalizes
+ *                         the NUMBERS to OpenAI semantics.
  *   P6  reasoning model — is `reasoning_tokens` inside `output_tokens`?
  *   P7  error families  — the envelope shape, and that a failure carries no usage.
  *
@@ -243,6 +245,18 @@ function pickModel(models: ModelEntry[], vendorHints: string[], nameHints: strin
   return pool[0]?.id ?? null;
 }
 
+/**
+ * The catalog's `provider:model` candidate form for a model id.
+ *
+ * `models` entries MUST be this form — a bare display name 400s with
+ * "`models` entry 0 must be a provider:model string" (measured).
+ */
+function candidateId(models: ModelEntry[], modelId: string | null): string | null {
+  const hit = models.find((m) => m.id === modelId);
+  const catalogId = (hit?.router as { catalog_id?: unknown } | undefined)?.catalog_id;
+  return typeof catalogId === "string" && catalogId ? catalogId : null;
+}
+
 async function main(): Promise<void> {
   // ---- P1: the catalog. Does it publish prices? -------------------------------------
   console.log("[P1] GET /v1/models");
@@ -280,7 +294,7 @@ async function main(): Promise<void> {
 
   const cheap = process.env.RAMP_ROUTER_MODEL ?? pickModel(catalog, ["openai"], ["nano", "mini", "4o-mini"]);
   const anthropic = process.env.RAMP_ROUTER_ANTHROPIC_MODEL ?? pickModel(catalog, ["anthropic"], ["haiku", "sonnet"]);
-  const reasoning = process.env.RAMP_ROUTER_REASONING_MODEL ?? pickModel(catalog, ["openai"], ["o3", "gpt-5", "mini"]);
+  const reasoning = process.env.RAMP_ROUTER_REASONING_MODEL ?? pickModel(catalog, ["openai"], ["o4-mini", "o3-mini", "o3", "gpt-5"]);
   console.log(`  using: cheap=${cheap} anthropic=${anthropic} reasoning=${reasoning}`);
 
   // ---- P2: requested alias, or served candidate? ------------------------------------
@@ -300,22 +314,24 @@ async function main(): Promise<void> {
   }
 
   // ---- P3: which candidate answered? ------------------------------------------------
-  if (cheap && anthropic && cheap !== anthropic) {
+  const cheapCand = candidateId(catalog, cheap);
+  const anthropicCand = candidateId(catalog, anthropic);
+  if (cheapCand && anthropicCand && cheapCand !== anthropicCand) {
     console.log("[P3] models fallback list");
     // A deliberately unroutable first candidate would 404 the whole request rather than
     // fall back (the docs are explicit: "Invalid requests and unauthorized models fail
     // immediately without touching the rest of the list"), so both candidates are real
     // and the question is only which one Router names in the response.
     const p3 = await call("POST", "/responses", {
-      models: [cheap, anthropic],
+      models: [cheapCand, anthropicCand],
       input: PROMPT,
       max_output_tokens: MAX_OUTPUT_TOKENS,
     });
-    save("03_real_models_fallback.json", "P3", "under a candidate list, does response.model name the served candidate?", {
-      _requested_models: [cheap, anthropic],
+    save("03_real_models_fallback.json", "P3", "under a candidate list, does response.model name the SERVED candidate?", {
+      _requested_models: [cheapCand, anthropicCand],
       ...p3,
     });
-    console.log(`  P3 ANSWER: candidates [${cheap}, ${anthropic}] -> response.model "${(p3._body as { model?: string })?.model}"`);
+    console.log(`  P3 ANSWER: candidates [${cheapCand}, ${anthropicCand}] -> response.model "${(p3._body as { model?: string })?.model}"`);
   }
 
   // ---- P4: streaming ----------------------------------------------------------------
@@ -348,10 +364,32 @@ async function main(): Promise<void> {
     await new Promise((r) => setTimeout(r, 3000));
     const read = await call("POST", "/responses", cacheBody);
     save("06_real_cache_read.json", "P5", "second call — is cache_read INSIDE input_tokens or additive to it?", read);
-    const u = (read._body as { usage?: Record<string, unknown> })?.usage ?? {};
+    // Probe A above measured NOTHING warming: prompt_cache_key alone reported
+    // cached_tokens 0 on both calls. Probe B is the one that answered the question.
+    const big =
+      "You are a precise assistant. " +
+      Array.from({ length: 1300 }, (_, i) => `Fact ${i}: item ${i} maps to ${(i * 7) % 1000}.`).join(" ");
+    const ccBody = {
+      model: anthropic,
+      max_output_tokens: MAX_OUTPUT_TOKENS,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: big, cache_control: { type: "ephemeral" } },
+            { type: "input_text", text: "What does item 3 map to? Number only." },
+          ],
+        },
+      ],
+    };
+    const cold = await call("POST", "/responses", ccBody);
+    save("05b_real_cache_control_cold.json", "P5b", "does Router forward an explicit cache_control part?", cold);
+    await new Promise((r) => setTimeout(r, 2000));
+    const warm = await call("POST", "/responses", ccBody);
+    save("06b_real_cache_control_warm.json", "P5b", "warm repeat of 05b — additive or inside-input?", warm);
+    const u = (warm._body as { usage?: Record<string, unknown> })?.usage ?? {};
     console.log(`  P5 ANSWER: usage on the warm call = ${JSON.stringify(u)}`);
-    console.log("  Compare input_tokens against the cold call's: unchanged => cache_read is INSIDE input");
-    console.log("  (OpenAI semantics); dropped by the cached amount => ADDITIVE (Anthropic semantics).");
+    console.log("  input unchanged with cached_tokens > 0 => cache_read is INSIDE input (OpenAI semantics).");
   }
 
   // ---- P6: reasoning ----------------------------------------------------------------
@@ -359,9 +397,9 @@ async function main(): Promise<void> {
     console.log("[P6] reasoning model");
     const p6 = await call("POST", "/responses", {
       model: reasoning,
-      input: "What is 17 * 23? Answer with the number only.",
-      max_output_tokens: 256,
-      reasoning: { effort: "low" },
+      input: "How many primes are there between 10 and 30? Answer with the count only.",
+      max_output_tokens: 400,
+      reasoning: { effort: "medium" },
     });
     save("07_real_reasoning.json", "P6", "is reasoning_tokens inside output_tokens?", p6);
     console.log(`  P6 ANSWER: usage = ${JSON.stringify((p6._body as { usage?: unknown })?.usage)}`);
@@ -371,7 +409,7 @@ async function main(): Promise<void> {
   console.log("[P7] error families");
   const errors: Array<[string, string, unknown]> = [
     ["08_real_error_404_model_not_found.json", "an id not in this key's catalog", { model: "definitely-not-a-model-id", input: PROMPT, max_output_tokens: MAX_OUTPUT_TOKENS }],
-    ["09_real_error_400_both_selectors.json", "both route selectors at once", { model: cheap, models: [cheap], input: PROMPT, max_output_tokens: MAX_OUTPUT_TOKENS }],
+    ["09_real_error_400_both_selectors.json", "both route selectors at once", { model: cheap, models: [cheapCand ?? cheap], input: PROMPT, max_output_tokens: MAX_OUTPUT_TOKENS }],
     ["10_real_error_400_no_selector.json", "neither route selector", { input: PROMPT, max_output_tokens: MAX_OUTPUT_TOKENS }],
   ];
   for (const [name, what, body] of errors) {

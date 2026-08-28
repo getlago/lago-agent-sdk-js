@@ -1,8 +1,8 @@
 {
-  "_captured": "2026-08-28",
+  "_captured": "real capture against a live Ramp Router account",
   "_probe": "P3",
   "_question": "under a candidate list, does response.model name the SERVED candidate?",
-  "_scrubbed": true,
+  "_scrubbed": "credentials, emails, IPs, dashboard URLs; prompt and completion text blanked to \"\"",
   "_requested_models": [
     "openai:gpt-5.4-nano",
     "anthropic:claude-haiku-4-5"
@@ -54,7 +54,7 @@
             "type": "output_text",
             "annotations": [],
             "logprobs": [],
-            "text": "pong"
+            "text": ""
           }
         ],
         "phase": "final_answer",
