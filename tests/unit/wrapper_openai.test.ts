@@ -1,7 +1,11 @@
 /** OpenAI wrapper tests — fake client, no live API. */
-import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
 import { PROVIDER_BY_BASE_URL_PATH, providerHintFor } from "../../src/wrappers/openai.js";
 import { TOKEN_BILLED_PROVIDERS } from "../../src/pricing.js";
+import { SnowflakeSource } from "../../src/gateway/snowflake.js";
 
 import { LagoSDK } from "../../src/index.js";
 import type { LagoEvent } from "../../src/lago_client.js";
@@ -934,5 +938,163 @@ describe("Snowflake Cortex: baseURL decides the provider", () => {
     await sdk.shutdown(1000);
     expect(received.every((e) => e.properties.model === "LAGO_DB.CORTEX.my_tuned_mistral7b")).toBe(true);
     expect(received.every((e) => e.properties.provider === "snowflake")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Snowflake Cortex: REST-view dedup key (INT-246)
+//
+// The live path stamps a Cortex call's events with the id a `views: ["rest"]`
+// backfill derives from that call's REQUEST_ID, so Lago rejects the backfill's
+// copy as a duplicate transaction_id instead of billing the call twice. The
+// response header `x-snowflake-request-id` IS the view's REQUEST_ID, measured
+// byte-identical live 2026-08-26.
+// ---------------------------------------------------------------------
+const REST_FIXTURE = JSON.parse(
+  readFileSync(
+    join(__dirname, "gateway", "adapters", "fixtures", "snowflake_cortex", "rest_plain.json"),
+    "utf8",
+  ),
+) as Record<string, unknown>;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** A thenable with `.asResponse()`, like the real APIPromise — arbitrary headers. */
+function headeredApiPromise(resolvedValue: unknown, headers: Record<string, string>) {
+  const promise = Promise.resolve(resolvedValue);
+  return {
+    then: promise.then.bind(promise),
+    catch: promise.catch.bind(promise),
+    finally: promise.finally.bind(promise),
+    asResponse: async () => new Response(null, { headers }),
+  };
+}
+
+/** A Cortex endpoint whose responses carry the given headers. Non-streaming usage
+ * matches `rest_plain.json`'s FIELD SET (input + output, no cache), because the dedup
+ * assertion compares transaction ids and those embed the canonical field names. */
+class HeaderedCortexOpenAI {
+  chat: { completions: { create: (args: any) => unknown } };
+  baseURL: string;
+
+  constructor(headers: Record<string, string>, baseURL: string = SNOW_CORTEX) {
+    this.baseURL = baseURL;
+    this.chat = {
+      completions: {
+        create: (args: any) => {
+          const model = args?.model ?? "claude-sonnet-4-5";
+          if (args?.stream === true) {
+            const chunks = [
+              { model, choices: [{ delta: { content: "hi" } }], usage: null },
+              { model, choices: [], usage: { prompt_tokens: 9, completion_tokens: 12 } },
+            ];
+            return headeredApiPromise(
+              (async function* () {
+                for (const c of chunks) yield c;
+              })(),
+              headers,
+            );
+          }
+          return headeredApiPromise(
+            {
+              model,
+              choices: [{ message: { role: "assistant", content: "hi" } }],
+              usage: { prompt_tokens: 9, completion_tokens: 12 },
+            },
+            headers,
+          );
+        },
+      },
+    };
+  }
+}
+Object.defineProperty(HeaderedCortexOpenAI, "name", { value: "OpenAI" });
+
+describe("Snowflake Cortex: REST-view dedup key", () => {
+  const REQUEST_ID = String(REST_FIXTURE.REQUEST_ID);
+
+  it("a live call and a backfill of the same row produce the same transaction ids", async () => {
+    // End to end on both sides, not two helpers pinned in isolation: the wrapper path
+    // goes wrap() -> header -> emit, the backfill path goes view row -> readUsage ->
+    // backfillSnowflake -> emit, and the assertion is on the events' transaction_ids.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new HeaderedCortexOpenAI({ "x-snowflake-request-id": REQUEST_ID }) as any);
+    await client.chat.completions.create({ model: "claude-sonnet-4-5", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    const liveIds = received.map((e) => e.transaction_id).sort();
+    expect(liveIds).toHaveLength(2); // input + output
+    for (const id of liveIds) expect(id.startsWith(`sfc_rest_sub_test_${REQUEST_ID}_tok_`)).toBe(true);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const src = new SnowflakeSource("ORG-ACCT", "tok", { warehouse: "COMPUTE_WH" });
+    src.query = () => Promise.resolve([REST_FIXTURE]);
+    received.length = 0;
+    await sdk.backfillSnowflake(src, "3 hours", { views: ["rest"], defaultSubscription: "sub_test" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    warn.mockRestore();
+    const backfillIds = received.map((e) => e.transaction_id).sort();
+    // The whole ticket in one line: Lago sees the SAME ids and rejects the copies.
+    expect(backfillIds).toEqual(liveIds);
+  });
+
+  it("a streamed call reaches the header and carries the same key", async () => {
+    // The header is reachable on the stream path: by the time the APIPromise resolves
+    // to an iterable the headers have arrived, and asResponse() reads them without
+    // consuming the body. Verified live on a streamed Cortex call.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new HeaderedCortexOpenAI({ "x-snowflake-request-id": REQUEST_ID }) as any);
+    const stream = (await client.chat.completions.create({
+      model: "claude-sonnet-4-5",
+      messages: [],
+      stream: true,
+    } as any)) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBe(2);
+    for (const e of received) {
+      expect(e.transaction_id.startsWith(`sfc_rest_sub_test_${REQUEST_ID}_tok_`)).toBe(true);
+    }
+  });
+
+  it("a real-OpenAI call keeps its UUID even if a proxy injects the header", async () => {
+    // The gate, not the header, decides. Remove the providerHint check and this fails:
+    // the id would come out sfc_rest_-prefixed for a call Snowflake never served.
+    const { sdk, received } = newSdk();
+    const fake = new HeaderedCortexOpenAI(
+      { "x-snowflake-request-id": REQUEST_ID },
+      "https://api.openai.com/v1",
+    ) as any;
+    const client = sdk.wrap(fake);
+    await client.chat.completions.create({ model: "gpt-4o-mini", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBe(2);
+    for (const e of received) expect(e.transaction_id).toMatch(UUID_RE);
+  });
+
+  it("a Cortex response without the header falls back to the UUID", async () => {
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new HeaderedCortexOpenAI({}) as any);
+    await client.chat.completions.create({ model: "claude-sonnet-4-5", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBe(2);
+    for (const e of received) expect(e.transaction_id).toMatch(UUID_RE);
+  });
+
+  it("a client whose promise has no asResponse() bills normally on a UUID, no throw", async () => {
+    // CortexOpenAI returns plain promises — the exact simplified-client shape the
+    // defensiveness exists for.
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(new CortexOpenAI() as any);
+    await client.chat.completions.create({ model: "claude-sonnet-4-5", messages: [] } as any);
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.length).toBe(2);
+    for (const e of received) expect(e.transaction_id).toMatch(UUID_RE);
   });
 });
