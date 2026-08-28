@@ -125,17 +125,29 @@ const EXTRA_COLUMNS = [
 // call, which is worse than the zero this marker reports.
 const MISSING_GRANULAR_KEY = "tokens_granular_missing";
 
-// Attribution sources, in the order `resolveSnowflakeSubscription` tries them by default.
-// Named strings rather than positional arguments so a caller's override reads as an
-// intention (`order: ["query_tag"]`) instead of a permutation.
-const DEFAULT_SUBSCRIPTION_ORDER = ["query_tag", "role_names", "user_id"] as const;
+// What the resolver tries when the caller says nothing: the tag, and ONLY the tag.
+//
+// `role_names` and `user_id` are deliberately NOT in the default, and the reason is
+// measured, not stylistic. Live (2026-08-28): every row either view produces carries a
+// populated `ROLE_NAMES`/`USER_ID`, so a default that includes them can never return
+// null — `defaultSubscription` becomes dead code, and every untagged row bills to a
+// Snowflake role name instead. Lago then ACCEPTS those events for the nonexistent
+// subscription with a 200 (30 events measured under "LAGO_CORTEX_ROLE", zero errors on
+// any hook), so the revenue parks under an id nobody bills and nothing anywhere says so.
+// Tag-or-null is also exactly what the Databricks resolver does, for the same reason.
+// Accounts that really do map one role or one user to one customer opt in by passing
+// the order explicitly.
+const DEFAULT_SUBSCRIPTION_ORDER = ["query_tag"] as const;
 
 // The key a customer puts inside QUERY_TAG. Identical to Cloudflare's
 // `cf-aig-metadata.lago_subscription` and Databricks' `request_tags.lago_subscription`,
 // so one instruction covers all three gateways.
 const SUBSCRIPTION_TAG_KEY = "lago_subscription";
 
-export type SnowflakeSubscriptionSource = (typeof DEFAULT_SUBSCRIPTION_ORDER)[number];
+// Every attribution source `resolveSnowflakeSubscription` knows how to read. Named
+// strings rather than positional arguments so a caller's override reads as an intention
+// (`order: ["query_tag"]`) instead of a permutation.
+export type SnowflakeSubscriptionSource = "query_tag" | "role_names" | "user_id";
 
 /**
  * Read a column by name, tolerating the case Snowflake actually returned.
@@ -527,8 +539,9 @@ export function extractSnowflakeFunctionsLog(row: Record<string, unknown>): Cano
  * unattributed row means (drop it, route it to a default, warn). This function only
  * reports whether attribution is present.
  *
- * `order` names the sources to try, first hit wins. Default
- * `["query_tag", "role_names", "user_id"]`:
+ * `order` names the sources to try, first hit wins. Default `["query_tag"]` — the tag
+ * alone; see `DEFAULT_SUBSCRIPTION_ORDER` for the live measurement behind that. The
+ * sources a caller can name:
  *
  *   query_tag   `QUERY_TAG` parsed as JSON, then its "lago_subscription" key. This is the
  *               ONLY customer-injectable attribution key on either view —
@@ -539,17 +552,16 @@ export function extractSnowflakeFunctionsLog(row: Record<string, unknown>): Cano
  *               `{"app": "cortex_code_sandbox", ...}`), so treating an arbitrary tag as a
  *               subscription id bills somebody's tooling label to a customer.
  *   role_names  first entry of the `ROLE_NAMES` array — the functions view's proxy for a
- *               tenant on accounts where one role means one customer.
- *   user_id     `USER_ID`, stringified.
+ *               tenant on accounts where one role means one customer. Opt-in only:
+ *               on any other account it is the caller's own role, not a customer.
+ *   user_id     `USER_ID`, stringified. Opt-in only: a numeric Snowflake identity
+ *               ("1") that matches a Lago subscription only if the customer maintains
+ *               that mapping themselves. (`ROLE_NAMES` does not exist on the REST view
+ *               at all, so an opted-in REST read resolves to `USER_ID` in practice.)
  *
- * **This view offers only `USER_ID`, and a Snowflake user is not a Lago subscription.**
- * `ROLE_NAMES` does not exist on the REST view at all, and `QUERY_TAG` — present since
- * the column appeared, NULL on all 24 captured rows — has never been observed carrying a
- * value here. So on REST traffic the default order resolves to `USER_ID` in practice,
- * i.e. a numeric Snowflake identity ("1") that matches a Lago subscription only if the
- * customer maintains that mapping themselves. Callers who do not should pass
- * `["query_tag"]` and let the row go unattributed, which is recoverable; billing the
- * wrong subscription is not. Do NOT invent a mapping table here — REST usage is meant to
+ * An untagged row therefore resolves to null and falls to the backfill's
+ * `defaultSubscription`, which is recoverable; billing a role or user id as if it were
+ * a subscription is not. Do NOT invent a mapping table here — REST usage is meant to
  * bill through the live `wrap()` path, where the subscription is known at call time.
  */
 export function resolveSnowflakeSubscription(

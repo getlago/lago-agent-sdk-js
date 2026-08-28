@@ -239,9 +239,19 @@ describe("Snowflake Cortex — subscription resolution", () => {
     expect(resolveSnowflakeSubscription({ QUERY_TAG: "nightly-etl" }, ["query_tag"])).toBe(null);
   });
 
-  it("falls through ROLE_NAMES then USER_ID", () => {
+  // The correction INT-230 measured live: every row either view produces carries a
+  // populated ROLE_NAMES/USER_ID, so a default including them never returns null —
+  // `defaultSubscription` was dead code and every untagged row billed to a Snowflake
+  // role name, which Lago ACCEPTED for the nonexistent subscription with a 200 (30
+  // events, zero errors on any hook). Reverting the default re-breaks this test.
+  it("an untagged row resolves to NOTHING by default, even with roles and a user present", () => {
     const row = { ROLE_NAMES: '["TENANT_ACME", "PUBLIC"]', USER_ID: "1" };
-    expect(resolveSnowflakeSubscription(row)).toBe("TENANT_ACME");
+    expect(resolveSnowflakeSubscription(row)).toBe(null);
+  });
+
+  it("ROLE_NAMES and USER_ID resolve only when opted into", () => {
+    const row = { ROLE_NAMES: '["TENANT_ACME", "PUBLIC"]', USER_ID: "1" };
+    expect(resolveSnowflakeSubscription(row, ["role_names", "user_id"])).toBe("TENANT_ACME");
     expect(resolveSnowflakeSubscription(row, ["user_id"])).toBe("1");
   });
 
@@ -264,13 +274,13 @@ describe("Snowflake Cortex — subscription resolution", () => {
   });
 
   // The honest state of this view: no QUERY_TAG value has ever been observed on it and it
-  // has no ROLE_NAMES at all, so the default order reaches `USER_ID` — a Snowflake identity,
-  // not a Lago subscription. A caller without that mapping should pass `["query_tag"]` and
-  // let the row go unattributed.
-  it("a real REST row resolves to the Snowflake user only", () => {
+  // has no ROLE_NAMES at all — `USER_ID` is a Snowflake identity, not a Lago
+  // subscription, so by default a real REST row goes unattributed and falls to the
+  // backfill's default.
+  it("a real REST row resolves to nothing by default, the Snowflake user on opt-in", () => {
     const row = load("rest_plain.json");
-    expect(resolveSnowflakeSubscription(row)).toBe("1");
-    expect(resolveSnowflakeSubscription(row, ["query_tag"])).toBe(null);
+    expect(resolveSnowflakeSubscription(row)).toBe(null);
+    expect(resolveSnowflakeSubscription(row, ["user_id"])).toBe("1");
   });
 });
 
@@ -278,13 +288,13 @@ describe("Snowflake Cortex — coercion edges", () => {
   // ARRAY columns arrive as TEXT over the SQL API and as a real array from a typed
   // connector — the same row must attribute the same way through either.
   it("ROLE_NAMES accepted as an array, not only a JSON string", () => {
-    expect(resolveSnowflakeSubscription({ ROLE_NAMES: ["TENANT_ACME"] })).toBe("TENANT_ACME");
+    expect(resolveSnowflakeSubscription({ ROLE_NAMES: ["TENANT_ACME"] }, ["role_names"])).toBe("TENANT_ACME");
   });
 
   it("malformed ROLE_NAMES resolves nothing rather than throwing", () => {
     const row = { ROLE_NAMES: "[not json", USER_ID: "1" };
     expect(resolveSnowflakeSubscription(row, ["role_names"])).toBe(null);
-    expect(resolveSnowflakeSubscription(row)).toBe("1");
+    expect(resolveSnowflakeSubscription(row, ["role_names", "user_id"])).toBe("1");
   });
 
   // `TOKENS` is only ever read to decide whether zeros mean "no usage" or "usage we could
@@ -402,12 +412,16 @@ describe("Snowflake Cortex functions — real fixtures", () => {
   });
 
   // Unlike the REST view, this one carries `ROLE_NAMES` — and a Snowflake-written
-  // `QUERY_TAG` (`{"app": "cortex_code_sandbox"}`) that must not be read as an id.
-  it("a real functions row resolves through ROLE_NAMES", () => {
-    expect(resolveSnowflakeSubscription(load("functions_large_prompt.json"))).toBe("LAGO_CORTEX_ROLE");
+  // `QUERY_TAG` (`{"app": "cortex_code_sandbox"}`) that must not be read as an id. By
+  // default neither is: a real untagged row resolves to nothing, and the role only on
+  // opt-in.
+  it("a real functions row is unattributed by default, resolves through ROLE_NAMES on opt-in", () => {
+    const row = load("functions_large_prompt.json");
+    expect(resolveSnowflakeSubscription(row)).toBe(null);
+    expect(resolveSnowflakeSubscription(row, ["role_names"])).toBe("LAGO_CORTEX_ROLE");
     const tagged = load("functions_query_tag.json");
-    expect(resolveSnowflakeSubscription(tagged, ["query_tag"])).toBe(null);
-    expect(resolveSnowflakeSubscription(tagged)).toBe("ACCOUNTADMIN");
+    expect(resolveSnowflakeSubscription(tagged)).toBe(null);
+    expect(resolveSnowflakeSubscription(tagged, ["query_tag", "role_names"])).toBe("ACCOUNTADMIN");
   });
 
   // The SQL API serializes ARRAY columns as TEXT; a typed connector hands back a real
