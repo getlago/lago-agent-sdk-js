@@ -576,14 +576,14 @@ describe("Ramp Router — recorded billing decisions", () => {
     expect(errors).toHaveLength(0);
   });
 
-  it("ramp_router's token convention is a recorded decision: additive on every axis", () => {
-    // Router normalizes the response SCHEMA to OpenAI's but nothing says it normalizes
-    // the NUMBERS, so the overlap convention is unmeasured. Absence from every subset
-    // set means the total_tokens guard treats the counts as additive — the conservative
-    // direction, which can under-fold a subset total but never inflates output with
-    // tokens that were never generated (the Cortex 2.0x shape). KNOWN_PROVIDERS is what
-    // makes that an explicit decision instead of a default nobody made.
+  it("ramp_router's token convention is a recorded measurement: OpenAI-shaped on every axis", () => {
+    // Measured live 2026-08-28, on an Anthropic-served model — the case that would
+    // diverge if anything did: a warm cache_control call reported the cached block
+    // INSIDE input_tokens (06b_real_cache_control_warm.json), and reasoning came back
+    // inside output (07_real_reasoning.json). Router normalizes the NUMBERS to OpenAI's
+    // convention, not just the schema. The entry lives in OPENAI_SHAPED_APIS because the
+    // adapter stamps api="ramp_router" and the surface wins over the vendor.
     expect(KNOWN_PROVIDERS.has(RAMP_ROUTER_PROVIDER)).toBe(true);
-    expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_PROVIDER)).toEqual([false, false, false]);
+    expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_PROVIDER)).toEqual([true, true, true]);
   });
 });

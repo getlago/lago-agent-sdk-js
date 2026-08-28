@@ -45,21 +45,21 @@ const WORKERS_AI_COMPAT_PREFIX = "workers-ai/";
  *   - A price lookup under a guessed vendor can be flatly wrong. Router bills at list
  *     price on its shared key but $0 for a BYOK-served request, and a non-default service
  *     tier bills at a rate its own catalog says "may differ" from the base one.
- *   - The cache and reasoning overlap semantics are UNMEASURED. `openai` counts
- *     cache_read inside input and reasoning inside output; `anthropic` counts both
- *     additively. Router normalizes the SCHEMA to OpenAI's, and no document says whether
- *     it also normalizes the NUMBERS. Stamping the served vendor before that is measured
- *     de-overlaps a call that may not overlap, or fails to de-overlap one that does.
- *     Absence from the subset sets means the total_tokens guard treats the counts as
- *     additive — the conservative direction: it can leave a subset uncounted in the
- *     total but never inflates output with tokens that were never generated.
+ *   - The overlap semantics belong to ROUTER, not to the served vendor. Measured
+ *     2026-08-28 on an Anthropic-served model — the case that would diverge if anything
+ *     did: Router normalizes the NUMBERS to OpenAI's convention, not just the schema
+ *     (cached block INSIDE input, reasoning inside output; fixtures
+ *     06b_real_cache_control_warm.json / 07_real_reasoning.json). So stamping the served
+ *     vendor would de-overlap with the WRONG convention whenever that vendor's native
+ *     one differs — "ramp_router" carries its own OPENAI_SHAPED_APIS entry instead.
  *
  * Token mode is unaffected and exact either way: it emits the counts Router reported.
  * Price mode routes to those same token events via `TOKEN_BILLED_PROVIDERS`, with no
  * per-call price-miss report — a structural, permanent miss must not cry wolf on the
- * error hook (the same decision Databricks and Snowflake got). Promoting
- * `extras.router_provider` into `provider` is safe only once the overlap question is
- * measured against a live account.
+ * error hook (the same decision Databricks and Snowflake got). The catalog DOES publish
+ * per-model rates (`router.pricing`, 01_real_models_catalog.json), so a Router price
+ * mode is buildable — but the response still cannot say whether a BYOK key served the
+ *     call ($0) or which tier rate applied, so token counts stay the honest default.
  */
 export const RAMP_ROUTER_PROVIDER = "ramp_router";
 
