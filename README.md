@@ -16,14 +16,14 @@
 </p>
 
 ```text
-                    ┌────────────────┐
-your code ────────► │ wrapped client │ ───► provider (Bedrock / Mistral / …)
-                    └───────┬────────┘
-                            │ (extract usage)
-                            ▼
-                    ┌────────────────┐
-                    │  Lago events   │ ───► api.getlago.com
-                    └────────────────┘
+                                ┌────────────────┐
+            your code ────────► │ wrapped client │ ───► provider (Bedrock / Mistral / …)
+                                └───────┬────────┘
+                                        │ (extract usage)
+                                        ▼
+                                ┌────────────────┐
+                                │  Lago events   │ ───► api.getlago.com
+                                └────────────────┘
 ```
 
 ## What it does
