@@ -18,6 +18,7 @@ import {
   deoverlappedTokenTotal,
   moneyStrToCents,
 } from "./pricing.js";
+import { SNOWFLAKE_EVENT_ID_PREFIX } from "./gateway/adapters/snowflake_cortex.js";
 import { EventQueue } from "./queue.js";
 import { wrapAnthropicClient } from "./wrappers/anthropic.js";
 import { wrapBedrockClient } from "./wrappers/bedrock.js";
@@ -804,7 +805,22 @@ export class LagoSDK {
    *
    * Idempotent: every event id derives from the source row's own id and is scoped by
    * subscription, so re-running the same window has Lago reject the duplicates rather than
-   * double-bill. Does not flush — call `flush()` when you want to await delivery.
+   * double-bill. The same key protects against the live path: the OpenAI wrapper stamps a
+   * REST call's events with the id this backfill would derive from that call's
+   * `REQUEST_ID`, so a `views: ["rest"]` read over a live-billed window is rejected by
+   * Lago instead of billing twice. That protection holds ONLY when this backfill runs
+   * with the default `eventIdPrefix` AND resolves the same subscription the live path
+   * billed — a custom prefix, or a different `defaultSubscription` than the wrapper's
+   * resolution, silently makes the two keys unrelated again and nothing reports it. Nor
+   * does it cover a cache-creation call's cached block: the wire reports creations as
+   * reads, so the live path billed `cache_read` while this backfill bills the row's
+   * `cache_write` under a different id — input and output dedup, that one component
+   * double-counts. Know
+   * also what a fully-duplicate window costs: `/events/batch` rejects a batch containing
+   * any duplicate wholesale, so the queue re-sends it one event at a time — N rows become
+   * N individual POSTs. Correct billing, through the mechanism built for emergencies;
+   * acceptable because reading this view at all is opt-in. Does not flush — call
+   * `flush()` when you want to await delivery.
    *
    * `source` is normally a `SnowflakeSource`, and `since` the window. It also accepts an
    * already-read array of `SnowflakeUsageRow` — pass one when you have inspected the rows
@@ -828,7 +844,7 @@ export class LagoSDK {
     const reader = Array.isArray(source) ? undefined : source;
     const rows = reader
       ? await reader.readUsage(since, {
-          eventIdPrefix: opts.eventIdPrefix ?? "sfc",
+          eventIdPrefix: opts.eventIdPrefix ?? SNOWFLAKE_EVENT_ID_PREFIX,
           // Only forwarded when set, so the reader's own safe default — functions only —
           // is what applies when a caller says nothing.
           ...(opts.views ? { views: opts.views } : {}),

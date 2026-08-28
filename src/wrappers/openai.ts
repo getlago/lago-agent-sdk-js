@@ -23,6 +23,12 @@
  */
 import { extractOpenAINative } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
+// The one import a wrapper takes from gateway code, and it is load-bearing: the REST-view
+// dedup only works if this wrapper and `gateway/snowflake.ts` compute the IDENTICAL
+// transaction id, so both call one helper instead of keeping two copies of a string
+// format that would drift without an error. The module is pure (canonical-only imports,
+// no I/O, no node built-ins), so this pulls nothing heavy into the wrap() path.
+import { SNOWFLAKE_EVENT_ID_PREFIX, snowflakeEventId } from "../gateway/adapters/snowflake_cortex.js";
 
 const INSTRUMENTED = Symbol.for("lago_instrumented_openai");
 
@@ -38,6 +44,9 @@ interface EmitOpts {
   dimensions?: Record<string, unknown>;
   mode?: "tokens" | "price";
   markup?: number;
+  /** Idempotency key for this call's events — set only on the Snowflake path, where the
+   * response header supplies the id the REST-view backfill would also derive. */
+  eventId?: string;
 }
 
 interface SDKLike {
@@ -114,6 +123,31 @@ async function isCacheHit(target: unknown): Promise<boolean> {
     return raw?.headers?.get?.("cf-aig-cache-status") === "HIT";
   } catch {
     return false;
+  }
+}
+
+/**
+ * The Snowflake-side id of a Cortex call, read off the raw response.
+ *
+ * `x-snowflake-request-id` IS the `REQUEST_ID` the call lands under in
+ * `CORTEX_REST_API_USAGE_HISTORY` (measured byte-identical, 2026-08-26), which is what
+ * lets the live path and a REST-view backfill produce one transaction id — see
+ * `snowflakeEventId`. The response BODY is not a route in: Cortex returns `"id": ""`.
+ *
+ * Same shape and same defensiveness as `isCacheHit`: `.asResponse()` on the real
+ * APIPromise, resolved from the same underlying response, headers only — for a stream it
+ * resolves once headers arrive, without touching the body the caller is about to read.
+ * A client without `.asResponse()`, or a response without the header, yields "" and the
+ * event keeps its UUID — never breaks the customer's call.
+ */
+async function snowflakeRequestId(target: unknown): Promise<string> {
+  try {
+    const asResponse = (target as { asResponse?: () => Promise<Response> }).asResponse;
+    if (typeof asResponse !== "function") return "";
+    const raw = await asResponse.call(target);
+    return raw?.headers?.get?.("x-snowflake-request-id") ?? "";
+  } catch {
+    return "";
   }
 }
 
@@ -269,15 +303,32 @@ export function wrapOpenAIClient<T extends OpenAILike>(
       const forwarded = firstArg === undefined ? args : [firstArg, ...args.slice(1)];
       const apiPromise = original(...forwarded) as object;
 
+      // The idempotency key that makes a REST-view backfill of this same call a
+      // duplicate Lago rejects, in the EXACT shape the reader builds. Gated on the
+      // provider hint rather than on the header existing: real OpenAI never sends the
+      // header today, but the gate makes that a property of this code instead of the
+      // provider's behaviour — a proxy injecting the header at an OpenAI baseURL must
+      // not change that call's transaction_id shape. Keyed off the subscription
+      // resolved at call time, which is the value `emit()` will bill. No header (or no
+      // `.asResponse()`) → undefined → `emit()` keeps its per-event UUID fallback; an
+      // extra guard here would be redundant with that, and a constant fallback would
+      // collide every call in the window onto one id.
+      const restEventId = async (target: unknown): Promise<string | undefined> => {
+        if (providerHint !== "snowflake") return undefined;
+        const requestId = await snowflakeRequestId(target);
+        if (!requestId) return undefined;
+        return snowflakeEventId(SNOWFLAKE_EVENT_ID_PREFIX, "rest", emitOpts.subscription, requestId);
+      };
+
       // ONE emit per call, whichever trap the caller touches. `await p` and
       // `p.withResponse()` are both instrumented below and both resolve from the SAME
       // underlying APIPromise, so doing both — a caller reading usage, then reading
       // rate-limit headers — billed the call twice.
       let emitted = false;
-      const emitOnce = (payload: unknown) => {
+      const emitOnce = (payload: unknown, eventId?: string) => {
         if (emitted) return;
         emitted = true;
-        emitFrom(payload, modelId, emitOpts);
+        emitFrom(payload, modelId, eventId ? { ...emitOpts, eventId } : emitOpts);
       };
 
       // APIPromise has class-private fields (#httpResponse). Methods accessed
@@ -299,10 +350,22 @@ export function wrapOpenAIClient<T extends OpenAILike>(
                     // underlying promise before emitting — see
                     // isCacheHit()'s docstring for why this is safe.
                     if (!(await isCacheHit(target))) {
-                      emitOnce(value);
+                      emitOnce(value, await restEventId(target));
                     }
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
+                    // Streaming reaches the header the same way: by the time the
+                    // APIPromise has resolved to an iterable, the response headers have
+                    // arrived, and `.asResponse()` reads them without consuming the body
+                    // (verified live on a streamed Cortex call). The keyed opts ride into
+                    // the stream wrapper, whose final-usage emit carries them.
+                    const eventId = await restEventId(target);
+                    next = wrapAsyncIterableStream(
+                      value,
+                      sdk,
+                      modelId,
+                      eventId ? { ...emitOpts, eventId } : emitOpts,
+                      providerHint,
+                    );
                   }
                 } catch (err) {
                   // Never break the call — but reaching here means the call went
@@ -327,7 +390,7 @@ export function wrapOpenAIClient<T extends OpenAILike>(
               const result = (await orig()) as { data?: unknown };
               try {
                 if (looksLikeResponse(result?.data) && !(await isCacheHit(target))) {
-                  emitOnce(result.data);
+                  emitOnce(result.data, await restEventId(target));
                 }
               } catch (err) {
                 sdk.reportError(err, "wrapper.openai");

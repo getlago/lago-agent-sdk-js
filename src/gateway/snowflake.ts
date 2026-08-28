@@ -51,25 +51,25 @@
  *     can NEVER see this traffic. It exists only in this view, and a backfill is the only
  *     way to bill it.
  *   * `CORTEX_REST_API_USAGE_HISTORY` reports the `/api/v2/cortex/v1` calls that the live
- *     `wrap()` path already bills. Backfilling a window the live path covered bills every
- *     one of those calls TWICE: the live path's `transaction_id` is a random UUID and this
- *     reader's is derived from `REQUEST_ID`, so Lago has no way to tell they are the same
- *     call and accepts both.
+ *     `wrap()` path already bills. Backfilling a window the live path covered re-reports
+ *     every one of those calls.
  *
  * Which is why `readUsage` reads the functions view by DEFAULT and the REST view only when
  * asked (`views: ["rest"]`). The Databricks reader's rule — "pick one path per traffic
  * stream" — cannot be followed here, because a customer using both surfaces has to
  * backfill one view and must not backfill the other. The default is the safe half of that.
  *
- * The double-bill is CLOSEABLE, and measured rather than assumed: driven live 2026-08-26,
- * one Cortex call whose response header read
+ * The re-report is caught by Lago itself, because both paths now derive ONE key. Measured
+ * rather than assumed, 2026-08-26: one Cortex call whose response header read
  * `x-snowflake-request-id: 21763baf-8a80-4e42-969e-1383dd5968d6` landed in the REST view
- * ~2 minutes later as exactly that `REQUEST_ID`. So the live path could adopt that header
- * as its `eventId`, both paths would compute one `transaction_id`, and Lago would reject
- * the backfill's copy by itself. (The response BODY is not the way in: Cortex returns
- * `"id": ""`.) That belongs to the wrapper, not this reader, and is its own ticket — the
- * opt-in above is what keeps the default safe until it lands, and stays worth having
- * afterwards as the thing that means a live-path customer never reads this view at all.
+ * ~2 minutes later as exactly that `REQUEST_ID`. (The response BODY is not the way in:
+ * Cortex returns `"id": ""`.) The OpenAI wrapper therefore adopts that header as its
+ * `eventId`, this reader derives the same key from `REQUEST_ID` via `snowflakeEventId`,
+ * and Lago rejects the backfill's copy as a duplicate `transaction_id`. The dedup holds
+ * ONLY while both sides compute the identical string — same `eventIdPrefix` ("sfc") and
+ * same resolved subscription; see `backfillSnowflake` for the two ways a caller can break
+ * that. The opt-in default stays worth having anyway: a live-path customer never reads
+ * this view at all, and headerless calls still fall back to a UUID.
  *
  * Uses the global `fetch()`, so this adds nothing to the install.
  */
@@ -78,10 +78,12 @@ import { createHash } from "node:crypto";
 
 import { type CanonicalUsage, nonzeroNumeric } from "../canonical.js";
 import {
+  SNOWFLAKE_EVENT_ID_PREFIX,
   column,
   extractSnowflakeFunctionsLog,
   extractSnowflakeRestLog,
   resolveSnowflakeSubscription,
+  snowflakeEventId,
 } from "./adapters/snowflake_cortex.js";
 
 const STATEMENTS_PATH = "/api/v2/statements";
@@ -190,7 +192,7 @@ export class SnowflakeUsageRow {
     public subscription: string | null,
     public rowId: string,
     public kind: SnowflakeView,
-    public prefix: string = "sfc",
+    public prefix: string = SNOWFLAKE_EVENT_ID_PREFIX,
     public raw: Record<string, unknown> = {},
   ) {}
 
@@ -263,7 +265,7 @@ export class SnowflakeUsageRow {
    * RESOLVED value, not from `this.subscription`.
    */
   eventIdFor(subscription: string | null | undefined): string {
-    return `${this.prefix}_${this.kind}_${subscription || "none"}_${this.rowId}`;
+    return snowflakeEventId(this.prefix, this.kind, subscription, this.rowId);
   }
 }
 
@@ -651,7 +653,7 @@ export class SnowflakeSource {
    * rule 4 already asks for.
    */
   async readUsage(since: string | Date = "1 day", opts: ReadUsageOptions = {}): Promise<SnowflakeUsageRow[]> {
-    const prefix = opts.eventIdPrefix ?? "sfc";
+    const prefix = opts.eventIdPrefix ?? SNOWFLAKE_EVENT_ID_PREFIX;
     const views = opts.views ?? (["functions"] as const);
     // Rewritten per read rather than appended to, so a later read of a healthy window
     // cannot leave an earlier read's gap standing as if it were current. Cleared ahead of
@@ -785,9 +787,10 @@ export class SnowflakeSource {
     // already opted in, and the one who did it by accident is the one who needs telling.
     console.warn(
       `[lago] reading ${rows.length} row(s) from ${REST_VIEW}. If these calls were made ` +
-        `through a wrapped client, the live path ALREADY billed them and this read will ` +
-        `bill them a second time — the two transaction_ids are unrelated, so Lago cannot ` +
-        `reject the duplicate. Only backfill this view for traffic wrap() never saw.`,
+        `through a wrapped client, the live path ALREADY billed them and this read ` +
+        `re-reports them. Lago rejects the copies as duplicate transaction_ids ONLY when ` +
+        `this backfill uses the default eventIdPrefix and resolves the same subscription ` +
+        `the live path billed. Only backfill this view for traffic wrap() never saw.`,
     );
 
     const out: SnowflakeUsageRow[] = [];
