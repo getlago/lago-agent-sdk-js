@@ -1,4 +1,7 @@
 /** Ramp Router live path — fake client, no live API. */
+import fs from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { LagoSDK } from "../../../src/index.js";
@@ -627,5 +630,59 @@ describe("Ramp Router — the totals guard reads the stamped api", () => {
     const u = extractOpenAINative(misreporting(200), "", RAMP_ROUTER_PROVIDER);
     expect(u.extras.unaccounted_output_tokens).toBe(50);
     expect(u.output).toBe(100);
+  });
+});
+
+// ----------------------------------------------------------------------
+// The captured responses, run through the adapter. The suites above pin the
+// SDK's decisions against a hand-built shape; these pin them against what
+// Router actually sent. Skips cleanly when the captures are absent, so a
+// missing capture reads as "not covered" rather than as a pass.
+// ----------------------------------------------------------------------
+const CAPTURES = path.join(__dirname, "..", "adapters", "fixtures", "ramp_router");
+
+/** Every captured 200 that carries usage, buffered or streamed. */
+function capturedBodies(): Array<[string, Record<string, any>]> {
+  if (!fs.existsSync(CAPTURES)) return [];
+  const out: Array<[string, Record<string, any>]> = [];
+  for (const name of fs.readdirSync(CAPTURES).sort()) {
+    if (!name.endsWith(".json")) continue;
+    const blob = JSON.parse(fs.readFileSync(path.join(CAPTURES, name), "utf8"));
+    let body = blob._body;
+    if (!(body && typeof body === "object" && body.usage)) {
+      // The streamed capture keeps its payload under `.response` per event; the terminal
+      // one is the only one carrying usage, and is what the wrapper bills.
+      body = undefined;
+      for (const event of blob._events ?? []) {
+        const candidate = event?.response;
+        if (candidate && typeof candidate === "object" && candidate.usage) body = candidate;
+      }
+    }
+    if (body && typeof body === "object" && body.usage) out.push([name, body]);
+  }
+  return out;
+}
+
+const CAPTURED = capturedBodies();
+
+describe.skipIf(CAPTURED.length === 0)("ramp router captured responses", () => {
+  it.each(CAPTURED)("%s reports its served tier", (_name, body) => {
+    // The regression this file previously had no way to catch. The tier was read only
+    // from a `provider:model:tier` candidate suffix, a shape Router resolves away before
+    // answering, so `service_tier` was dropped on 100% of live traffic while the
+    // hand-built tests stayed green.
+    const u = extractOpenAINative(body, "", RAMP_ROUTER_PROVIDER);
+    expect(u.extras.service_tier).toBe(body.service_tier);
+  });
+
+  it.each(CAPTURED)("%s bills the bare served snapshot", (_name, body) => {
+    // Router answers with a resolved vendor snapshot, never a compound candidate — the
+    // reason the suffix parse is a fallback rather than the live path. Billing the model
+    // verbatim is what rolls a Router-served call up against the same Lago row a direct
+    // call to that model reports.
+    const u = extractOpenAINative(body, "", RAMP_ROUTER_PROVIDER);
+    expect(u.model).toBe(body.model);
+    expect(u.model).not.toContain(":");
+    expect(u.provider).toBe(RAMP_ROUTER_PROVIDER);
   });
 });
