@@ -587,3 +587,45 @@ describe("Ramp Router — recorded billing decisions", () => {
     expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_PROVIDER)).toEqual([true, true, true]);
   });
 });
+
+// Router is the only surface in this tree that REASSIGNS `api` mid-extract, so the stamp
+// has to land before the totalTokens guard reads it.
+describe("Ramp Router — the totals guard reads the stamped api", () => {
+  /**
+   * A Router payload whose declared total does NOT equal input + output, with both subsets
+   * non-zero. No captured fixture has this shape — all ten report total == input + output,
+   * streamed included — so this is the only cover the guard's Router branch has.
+   */
+  const misreporting = (total: number) =>
+    routerResponse("gpt-5.4-nano", {
+      input_tokens: 100,
+      output_tokens: 50,
+      total_tokens: total,
+      input_tokens_details: { cached_tokens: 80 },
+      output_tokens_details: { reasoning_tokens: 30 },
+    });
+
+  it("folds the whole remainder, not the remainder minus the subsets", () => {
+    // The guard, computeCost and deoverlappedTokenTotal must answer the overlap question
+    // identically — the whole reason token_semantics.ts exists. Read before the stamp, the
+    // guard sees ("ramp_router", "responses"), which is in no subset set, and so adds
+    // cacheRead + reasoning to an accounted sum that already contains them.
+    const u = extractOpenAINative(misreporting(1000), "", RAMP_ROUTER_PROVIDER);
+    // 1000 - (100 + 50). The cached block sits INSIDE input and reasoning INSIDE output, so
+    // neither is accounted twice; folding 740 would lose exactly cacheRead + reasoning.
+    expect(u.extras.unaccounted_output_tokens).toBe(850);
+    expect(u.output).toBe(50 + 850);
+    // Read from before the stamp — moving the block above the guard must not cost this.
+    expect(u.extras.router_surface).toBe("responses");
+  });
+
+  it("still folds a remainder smaller than its own subsets rather than dropping it", () => {
+    // The suppression case, and the one that loses money silently rather than merely
+    // under-counting: with the wrong semantics the accounted sum (260) EXCEEDS the declared
+    // total, `unaccounted` goes negative, the guard never fires, and 50 generated tokens are
+    // dropped with no extras key and no onError report.
+    const u = extractOpenAINative(misreporting(200), "", RAMP_ROUTER_PROVIDER);
+    expect(u.extras.unaccounted_output_tokens).toBe(50);
+    expect(u.output).toBe(100);
+  });
+});

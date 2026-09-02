@@ -318,6 +318,41 @@ export function extractOpenAINative(
   const resolvedModel = resolveModel(resp.model, modelId);
   const provider = providerHint || inferProvider(resolvedModel);
 
+  // MUST stay ABOVE the totalTokens guard below. The guard asks
+  // `tokenSemantics(provider, api)` the same convention question `computeCost` and
+  // `deoverlappedTokenTotal` ask, and Router is the one surface here that REASSIGNS
+  // `api` mid-function. Read before the reassignment, the guard sees
+  // ("ramp_router", "responses") — all-additive — while the money paths see the stamped
+  // api="ramp_router" and de-overlap as subset. That divergence is exactly what
+  // token_semantics.ts exists to make impossible, and it under-folds a genuine remainder
+  // by cacheRead + reasoning, or suppresses the fold entirely when the over-count exceeds
+  // the declared total — silently, with no onError.
+  //
+  // `resolveModel` prefers the response's own model over the requested one, which is what
+  // makes a Router fallback bill correctly with no extra work: a `models` request sends no
+  // `model` at all, and Switchyard routing can serve a different model than the one asked
+  // for, so the response is the only place the SERVED model appears.
+  let model = resolvedModel;
+  let api = extracted.api;
+  if (providerHint === RAMP_ROUTER_PROVIDER) {
+    const parts = parseRouterModel(resolvedModel);
+    if (parts.provider) {
+      model = parts.model;
+      // Recorded, not promoted to `provider` — see RAMP_ROUTER_PROVIDER for why the
+      // served vendor cannot drive pricing until Router's overlap semantics are measured.
+      extras.router_provider = parts.provider;
+    }
+    // The tier is billing-relevant on its own: Router's catalog says tiers "may use
+    // different rates" than the base ones it publishes, so a pinned non-default tier is
+    // the difference between a correct price and an over-bill at the standard rate.
+    if (parts.tier) extras.service_tier = parts.tier;
+    // Which of Router's two OpenAI-shaped surfaces answered. Router documents only
+    // `/v1/responses` (`/v1/chat/completions` 404s), so a `chat_completions` value here is
+    // drift worth seeing rather than a case to handle.
+    extras.router_surface = api;
+    api = RAMP_ROUTER_PROVIDER;
+  }
+
   // Consistency guard: for genuine OpenAI, total_tokens always equals
   // prompt + completion (reasoning is a SUBSET of completion, never additive).
   // Verified across every fixture under openai_native/ — zero deltas. So a
@@ -380,7 +415,9 @@ export function extractOpenAINative(
   // A no-op for real OpenAI either way: total always equals prompt + completion.
   const declaredTotal = safeInt(usage.total_tokens);
   if (declaredTotal) {
-    const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(provider, extracted.api);
+    // `api`, not `extracted.api` — the latter keeps the pre-Router surface value and would
+    // re-open the divergence the block above was moved to close.
+    const [incCacheRead, incCacheWrite, incReasoning] = tokenSemantics(provider, api);
     let accounted = extracted.inputTokens + extracted.outputTokens;
     if (!incReasoning) accounted += extracted.reasoning;
     if (!incCacheRead) accounted += extracted.cacheRead;
@@ -390,31 +427,6 @@ export function extractOpenAINative(
       extracted.outputTokens += unaccounted;
       extras.unaccounted_output_tokens = unaccounted;
     }
-  }
-
-  // `resolveModel` prefers the response's own model over the requested one, which is what
-  // makes a Router fallback bill correctly with no extra work: a `models` request sends no
-  // `model` at all, and Switchyard routing can serve a different model than the one asked
-  // for, so the response is the only place the SERVED model appears.
-  let model = resolvedModel;
-  let api = extracted.api;
-  if (providerHint === RAMP_ROUTER_PROVIDER) {
-    const parts = parseRouterModel(resolvedModel);
-    if (parts.provider) {
-      model = parts.model;
-      // Recorded, not promoted to `provider` — see RAMP_ROUTER_PROVIDER for why the
-      // served vendor cannot drive pricing until Router's overlap semantics are measured.
-      extras.router_provider = parts.provider;
-    }
-    // The tier is billing-relevant on its own: Router's catalog says tiers "may use
-    // different rates" than the base ones it publishes, so a pinned non-default tier is
-    // the difference between a correct price and an over-bill at the standard rate.
-    if (parts.tier) extras.service_tier = parts.tier;
-    // Which of Router's two OpenAI-shaped surfaces answered. Router documents only
-    // `/v1/responses` (`/v1/chat/completions` 404s), so a `chat_completions` value here is
-    // drift worth seeing rather than a case to handle.
-    extras.router_surface = api;
-    api = RAMP_ROUTER_PROVIDER;
   }
 
   return makeCanonicalUsage({
