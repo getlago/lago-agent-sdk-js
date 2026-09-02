@@ -81,7 +81,11 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // real vendor prefix would let a near-miss model string match Anthropic's or OpenAI's own
 // OpenRouter rate — a silent mispricing of a call Snowflake charged in credits. The
 // absence is the guard; do not "fix" it.
-export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set(["databricks", "snowflake"]);
+export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set([
+  "databricks",
+  "snowflake",
+  "ramp_router",
+]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",

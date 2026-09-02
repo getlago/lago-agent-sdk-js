@@ -138,7 +138,20 @@ export const OUTPUT_INCLUDES_REASONING = new Set(["openai", "workers-ai"]);
 // Adding either would drop a cached row from 4,698 tokens to 14; INT-221's
 // reconciliation test asserts the sum against Snowflake's own TOKENS column and fails if
 // someone does.
-export const OPENAI_SHAPED_APIS = new Set(["databricks_gateway"]);
+export const OPENAI_SHAPED_APIS = new Set([
+  "databricks_gateway",
+  // Ramp Router normalizes the NUMBERS to OpenAI's convention, not just the schema —
+  // measured 2026-08-28 against a live account, on an ANTHROPIC-served model, which is
+  // the case that would diverge if anything did: a warm cache_control call reported
+  // input_tokens unchanged (18825) with cached_tokens 18810 INSIDE it, total = input +
+  // output exactly (06b_real_cache_control_warm.json); reasoning came back inside
+  // output (128 of 169, total = input + output, 07_real_reasoning.json). cache_write is
+  // inferred from the same normalization rather than measured — every observed write
+  // reported cache_write_tokens: 0 while the warm read proved the cache existed, and
+  // the arithmetic keeps the write inside input — re-verify the day a nonzero write
+  // appears in a capture.
+  "ramp_router",
+]);
 
 // Every provider name the SDK's own code can stamp on a CanonicalUsage, so that absence
 // from the sets above is always a recorded DECISION and never a default nobody made.
@@ -167,6 +180,10 @@ export const KNOWN_PROVIDERS = new Set([
   "mistral",
   "databricks",
   "snowflake",
+  // Ramp Router, from the wrapper's host hint. Its convention lives in
+  // OPENAI_SHAPED_APIS (the adapter stamps api="ramp_router", and the surface wins):
+  // measured OpenAI-normalized on cache_read and reasoning, see the entry there.
+  "ramp_router",
   // adapters/bedrock_*, from providerFromModel
   "amazon",
   "meta",

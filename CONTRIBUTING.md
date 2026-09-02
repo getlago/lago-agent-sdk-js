@@ -40,6 +40,7 @@ npm run build
 - `src/gateway/` — second front door: gateway usage logs → `CanonicalUsage`, for backfill
 - `tests/unit/` — unit tests, organized to mirror `src/`
 - `tests/unit/adapters/fixtures/` — captured real provider responses, used by adapter tests
+- `tests/unit/adapters/fixtures/capture_*.{ts,py}` — capture scripts; each reads its credential from the environment and scrubs secrets in the same step that writes a fixture into the tree
 
 ## Adding a provider
 
