@@ -14,6 +14,12 @@
  *     per-token table and never resolves a moving alias ("mistral-small-latest") in its
  *     response, so the OpenRouter lookup misses even though OpenRouter lists the
  *     resolved id. Needs the customer's own Mistral key.
+ *   - Ramp Router's own `GET /v1/models`, for "ramp_router" — like Cloudflare's catalog,
+ *     the rate the gateway actually bills at (measured exact against a live account's
+ *     dashboard export across five served vendors), and like Cloudflare's it is
+ *     account-scoped and needs the customer's Router key. The key is learned from the
+ *     wrapped client at `wrap()` time, or set via `LagoConfig.rampRouterApiKey`; without
+ *     either the source is simply empty.
  *
  * `lookup()` is pure in-memory and O(1) — the customer's call is never blocked on
  * pricing. ALL HTTP happens in `maybeRefresh()`, on the queue's background loop. A cold
@@ -32,6 +38,7 @@ export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/Ama
 export const cloudflareModelsUrl = (accountId: string): string =>
   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
 export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
+export const RAMP_ROUTER_MODELS_URL = "https://api.router.com/v1/models";
 
 // A failed pricing fetch must not be retried on every tick. `maybeRefresh()` runs once
 // per queue flush (1s by default) and each attempt can burn the full 10s HTTP timeout,
@@ -81,11 +88,12 @@ export type PricedField = (typeof PRICED_FIELDS)[number];
 // real vendor prefix would let a near-miss model string match Anthropic's or OpenAI's own
 // OpenRouter rate — a silent mispricing of a call Snowflake charged in credits. The
 // absence is the guard; do not "fix" it.
-export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set([
-  "databricks",
-  "snowflake",
-  "ramp_router",
-]);
+//
+// "ramp_router" was here until its catalog became a price source (see the Ramp Router
+// section below). Its miss is no longer structural: a Router call that cannot be priced
+// now reports through onError like any other provider's, because the customer CAN act
+// on it — a missing Router key, a cold table, or a non-default service tier.
+export const TOKEN_BILLED_PROVIDERS: ReadonlySet<string> = new Set(["databricks", "snowflake"]);
 
 const OPENROUTER_FIELD_MAP: Record<PricedField, string> = {
   input: "prompt",
@@ -270,16 +278,34 @@ function stripVersionOpenrouter(model: string): string {
 // Price tables
 // ----------------------------------------------------------------------
 export interface ModelPrice {
-  source: string; // "openrouter" | "aws_bedrock"
+  source: string; // "openrouter" | "aws_bedrock" | "cloudflare_workers_ai" | "ramp_router"
   input: bigint | null;
   output: bigint | null;
   cache_read: bigint | null;
   cache_write: bigint | null;
   reasoning: bigint | null;
+  // Anthropic prices a cache write by its TTL: 1.25x input for the 5-minute cache, 2x for
+  // the 1-hour one. Only a source that publishes both can fill these (Ramp Router's
+  // catalog does; OpenRouter publishes one `input_cache_write`, the 5m rate, so native
+  // Anthropic bills every write at it). When they are set AND the usage carries the
+  // matching `cache_write_5m`/`cache_write_1h` split, `computeCost` bills each part at its
+  // own rate instead of the lump `cache_write` rate — see `splitCacheWrite`. Optional so
+  // a hand-built five-field price stays a valid ModelPrice.
+  cache_write_5m?: bigint | null;
+  cache_write_1h?: bigint | null;
 }
 
 function emptyPrice(source: string): ModelPrice {
-  return { source, input: null, output: null, cache_read: null, cache_write: null, reasoning: null };
+  return {
+    source,
+    input: null,
+    output: null,
+    cache_read: null,
+    cache_write: null,
+    reasoning: null,
+    cache_write_5m: null,
+    cache_write_1h: null,
+  };
 }
 
 export interface CostBreakdown {
@@ -295,6 +321,8 @@ export interface CostBreakdown {
 export type CanonicalUsageLike = { [K in PricedField]: number } & {
   provider?: string;
   api?: string;
+  cache_write_5m?: number;
+  cache_write_1h?: number;
 };
 
 /**
@@ -330,13 +358,16 @@ export function computeCost(
   if (incCacheWrite && price.cache_write !== null && price.cache_write !== undefined) {
     counts.input = Math.max(0, counts.input - counts.cache_write);
   }
+  const split = splitCacheWrite(usage, price, counts);
 
   let baseScaled = 0n;
   const fields: CostBreakdown["fields"] = {};
-  for (const f of PRICED_FIELDS) {
-    const count = counts[f];
+  const lines: Array<[string, number, bigint | null | undefined]> = [
+    ...PRICED_FIELDS.map((f): [string, number, bigint | null | undefined] => [f, counts[f], price[f]]),
+    ...split,
+  ];
+  for (const [f, count, unit] of lines) {
     if (!count) continue;
-    const unit = price[f];
     if (unit === null || unit === undefined) continue;
     const costScaled = unit * BigInt(count); // scale 1e12
     baseScaled += costScaled;
@@ -350,6 +381,47 @@ export function computeCost(
  * markup (1e12) / 1e12 -> 1e12, truncated (floor) — matches Python's
  * ROUND_DOWN, so cents == billed-USD × 100 exactly.
  */
+const CACHE_WRITE_TTL_FIELDS = ["cache_write_5m", "cache_write_1h"] as const;
+
+/**
+ * Move the TTL-split part of `cache_write` onto its own rates, when both sides carry the
+ * split.
+ *
+ * `cache_write_5m` / `cache_write_1h` are a breakdown OF `cache_write`, not additions to
+ * it (Anthropic: `cache_creation_input_tokens == ephemeral_5m + ephemeral_1h`, measured on
+ * every capture). So each part priced here is REMOVED from the lump count, and only a
+ * remainder — a surface reporting a lump with no split — still bills at the lump rate.
+ * Engages only when the price publishes a rate for that TTL: on OpenRouter's single-rate
+ * Anthropic listing nothing moves and the lump path is unchanged.
+ *
+ * The 1h rate is 2x input where the 5m rate is 1.25x; billing a 1h write at the 5m rate
+ * under-bills it by 37.5%, which is what this exists to prevent on the one source (Ramp
+ * Router) that publishes both and the one surface (`/v1/messages`) that reports the split.
+ * Reconciled exactly against Router's dashboard on 2026-09-04: 20,113 tokens at the 5m
+ * rate + 16 input + 5 output = $0.02518225.
+ *
+ * Mutates `counts.cache_write`; returns [field, count, unit] triples to price.
+ */
+function splitCacheWrite(
+  usage: CanonicalUsageLike,
+  price: ModelPrice,
+  counts: Record<PricedField, number>,
+): Array<[string, number, bigint | null | undefined]> {
+  const split: Array<[string, number, bigint | null | undefined]> = [];
+  for (const f of CACHE_WRITE_TTL_FIELDS) {
+    const unit = price[f];
+    let n = Number(usage[f]) || 0;
+    if (unit === null || unit === undefined || n <= 0) continue;
+    // Never bill more split tokens than the lump reports: a surface whose split exceeds
+    // its total is misreporting, and the lump is the authoritative count.
+    n = Math.min(n, counts.cache_write);
+    if (n <= 0) continue;
+    counts.cache_write -= n;
+    split.push([f, n, unit]);
+  }
+  return split;
+}
+
 function finalizeBreakdown(
   baseScaled: bigint,
   markupScaled: bigint,
@@ -567,6 +639,210 @@ export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model:
     if (hit !== undefined) return hit;
   }
   return null;
+}
+
+// ----------------------------------------------------------------------
+// Ramp Router parsing + matching
+//
+// Router's own `GET /v1/models` is the price source for the same reason Cloudflare's
+// catalog is Workers AI's: it is the rate the gateway actually bills, not a third
+// party's listing for the same model hosted elsewhere. Measured against a live
+// account's dashboard export: every default-tier row whose counts the response fully
+// reports reconciled at exactly 1.000000x the catalog rate — 28 rows across five
+// served vendors on 2026-09-04, including the cache split (grok, 194 in / 192 cached:
+// 2 x input + 192 x cache_read + out, to the last digit), and an OpenAI cache WRITE
+// billed at `cache_write_input` on 2026-09-07 (gpt-5.6-luna, 4493 in / 4490 written).
+// The five default-tier rows that did NOT reconcile were Anthropic cold cache writes,
+// whose write count this surface never reports — see the adapter.
+//
+// Where Router bills OFF its own catalog (measured 2026-09-07: eight OpenAI models at a
+// constant 1.1x or 0.55x of their published rate), the SDK still bills the PUBLISHED rate
+// and documents the mismatch with its date, recommending `markup` on those models. A
+// factor baked into the SDK would be the thing out of sync the day Router corrects its
+// catalog — a customer's markup can be dropped the same day, an SDK release cannot.
+// Where Router serves an entry through a backend other than the one the rate belongs to,
+// the served name is refused rather than mispriced — see `isForeignBackendAlias`.
+// ----------------------------------------------------------------------
+
+// Ramp Router's `router.pricing` key -> canonical field. Every one of the live catalog's
+// entries carries all six keys as STRINGS in USD per 1M tokens (measured 2026-09-07, 68
+// of 68). `cache_write_input_5m` / `_1h` are Anthropic's TTL-split write rates; the count
+// they price is reported only on Router's `/v1/messages` surface (the Anthropic wrapper),
+// never on `/v1/responses` — see adapters/anthropic_native.ts.
+type RampRouterPriceField = PricedField | "cache_write_5m" | "cache_write_1h";
+const RAMP_ROUTER_FIELD_MAP: ReadonlyArray<[RampRouterPriceField, string]> = [
+  ["input", "input"],
+  ["output", "output"],
+  ["cache_read", "cache_read_input"],
+  ["cache_write", "cache_write_input"],
+  ["cache_write_5m", "cache_write_input_5m"],
+  ["cache_write_1h", "cache_write_input_1h"],
+];
+
+// Served service tiers that bill at the catalog's published rate. Any OTHER reported
+// tier — `flex` (measured 0.5x), `priority` (measured 2.0x on two vendors), or a tier
+// Router adds later — is a price MISS: token events plus an onError report, never a
+// multiplied rate. The tier multipliers are Router's policy, published nowhere
+// machine-readable. `standard` is the dashboard's spelling of the tier the API reports
+// as `default`; accepted so a vocabulary change on the wire stays a base-rate call.
+//
+// A response with NO tier at all is priced at the base rate (decided 2026-09-07 on
+// data): in a 237-call sweep Router omitted `service_tier` on exactly the responses
+// that stopped with zero output (`incomplete`, both surfaces, six calls) and billed
+// every one of them at the standard rate; flex and priority were reported explicitly
+// whenever they applied. So absence has only ever meant standard, and treating it as a
+// miss turned $0.50 of real usage into token events for no gain.
+export const RAMP_ROUTER_BASE_RATE_TIERS: ReadonlySet<string> = new Set(["default", "standard"]);
+
+/**
+ * True when an alias names the SAME model on a DIFFERENT backend than the entry's own.
+ *
+ * Router serves some catalog entries through more than one hosting provider and bills
+ * the rate of whichever served — but publishes ONE rate per entry, the entry's own
+ * provider's. Measured 2026-09-07: ten Fireworks-owned entries carry a Baseten alias
+ * (`deepseek-ai/DeepSeek-V4-Flash-0731`, `zai-org/GLM-5.2`, `moonshotai/Kimi-K2.7-Code`,
+ * …); when Baseten served, Router billed Baseten's rate, 1.11x to 2.4x away from the
+ * catalog's. The served model name is that alias, so it is the one signal that the
+ * published rate does not apply — and a name the SDK refuses to index is an honest miss
+ * (token events + onError) instead of a wrong price. Decided by the user, 2026-09-07,
+ * knowing it also turns the Baseten-served rows that happened to match (kimi-k3,
+ * glm-5p3-flash, deepseek-v4-pro) into misses.
+ *
+ * "Different backend" is read off the path prefix: `provider_model` says where the
+ * entry's rate comes from (`accounts/fireworks/models/…`), and an alias whose leading
+ * path segment differs (`deepseek-ai/…`) is another host's spelling. A bare alias with
+ * no path is a plain synonym and stays indexed.
+ */
+function isForeignBackendAlias(alias: string, providerModel: unknown): boolean {
+  if (!alias.includes("/") || typeof providerModel !== "string" || !providerModel.includes("/")) return false;
+  return alias.split("/", 1)[0] !== providerModel.split("/", 1)[0];
+}
+
+function samePrice(a: ModelPrice, b: ModelPrice): boolean {
+  return PRICED_FIELDS.every((f) => a[f] === b[f]);
+}
+
+/**
+ * Parse Router's `/v1/models` into {name: ModelPrice}, keyed on every name a served
+ * response can report for the entry.
+ *
+ * Router answers with a RESOLVED vendor snapshot, not the catalog id: `gpt-5.4-nano` in
+ * the catalog, `gpt-5.4-nano-2026-03-17` in the response — `lookupRampRouter` strips
+ * that. But Fireworks- and Baseten-served responses report the vendor's own path
+ * (`accounts/fireworks/models/…`, `thinkingmachines/inkling-small`), which is the entry's
+ * `router.provider_model` or one of its `router.aliases`, never its `id`. So every one of
+ * `id`, `router.request_name`, `router.provider_model` and `router.aliases[]` is indexed
+ * (measured: all 9 distinct served names across every capture resolve, 5 by
+ * version-strip and 4 by exact name).
+ *
+ * Two rules keep that widening honest:
+ *
+ *   - A name claimed by two entries with DIFFERENT rates is unpriced — removed and pinned
+ *     so no later entry can re-add it. Guessing between two rates is a mispricing, not a
+ *     miss. The live catalog has exactly one shared name today
+ *     (`…/nemotron-3-ultra-nvfp4`, the provider_model of two entries) and both carry
+ *     identical rates, so it prices; the rule is for the day they diverge.
+ *   - A ZERO cache rate means "no separate rate", not "free": `cache_write_input` is "0"
+ *     on every Anthropic entry because their write price lives in the `_5m`/`_1h` keys,
+ *     and `cache_read_input` is "0" on the pro and legacy OpenAI models that do not cache
+ *     at all. Stored as null so `computeCost` leaves those tokens inside `input` at the
+ *     input rate — the floor — rather than billing a cached block at $0. Zero
+ *     `input`/`output` is kept as a genuine published zero.
+ *
+ * One more rule, measured against the dashboard on 2026-09-07: an alias that names the
+ * entry on a DIFFERENT backend is NOT indexed — see `isForeignBackendAlias`. A call served
+ * there misses rather than misprices. The published rate is otherwise stored as-is, even
+ * for the models measured to bill off it (see the section comment).
+ *
+ * An entry with no token rate at all is simply absent, the same safe miss as everywhere
+ * else.
+ */
+export function parseRampRouter(data: unknown): Map<string, ModelPrice> {
+  const table = new Map<string, ModelPrice>();
+  const conflicts = new Set<string>();
+  const models = isObj(data) ? data.data : null;
+  if (!Array.isArray(models)) return table;
+  for (const m of models) {
+    if (!isObj(m)) continue;
+    const mid = m.id;
+    const router = m.router;
+    if (typeof mid !== "string" || !mid || !isObj(router) || !isObj(router.pricing)) continue;
+    const pricing = router.pricing;
+    const fields: Partial<Record<RampRouterPriceField, bigint>> = {};
+    for (const [field, key] of RAMP_ROUTER_FIELD_MAP) {
+      const perMillion = parseScaled(pricing[key]);
+      if (perMillion === null) continue;
+      if (perMillion === 0n && field.startsWith("cache_")) continue;
+      fields[field] = perMillion / 1_000_000n; // per-million -> per-token, truncated
+    }
+    if (Object.keys(fields).length === 0) continue;
+    const mp = emptyPrice("ramp_router");
+    for (const [f] of RAMP_ROUTER_FIELD_MAP) if (fields[f] !== undefined) mp[f] = fields[f]!;
+    const names = new Set<string>([mid]);
+    for (const key of ["request_name", "provider_model"]) {
+      const v = router[key];
+      if (typeof v === "string" && v) names.add(v);
+    }
+    if (Array.isArray(router.aliases)) {
+      for (const a of router.aliases) {
+        if (typeof a === "string" && a && !isForeignBackendAlias(a, router.provider_model)) names.add(a);
+      }
+    }
+    for (const name of names) {
+      if (conflicts.has(name)) continue;
+      const prior = table.get(name);
+      if (prior === undefined) table.set(name, mp);
+      else if (!samePrice(prior, mp)) {
+        table.delete(name);
+        conflicts.add(name);
+      }
+    }
+  }
+  if (conflicts.size > 0) {
+    // Once per fetch, not per call: a customer can act on it (the name is unpriced until
+    // Router's catalog stops disagreeing with itself), so it must be visible.
+    console.warn(
+      `[lago] ramp router catalog lists ${conflicts.size} name(s) under more than one rate; ` +
+        `left unpriced: ${[...conflicts].sort().join(", ")}`,
+    );
+  }
+  return table;
+}
+
+/**
+ * Exact served name first, then the version-stripped form.
+ *
+ * The strip is the same `stripVersion` the OpenRouter path uses, because Router reports
+ * the vendor's own dated snapshot for OpenAI- and Anthropic-served calls
+ * (`o3-2025-04-16`, `claude-haiku-4-5-20251001`) while its catalog lists the bare id.
+ * Verified collision-free against the live catalog: no stripped served name lands on a
+ * different entry than the exact one would.
+ */
+export function lookupRampRouter(table: Map<string, ModelPrice>, model: string): ModelPrice | null {
+  return table.get(model) ?? table.get(stripVersion(model)) ?? null;
+}
+
+/**
+ * The served tier that keeps a Router call OUT of price mode, or null.
+ *
+ * null means "bill the catalog rate": either this is not a Router call at all, or Router
+ * served it at a base-rate tier (see RAMP_ROUTER_BASE_RATE_TIERS). Otherwise the
+ * offending tier is returned so the miss report can say WHY — a customer seeing "no
+ * price" for a model that priced a second ago needs to know it was the tier. The tier is
+ * read from `extras.service_tier`, where the adapter records the response's own field
+ * (top level on `/v1/responses`, inside `usage` on `/v1/messages`). A Router call with NO
+ * tier bills at the base rate — see RAMP_ROUTER_BASE_RATE_TIERS for the measurement
+ * behind that. Only an explicitly reported non-base tier is a miss.
+ */
+export function rampRouterUnpricedTier(usage: {
+  provider?: string;
+  extras?: Record<string, unknown>;
+}): string | null {
+  if ((usage.provider || "").toLowerCase() !== "ramp_router") return null;
+  const tier = usage.extras?.service_tier;
+  if (tier === null || tier === undefined || tier === "") return null;
+  if (typeof tier === "string" && RAMP_ROUTER_BASE_RATE_TIERS.has(tier.toLowerCase())) return null;
+  return typeof tier === "string" ? tier : String(tier);
 }
 
 // ----------------------------------------------------------------------
@@ -789,6 +1065,7 @@ export interface PricingFetcher {
   fetchBedrock(region: string): Promise<Map<string, ModelPrice>>;
   fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>>;
   fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>>;
+  fetchRampRouter(apiKey?: string | null): Promise<Map<string, ModelPrice>>;
 }
 
 /**
@@ -804,6 +1081,12 @@ export interface PricingFetcher {
  * `fetchMistralAliases` returns an empty map, so alias resolution is simply
  * skipped and lookups fall back to whatever the request already spelled
  * out (safe miss, not a break).
+ *
+ * `rampRouterApiKey`: Router's catalog is account-scoped too. Without it (and without
+ * one learned from a wrapped client), `fetchRampRouter` returns an empty table, so
+ * Router pricing is unavailable and every Router call in price mode reports a miss and
+ * bills token events — loudly, because unlike the two above this is a source the
+ * customer almost always has the key for.
  */
 export class HttpPricingFetcher implements PricingFetcher {
   constructor(
@@ -811,6 +1094,7 @@ export class HttpPricingFetcher implements PricingFetcher {
     private cloudflareAccountId?: string,
     private cloudflareApiToken?: string,
     private mistralApiKey?: string,
+    private rampRouterApiKey?: string,
   ) {}
 
   private async getJson(url: string, headers?: Record<string, string>): Promise<unknown> {
@@ -882,6 +1166,18 @@ export class HttpPricingFetcher implements PricingFetcher {
     const headers = { Authorization: `Bearer ${key}` };
     return parseMistralAliases(await this.getJson(MISTRAL_MODELS_URL, headers));
   }
+
+  async fetchRampRouter(apiKey?: string | null): Promise<Map<string, ModelPrice>> {
+    // Same precedence as Mistral: an explicitly configured key always wins over one
+    // learned from a wrapped client.
+    const key = this.rampRouterApiKey || apiKey;
+    if (!key) return new Map();
+    // `api.router.com` sits behind Cloudflare bot management, which rejects urllib's
+    // default User-Agent outright (403). Node's `fetch` passes as-is (measured
+    // 2026-09-07), so nothing is overridden here.
+    const headers = { Authorization: `Bearer ${key}` };
+    return parseRampRouter(await this.getJson(RAMP_ROUTER_MODELS_URL, headers));
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -911,6 +1207,12 @@ export class PricingProvider {
   // making real calls, so alias resolution can reuse it without ever
   // requiring a separate LagoConfig.mistralApiKey.
   private mistralApiKeyOverride: string | null = null;
+  private rampRouter: Map<string, ModelPrice> | null = null;
+  private rampRouterFetched = 0;
+  private rampRouterStale = false;
+  // Learned from a wrapped OpenAI client pointed at Router, same mechanism and same
+  // precedence as the Mistral key above.
+  private rampRouterApiKeyOverride: string | null = null;
   private refreshing = new Set<string>();
   // Post-failure backoff, per source: current delay, and the earliest next attempt.
   // Absent from both maps == healthy.
@@ -926,11 +1228,18 @@ export class PricingProvider {
       cloudflareAccountId?: string;
       cloudflareApiToken?: string;
       mistralApiKey?: string;
+      rampRouterApiKey?: string;
     } = {},
   ) {
     this.fetcher =
       opts.fetcher ??
-      new HttpPricingFetcher(10_000, opts.cloudflareAccountId, opts.cloudflareApiToken, opts.mistralApiKey);
+      new HttpPricingFetcher(
+        10_000,
+        opts.cloudflareAccountId,
+        opts.cloudflareApiToken,
+        opts.mistralApiKey,
+        opts.rampRouterApiKey,
+      );
     this.ttlMs = opts.ttlMs ?? 3_600_000;
     this.defaultRegion = opts.defaultRegion ?? "us-east-1";
     this.onError = opts.onError;
@@ -949,7 +1258,7 @@ export class PricingProvider {
    * every call after that hits the cache with zero further network calls
    * until the TTL expires.
    *
-   * Pass `providers: ["mistral"]` and/or `["workers-ai"]` when you already
+   * Pass `providers: ["mistral"]`, `["workers-ai"]` and/or `["ramp_router"]` when you already
    * know, in advance, which of these two you're about to call this
    * session — this eagerly warms exactly that source too, so even ITS
    * first call prices correctly instead of paying the one-time lazy
@@ -971,6 +1280,8 @@ export class PricingProvider {
         if (this.isCold(this.cloudflareWorkersAi, this.cloudflareFetched)) this.cloudflareStale = true;
       } else if (key === "mistral") {
         if (this.isCold(this.mistralAliases, this.mistralFetched)) this.mistralStale = true;
+      } else if (key === "ramp_router") {
+        if (this.isCold(this.rampRouter, this.rampRouterFetched)) this.rampRouterStale = true;
       }
     }
   }
@@ -994,6 +1305,17 @@ export class PricingProvider {
     if (!this.mistralApiKeyOverride) this.mistralApiKeyOverride = apiKey;
   }
 
+  /**
+   * Adopt the Router key a wrapped OpenAI client already carries, so the catalog can be
+   * fetched without a separate `LagoConfig.rampRouterApiKey`. Pure in-memory, no I/O.
+   * Same precedence as the Mistral key: an explicit config value wins, and the first
+   * learned key is kept.
+   */
+  learnRampRouterApiKey(apiKey: string): void {
+    if (!apiKey) return;
+    if (!this.rampRouterApiKeyOverride) this.rampRouterApiKeyOverride = apiKey;
+  }
+
   /** Non-blocking, pure in-memory lookup (runs on the customer's call). */
   lookup(provider: string, model: string, api: string): ModelPrice | null {
     try {
@@ -1003,6 +1325,12 @@ export class PricingProvider {
         const fresh = table !== undefined && Date.now() - (this.bedrockFetched.get(region) ?? 0) < this.ttlMs;
         if (!fresh) this.bedrockStale.add(region);
         return table !== undefined ? lookupBedrock(table, model) : null;
+      }
+      if ((provider || "").toLowerCase() === "ramp_router") {
+        const table = this.rampRouter;
+        const fresh = table !== null && Date.now() - this.rampRouterFetched < this.ttlMs;
+        if (!fresh) this.rampRouterStale = true;
+        return table !== null ? lookupRampRouter(table, model) : null;
       }
       if ((provider || "").toLowerCase() === "workers-ai") {
         const table = this.cloudflareWorkersAi;
@@ -1043,7 +1371,8 @@ export class PricingProvider {
       !this.openrouterStale &&
       this.bedrockStale.size === 0 &&
       !this.cloudflareStale &&
-      !this.mistralStale
+      !this.mistralStale &&
+      !this.rampRouterStale
     ) {
       return;
     }
@@ -1079,6 +1408,17 @@ export class PricingProvider {
           this.mistralAliases = aliases;
           this.mistralFetched = Date.now();
           this.mistralStale = false;
+        }),
+      );
+    }
+
+    if (this.rampRouterStale) {
+      jobs.push(
+        this.refreshSource("ramp_router", "pricing.fetchRampRouter", async () => {
+          const table = await this.fetcher.fetchRampRouter(this.rampRouterApiKeyOverride);
+          this.rampRouter = table;
+          this.rampRouterFetched = Date.now();
+          this.rampRouterStale = false;
         }),
       );
     }

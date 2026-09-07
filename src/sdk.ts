@@ -17,7 +17,9 @@ import {
   computePrecomputedCost,
   deoverlappedTokenTotal,
   moneyStrToCents,
+  rampRouterUnpricedTier,
 } from "./pricing.js";
+import { RAMP_ROUTER_PROVIDER } from "./adapters/openai_native.js";
 import { SNOWFLAKE_EVENT_ID_PREFIX } from "./gateway/adapters/snowflake_cortex.js";
 import { EventQueue } from "./queue.js";
 import { wrapAnthropicClient } from "./wrappers/anthropic.js";
@@ -25,6 +27,7 @@ import { wrapBedrockClient } from "./wrappers/bedrock.js";
 import { wrapGeminiClient } from "./wrappers/gemini.js";
 import { wrapMistralClient } from "./wrappers/mistral.js";
 import { wrapOpenAIClient } from "./wrappers/openai.js";
+import { clientPointsAtRampRouter } from "./wrappers/ramp_router.js";
 
 const subscriptionStore = new AsyncLocalStorage<string>();
 
@@ -216,6 +219,7 @@ export class LagoSDK {
         cloudflareAccountId: this.config.cloudflareAccountId,
         cloudflareApiToken: this.config.cloudflareApiToken,
         mistralApiKey: this.config.mistralApiKey,
+        rampRouterApiKey: this.config.rampRouterApiKey,
       });
     if (this.config.pricingMode === "price") this.pricing.prime(); // eager warm when price mode is the global default
     this.queue = new EventQueue(
@@ -280,10 +284,47 @@ export class LagoSDK {
         /* ignore */
       }
       if (baseUrl.includes("gateway.ai.cloudflare.com")) provider = "workers-ai";
+      else provider = this.learnRampRouterKeyIfPointedThere(client);
+    } else if (kind === "anthropic") {
+      // Router's second surface, `/v1/messages`, is reached with an Anthropic client.
+      // Same catalog, same key, same warm-up.
+      provider = this.learnRampRouterKeyIfPointedThere(client);
     }
     if (provider) {
       this.pricing.prime([provider]);
       this.queue.wake();
+    }
+  }
+
+  /**
+   * Ramp Router's catalog needs the customer's Router key, and the client being wrapped
+   * already carries it — both `openai` and `@anthropic-ai/sdk` expose the constructor's
+   * key as `.apiKey` (verified on openai 4.104 and anthropic 0.97). Same shape as the
+   * Mistral arm: learn it here, so the very first Router call has a warm table instead of
+   * a cold miss. Detection reuses the wrappers' own host match so the three cannot
+   * disagree about what counts as Router. Returns the provider to prime, or null when the
+   * client is not Router's.
+   */
+  private learnRampRouterKeyIfPointedThere(client: unknown): string | null {
+    if (!clientPointsAtRampRouter(client)) return null;
+    const key = LagoSDK.extractClientApiKey(client);
+    if (key) this.pricing.learnRampRouterApiKey(key);
+    return RAMP_ROUTER_PROVIDER;
+  }
+
+  /**
+   * The constructor's key at `client.apiKey`, as the openai and anthropic SDKs both expose
+   * it (verified against real instances). Defensive for the same reason as the Mistral
+   * reader: a client variant without it degrades to "no key learned" — then
+   * `LagoConfig.rampRouterApiKey`, then a reported miss — rather than throwing out of
+   * wrap().
+   */
+  private static extractClientApiKey(client: unknown): string | null {
+    try {
+      const key = (client as { apiKey?: unknown })?.apiKey;
+      return typeof key === "string" && key ? key : null;
+    } catch {
+      return null;
     }
   }
 
@@ -424,10 +465,24 @@ export class LagoSDK {
         this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
         return;
       } else {
-        const price = this.pricing.lookup(usage.provider, usage.model, usage.api);
+        // A Ramp Router call served at a non-default tier bills at a rate the catalog
+        // does not publish (flex measured 0.5x, priority 2.0x), so it is a miss BEFORE
+        // the table is consulted — and a miss that names the tier, because the same
+        // model priced fine a moment ago and a bare "no price" would send the customer
+        // looking at the wrong thing.
+        const unpricedTier = rampRouterUnpricedTier(usage);
+        const price =
+          unpricedTier === null ? this.pricing.lookup(usage.provider, usage.model, usage.api) : null;
         if (price === null) {
+          const detail =
+            unpricedTier === null
+              ? undefined
+              : `served service_tier '${unpricedTier}' bills at a rate Router does not publish`;
           // Don't silently under-bill: fall back to token events + report.
-          this.reportError(new PricingUnavailableError(usage.provider, usage.model, usage.api), "pricing");
+          this.reportError(
+            new PricingUnavailableError(usage.provider, usage.model, usage.api, detail),
+            "pricing",
+          );
           this.emitTokenEvents(usage, sub, opts.dimensions, opts.eventId, at);
           return;
         }

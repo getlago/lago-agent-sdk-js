@@ -28,4 +28,8 @@ export class OfflinePricingFetcher implements PricingFetcher {
   async fetchMistralAliases(_apiKey?: string | null): Promise<Map<string, string>> {
     return new Map<string, string>();
   }
+
+  async fetchRampRouter(_apiKey?: string | null): Promise<Map<string, ModelPrice>> {
+    return new Map<string, ModelPrice>();
+  }
 }

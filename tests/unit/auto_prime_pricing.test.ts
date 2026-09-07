@@ -43,10 +43,25 @@ class FakeMistralClient {
 }
 Object.defineProperty(FakeMistralClient, "name", { value: "Mistral" });
 
+class FakeAnthropicClient {
+  baseURL: string;
+  apiKey?: string;
+  messages = { create: async () => ({ usage: { input_tokens: 1, output_tokens: 1 } }) };
+  constructor(baseURL: string, apiKey?: string) {
+    this.baseURL = baseURL;
+    if (apiKey !== undefined) this.apiKey = apiKey;
+  }
+}
+Object.defineProperty(FakeAnthropicClient, "name", { value: "Anthropic" });
+
 class FakeOpenAIClient {
   baseURL: string;
-  constructor(baseURL: string) {
+  // `new OpenAI({ apiKey })` exposes the key as `.apiKey` (verified on 4.104); left
+  // undefined here to model a client variant without it.
+  apiKey?: string;
+  constructor(baseURL: string, apiKey?: string) {
     this.baseURL = baseURL;
+    if (apiKey !== undefined) this.apiKey = apiKey;
   }
 }
 Object.defineProperty(FakeOpenAIClient, "name", { value: "OpenAI" });
@@ -168,6 +183,105 @@ describe("wrap()-triggered auto-prime pricing", () => {
     await provider.maybeRefresh();
 
     expect(mistralCalls).toBe(0);
+    await sdk.shutdown(1000);
+  });
+  it("wrap(openai client pointed at Ramp Router) learns the key and primes the catalog", async () => {
+    // Router's catalog is account-scoped, so the key the client already carries is the
+    // one that unlocks it — no LagoConfig.rampRouterApiKey required.
+    const seenKeys: Array<string | null | undefined> = [];
+    class StubFetcher extends OfflinePricingFetcher {
+      async fetchRampRouter(apiKey?: string | null) {
+        seenKeys.push(apiKey);
+        return new Map<string, ModelPrice>();
+      }
+    }
+    const fetcher = new StubFetcher();
+    const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    const sdk = sdkWithProvider(provider);
+
+    sdk.wrap(new FakeOpenAIClient("https://api.router.com/v1", "sk-router-abc"));
+
+    expect(await waitUntil(() => seenKeys.includes("sk-router-abc"))).toBe(true);
+    expect(seenKeys).toEqual(["sk-router-abc"]);
+    await sdk.shutdown(1000);
+  });
+
+  it("wrap(openai client pointed at Router) without a readable key still primes", async () => {
+    // A client variant with no `.apiKey` degrades to "no key learned": the fetch runs with
+    // null (then LagoConfig.rampRouterApiKey, then an empty table and a reported miss)
+    // rather than throwing out of wrap().
+    const seenKeys: Array<string | null | undefined> = [];
+    class StubFetcher extends OfflinePricingFetcher {
+      async fetchRampRouter(apiKey?: string | null) {
+        seenKeys.push(apiKey);
+        return new Map<string, ModelPrice>();
+      }
+    }
+    const fetcher = new StubFetcher();
+    const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    const sdk = sdkWithProvider(provider);
+
+    sdk.wrap(new FakeOpenAIClient("https://api.router.com/v1"));
+
+    expect(await waitUntil(() => seenKeys.length === 1)).toBe(true);
+    expect(seenKeys).toEqual([null]);
+    await sdk.shutdown(1000);
+  });
+
+  it("wrap(openai client pointed at real OpenAI) does NOT prime Router", async () => {
+    let routerCalls = 0;
+    class StubFetcher extends OfflinePricingFetcher {
+      async fetchRampRouter() {
+        routerCalls++;
+        return new Map<string, ModelPrice>();
+      }
+    }
+    const fetcher = new StubFetcher();
+    const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    const sdk = sdkWithProvider(provider);
+
+    sdk.wrap(new FakeOpenAIClient("https://api.openai.com/v1", "sk-openai"));
+    await provider.maybeRefresh();
+
+    expect(routerCalls).toBe(0);
+    await sdk.shutdown(1000);
+  });
+  it("wrap(anthropic client pointed at Router) learns the key and primes the catalog", async () => {
+    // Router's second surface. The Anthropic client carries the same Router key, read the
+    // same way — one helper, so the two wrappers cannot learn it differently.
+    const seenKeys: Array<string | null | undefined> = [];
+    class StubFetcher extends OfflinePricingFetcher {
+      async fetchRampRouter(apiKey?: string | null) {
+        seenKeys.push(apiKey);
+        return new Map<string, ModelPrice>();
+      }
+    }
+    const fetcher = new StubFetcher();
+    const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    const sdk = sdkWithProvider(provider);
+
+    sdk.wrap(new FakeAnthropicClient("https://api.router.com", "sk-router-via-anthropic"));
+
+    expect(await waitUntil(() => seenKeys.includes("sk-router-via-anthropic"))).toBe(true);
+    await sdk.shutdown(1000);
+  });
+
+  it("wrap(anthropic client pointed at Anthropic) does NOT prime Router", async () => {
+    let routerCalls = 0;
+    class StubFetcher extends OfflinePricingFetcher {
+      async fetchRampRouter() {
+        routerCalls++;
+        return new Map<string, ModelPrice>();
+      }
+    }
+    const fetcher = new StubFetcher();
+    const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    const sdk = sdkWithProvider(provider);
+
+    sdk.wrap(new FakeAnthropicClient("https://api.anthropic.com", "sk-ant"));
+    await provider.maybeRefresh();
+
+    expect(routerCalls).toBe(0);
     await sdk.shutdown(1000);
   });
 });

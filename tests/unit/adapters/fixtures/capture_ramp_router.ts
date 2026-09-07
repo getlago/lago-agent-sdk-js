@@ -109,18 +109,23 @@ const CONTENT_KEYS = new Set(["text", "input", "instructions", "output_text", "c
  * Content keys are blanked to "" rather than deleted, so the shape a test reads is the
  * shape Router really sent — `countResponsesToolCalls` walks `output[]` by item `type`,
  * and deleting entries would change what the fixture proves.
+ *
+ * `parent` exists because a content key is only content in a content position. The
+ * catalog's `router.pricing.input` is a RATE, and blanking it shipped a fixture whose
+ * every input rate read "" — which was then taken for Router's own data and cited as a
+ * reason price mode could not be built. Nothing under `pricing` is ever content.
  */
-function scrub(value: unknown, key = ""): unknown {
+function scrub(value: unknown, key = "", parent = ""): unknown {
   if (typeof value === "string") {
-    if (CONTENT_KEYS.has(key)) return "";
+    if (CONTENT_KEYS.has(key) && parent !== "pricing") return "";
     return scrubString(value);
   }
-  if (Array.isArray(value)) return value.map((v) => scrub(v, key));
+  if (Array.isArray(value)) return value.map((v) => scrub(v, key, parent));
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (DROP_HEADERS.has(k.toLowerCase())) continue;
-      out[k] = scrub(v, k);
+      out[k] = scrub(v, k, key);
     }
     return out;
   }
@@ -177,13 +182,19 @@ interface Captured {
  * envelope. A capture script that assumed JSON would crash on exactly the case worth
  * recording.
  */
-async function call(method: "GET" | "POST", path: string, body?: unknown): Promise<Captured> {
+async function call(
+  method: "GET" | "POST",
+  path: string,
+  body?: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<Captured> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${API_KEY}`,
       "Content-Type": "application/json",
       "User-Agent": "lago-agent-sdk-capture/0.2.0",
+      ...extraHeaders,
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
@@ -199,14 +210,23 @@ async function call(method: "GET" | "POST", path: string, body?: unknown): Promi
   return { _status: res.status, _headers: headersOf(res), _body: parsed, _body_was_json: wasJson };
 }
 
-/** A streamed request, captured as the ordered list of SSE events. */
-async function callStream(body: unknown): Promise<Captured & { _events: unknown[] }> {
-  const res = await fetch(`${BASE_URL}/responses`, {
+/**
+ * A streamed request, captured as the ordered list of SSE events. Anthropic's SSE prefixes
+ * each `data:` line with an `event:` line; only the data lines are kept, which is also all
+ * the wrapper reads.
+ */
+async function callStream(
+  body: unknown,
+  path = "/responses",
+  extraHeaders: Record<string, string> = {},
+): Promise<Captured & { _events: unknown[] }> {
+  const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${API_KEY}`,
       "Content-Type": "application/json",
       "User-Agent": "lago-agent-sdk-capture/0.2.0",
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
   });
@@ -257,6 +277,84 @@ function candidateId(models: ModelEntry[], modelId: string | null): string | nul
   return typeof catalogId === "string" && catalogId ? catalogId : null;
 }
 
+// ---------------------------------------------------------------------------
+// P11-P15: Router's SECOND surface, `POST /v1/messages` (Anthropic-shaped), reached with an
+// Anthropic client. Captured because it is the only surface that reports an
+// Anthropic-served cache WRITE — `/v1/responses` has no field for it — and because nothing
+// in these bodies says Router was in the path, so these fixtures are what the Anthropic
+// wrapper's provider hint is tested against. Run alone with `--messages-only`.
+// ---------------------------------------------------------------------------
+// Required on this surface (a request without it is rejected, measured 2026-09-04).
+const MESSAGES_HEADERS = { "anthropic-version": "2023-06-01" };
+
+/** ~2.6k tokens of synthetic ledger lines: above Haiku's 2,048-token minimum cacheable
+ * prefix, and cheap to write (a few tenths of a cent). */
+function cachePrefix(nLines = 220): string {
+  return Array.from(
+    { length: nLines },
+    (_, i) =>
+      `Ledger entry ${i}: account ACC-${String((i * 7) % 9973).padStart(5, "0")}, debit ${(i * 11) % 503}.${String(
+        (i * 13) % 100,
+      ).padStart(2, "0")} EUR, memo 'batch ${Math.floor(i / 12)} settlement', region ${String.fromCharCode(
+        65 + ((i * 5) % 26),
+      )}.`,
+  ).join(" ");
+}
+
+async function probeMessages(cheap: string | null, anthropic: string | null): Promise<void> {
+  const messagesCall = (body: unknown) => call("POST", "/messages", body, MESSAGES_HEADERS);
+  const user = [{ role: "user", content: PROMPT }];
+  if (anthropic) {
+    console.log("[P11] /v1/messages, plain call, Anthropic-served");
+    save(
+      "11_real_messages_plain.json",
+      "P11",
+      "does the Anthropic-shaped surface report usage in Anthropic's native shape, service_tier inside usage?",
+      await messagesCall({ model: anthropic, max_tokens: MAX_OUTPUT_TOKENS, messages: user }),
+    );
+    const cached = {
+      model: anthropic,
+      max_tokens: MAX_OUTPUT_TOKENS,
+      system: [{ type: "text", text: cachePrefix(), cache_control: { type: "ephemeral" } }],
+      messages: user,
+    };
+    console.log("[P12] /v1/messages, cache_control cold — is the WRITE count reported here?");
+    save(
+      "12_real_messages_cache_control_cold.json",
+      "P12",
+      "does a cold cache_control write report cache_creation_input_tokens, with the 5m/1h split?",
+      await messagesCall(cached),
+    );
+    console.log("[P13] /v1/messages, cache_control warm");
+    save(
+      "13_real_messages_cache_control_warm.json",
+      "P13",
+      "warm repeat of P12 — cache_read_input_tokens beside input_tokens (additive)?",
+      await messagesCall(cached),
+    );
+    console.log("[P14] /v1/messages, streamed");
+    save(
+      "14_real_messages_streamed.json",
+      "P14",
+      "where do usage and service_tier land across message_start / message_delta?",
+      await callStream(
+        { model: anthropic, max_tokens: MAX_OUTPUT_TOKENS, stream: true, messages: user },
+        "/messages",
+        MESSAGES_HEADERS,
+      ),
+    );
+  }
+  if (cheap) {
+    console.log("[P15] /v1/messages, OpenAI-served model");
+    save(
+      "15_real_messages_openai_served.json",
+      "P15",
+      "does a non-Anthropic vendor's usage arrive in Anthropic's additive shape on this surface?",
+      await messagesCall({ model: cheap, max_tokens: MAX_OUTPUT_TOKENS, messages: user }),
+    );
+  }
+}
+
 async function main(): Promise<void> {
   // ---- P1: the catalog. Does it publish prices? -------------------------------------
   console.log("[P1] GET /v1/models");
@@ -296,6 +394,11 @@ async function main(): Promise<void> {
   const anthropic = process.env.RAMP_ROUTER_ANTHROPIC_MODEL ?? pickModel(catalog, ["anthropic"], ["haiku", "sonnet"]);
   const reasoning = process.env.RAMP_ROUTER_REASONING_MODEL ?? pickModel(catalog, ["openai"], ["o4-mini", "o3-mini", "o3", "gpt-5"]);
   console.log(`  using: cheap=${cheap} anthropic=${anthropic} reasoning=${reasoning}`);
+
+  if (process.argv.includes("--messages-only")) {
+    await probeMessages(cheap, anthropic);
+    return;
+  }
 
   // ---- P2: requested alias, or served candidate? ------------------------------------
   if (cheap) {

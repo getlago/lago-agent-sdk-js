@@ -22,6 +22,7 @@
  * removed: the provider's validator rejects it, and the caller may reuse the object.
  */
 import { RAMP_ROUTER_PROVIDER, extractOpenAINative } from "../adapters/openai_native.js";
+import { isRampRouterBaseUrl } from "./ramp_router.js";
 import type { CanonicalUsage } from "../canonical.js";
 // The one import a wrapper takes from gateway code, and it is load-bearing: the REST-view
 // dedup only works if this wrapper and `gateway/snowflake.ts` compute the IDENTICAL
@@ -227,26 +228,19 @@ export const PROVIDER_BY_BASE_URL_PATH: ReadonlyArray<readonly [string, string]>
  */
 // Ramp Router cannot be a row in the path table above: it serves every provider it
 // fronts through one dedicated host with no distinguishing path, so the HOST is the
-// signal — and it must be the PARSED host, never a substring test. A substring row
-// ("api.router.com") also matches `https://evil.example.com/api.router.com/v1`, which
-// would stamp an unrelated endpoint's traffic as Router-served. The `.router.com`
-// suffix arm covers a regional or staging host without widening to arbitrary domains —
-// `evilrouter.com` does not end in `.router.com`. The path table keeps first say: its
-// rows are more specific, and no Snowflake or Databricks URL lives under router.com.
-const RAMP_ROUTER_HOST = "api.router.com";
-const RAMP_ROUTER_DOMAIN = ".router.com";
-
+// signal. The match itself lives in `wrappers/ramp_router.ts`, because the Anthropic
+// wrapper needs the identical answer for Router's `/v1/messages` surface. The path table
+// keeps first say: its rows are more specific, and no Snowflake or Databricks URL lives
+// under router.com.
 export function providerHintFor(client: unknown): string {
   try {
     const url = String((client as { baseURL?: unknown })?.baseURL ?? "");
     for (const [path, provider] of PROVIDER_BY_BASE_URL_PATH) {
       if (url.includes(path)) return provider;
     }
-    const host = new URL(url).host.toLowerCase();
-    if (host === RAMP_ROUTER_HOST || host.endsWith(RAMP_ROUTER_DOMAIN)) return RAMP_ROUTER_PROVIDER;
-    return "";
+    return isRampRouterBaseUrl(url) ? RAMP_ROUTER_PROVIDER : "";
   } catch {
-    // A relative or malformed baseURL is not a gateway. Never throw out of wrap().
+    // A client whose baseURL getter throws is not a gateway. Never throw out of wrap().
     return "";
   }
 }
@@ -452,17 +446,24 @@ export function wrapOpenAIClient<T extends OpenAILike>(
  * The chunk's own `model` is carried through with the usage: it is the RESOLVED
  * snapshot, and the requested alias usually is not in OpenRouter's table, so dropping
  * it makes price mode miss and degrade to token events.
+ *
+ * `service_tier` rides along for the same reason. The adapter reads it off the response's
+ * top level to record which tier SERVED the call, and on Ramp Router that decides whether
+ * the call prices at all — a non-default tier is a reported miss. The terminal
+ * `response.completed` event carries it (fixture 04_real_streamed.json: `flex`), but a
+ * usage-and-model-only payload dropped it, so every streamed Router call reached price
+ * mode tier-less and missed.
  */
 function extractStreamUsage(payload: unknown): Record<string, unknown> | null {
   if (!isObject(payload)) return null;
   if (isObject(payload.usage)) {
-    return { usage: payload.usage, model: payload.model };
+    return { usage: payload.usage, model: payload.model, service_tier: payload.service_tier };
   }
   // Responses API stream events nest usage under `.response.usage` — and the
   // resolved model under `.response.model`, not at the event's top level.
   const response = payload.response;
   if (isObject(response) && isObject(response.usage)) {
-    return { usage: response.usage, model: response.model };
+    return { usage: response.usage, model: response.model, service_tier: response.service_tier };
   }
   return null;
 }

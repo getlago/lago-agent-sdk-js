@@ -40,11 +40,17 @@ export class PricingUnavailableError extends LagoSDKError {
   provider: string;
   model: string;
   api: string;
-  constructor(provider: string, model: string, api: string) {
-    super(`no price for provider=${provider} model=${model} api=${api}`);
+  detail?: string;
+  constructor(provider: string, model: string, api: string, detail?: string) {
+    // `detail` is for the miss that is NOT "table cold / model unknown" — a Ramp Router
+    // call served at a non-default tier is unpriced by decision, and the customer needs
+    // to read that off the error rather than chase a model name.
+    const message = `no price for provider=${provider} model=${model} api=${api}`;
+    super(detail ? `${message}: ${detail}` : message);
     this.name = "PricingUnavailableError";
     this.provider = provider;
     this.model = model;
     this.api = api;
+    this.detail = detail;
   }
 }
