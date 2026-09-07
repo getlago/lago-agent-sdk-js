@@ -57,6 +57,12 @@ export interface LagoConfig {
    * price Mistral usage without ever calling `wrap()` (e.g. a backfill); an explicit
    * value always wins over an auto-detected one. */
   mistralApiKey?: string;
+  /** Usually NOT needed either: `wrap()`-ing an OpenAI client pointed at Ramp Router learns
+   * the key that client already carries, and Router's catalog (the price source for
+   * "ramp_router") is account-scoped, so no other key would do. Set it only to price
+   * Router usage without ever calling `wrap()`; an explicit value always wins over a
+   * learned one. */
+  rampRouterApiKey?: string;
   /** Optional injected PricingProvider (or stub) — primarily for tests/overrides. Typed unknown to avoid a config→pricing import cycle. */
   pricingProvider?: unknown;
 }

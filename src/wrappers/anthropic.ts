@@ -19,7 +19,9 @@
  * caller touches first; `messages.stream()` bills from `finalMessage()`.
  */
 import { extractAnthropicNative } from "../adapters/anthropic_native.js";
+import { RAMP_ROUTER_PROVIDER } from "../adapters/openai_native.js";
 import type { CanonicalUsage } from "../canonical.js";
+import { clientPointsAtRampRouter } from "./ramp_router.js";
 
 const INSTRUMENTED = Symbol.for("lago_instrumented_anthropic");
 
@@ -115,6 +117,14 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
 
   const originalCreate = messages.create?.bind(messages);
   const originalStream = messages.stream?.bind(messages);
+  // Resolved once, here, and threaded through every emit path below — including the
+  // async-iterable stream, which is a module-level generator rather than a closure and so
+  // takes it as a REQUIRED parameter. An Anthropic client pointed at Ramp Router's
+  // `/v1/messages` answers in Anthropic's exact schema, so the base URL is the only thing
+  // that says Router was in the path. Without it the call billed as native Anthropic:
+  // OpenRouter's rate instead of Router's catalog, no Router key learned, and events
+  // stamped provider=anthropic.
+  const providerHint = clientPointsAtRampRouter(client) ? RAMP_ROUTER_PROVIDER : "";
 
   const resolveOpts = (lagoOpts: LagoOpts): EmitOpts => ({
     // Resolved HERE, at the moment the customer makes the call, rather than left to
@@ -136,7 +146,7 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
 
   const emitFrom = (payload: unknown, modelId: string, opts: EmitOpts) => {
     try {
-      const usage = extractAnthropicNative(payload, modelId);
+      const usage = extractAnthropicNative(payload, modelId, providerHint);
       sdk.emit(usage, opts);
     } catch (err) {
       sdk.reportError(err, "adapter.anthropic");
@@ -200,7 +210,7 @@ export function wrapAnthropicClient<T extends AnthropicLike>(
                       emitOnce(value);
                     }
                   } else if (isAsyncIterable(value)) {
-                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts);
+                    next = wrapAsyncIterableStream(value, sdk, modelId, emitOpts, providerHint);
                   }
                 } catch (err) {
                   sdk.reportError(err, "wrapper.anthropic");
@@ -341,6 +351,9 @@ async function* wrapAsyncIterableStream(
   sdk: SDKLike,
   modelId: string,
   opts: EmitOpts,
+  // Deliberately NOT defaulted: "" is a legitimate value (every non-Router client), so an
+  // omission would be indistinguishable at runtime from a real answer.
+  providerHint: string,
 ): AsyncIterable<unknown> {
   const accumulated: Record<string, unknown> = {};
   let sawUsage = false;
@@ -380,7 +393,11 @@ async function* wrapAsyncIterableStream(
       sdk.reportError(readFailure, "adapter.anthropic");
     } else if (sawUsage) {
       try {
-        const usage = extractAnthropicNative({ usage: accumulated, model: resolvedModel }, modelId);
+        const usage = extractAnthropicNative(
+          { usage: accumulated, model: resolvedModel },
+          modelId,
+          providerHint,
+        );
         sdk.emit(usage, opts);
       } catch (err) {
         sdk.reportError(err, "adapter.anthropic");

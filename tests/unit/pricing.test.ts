@@ -17,6 +17,7 @@ import {
   lookupBedrock,
   lookupCloudflareWorkersAi,
   lookupOpenRouter,
+  lookupRampRouter,
   type ModelPrice,
   type OpenRouterTable,
   parseBedrockOffer,
@@ -24,9 +25,13 @@ import {
   parseCloudflareWorkersAi,
   parseMistralAliases,
   parseOpenRouter,
+  parseRampRouter,
   parseScaled,
   type PricingFetcher,
   PricingProvider,
+  RAMP_ROUTER_MODELS_URL,
+  rampRouterUnpricedTier,
+  TOKEN_BILLED_PROVIDERS,
 } from "../../src/pricing.js";
 
 const GOLDEN = JSON.parse(
@@ -40,11 +45,14 @@ class StubFetcher {
   cloudflareWorkersAiCalls = 0;
   mistralAliasesCalls = 0;
   lastMistralApiKey: string | null | undefined = undefined;
+  rampRouterCalls = 0;
+  lastRampRouterApiKey: string | null | undefined = undefined;
   constructor(
     private openrouter: OpenRouterTable = { exact: new Map(), norm: new Map() },
     private bedrock: Map<string, Map<string, ModelPrice>> = new Map(),
     private cloudflareWorkersAi: Map<string, ModelPrice> = new Map(),
     private mistralAliases: Map<string, string> = new Map(),
+    private rampRouter: Map<string, ModelPrice> = new Map(),
   ) {}
   async fetchOpenRouter(): Promise<OpenRouterTable> {
     this.openrouterCalls++;
@@ -62,6 +70,11 @@ class StubFetcher {
     this.mistralAliasesCalls++;
     this.lastMistralApiKey = apiKey;
     return this.mistralAliases;
+  }
+  async fetchRampRouter(apiKey?: string | null): Promise<Map<string, ModelPrice>> {
+    this.rampRouterCalls++;
+    this.lastRampRouterApiKey = apiKey;
+    return this.rampRouter;
   }
 }
 
@@ -205,6 +218,8 @@ function modelPrice(prices: Record<string, string>): ModelPrice {
     cache_read: prices.cache_read !== undefined ? parseScaled(prices.cache_read) : null,
     cache_write: prices.cache_write !== undefined ? parseScaled(prices.cache_write) : null,
     reasoning: prices.reasoning !== undefined ? parseScaled(prices.reasoning) : null,
+    cache_write_5m: prices.cache_write_5m !== undefined ? parseScaled(prices.cache_write_5m) : null,
+    cache_write_1h: prices.cache_write_1h !== undefined ? parseScaled(prices.cache_write_1h) : null,
   };
 }
 
@@ -1995,5 +2010,497 @@ describe("workers-ai token semantics match openai on both axes", () => {
     const oa = computeCost(usage("openai"), price, parseScaled("1")!);
     expect(cf.total).toBe(oa.total);
     expect(cf.fields.reasoning).toBeUndefined();
+  });
+});
+
+// ----------------------------------------------------------------------
+// Ramp Router — its own catalog is the price source
+//
+// Built through the real parser from the REAL captured catalog. The numbers
+// asserted below are the ones that reconciled against Router's dashboard.
+// ----------------------------------------------------------------------
+const ROUTER_CATALOG = JSON.parse(
+  readFileSync(
+    new URL("./adapters/fixtures/ramp_router/01_real_models_catalog.json", import.meta.url),
+    "utf8",
+  ),
+)._body as { data: Array<Record<string, any>> };
+const ROUTER_TABLE = parseRampRouter(ROUTER_CATALOG);
+const ONE = 1_000_000_000_000n; // markup 1.0 at 1e12 scale
+
+function routerEntry(mid: string, rates: Record<string, string>, router: Record<string, unknown> = {}) {
+  return {
+    id: mid,
+    router: {
+      request_name: mid,
+      provider_model: mid,
+      pricing: {
+        input: "1",
+        output: "2",
+        cache_read_input: "0",
+        cache_write_input: "0",
+        cache_write_input_5m: "0",
+        cache_write_input_1h: "0",
+        ...rates,
+      },
+      ...router,
+    },
+  };
+}
+
+describe("ramp router pricing", () => {
+  it("is no longer token-billed", () => {
+    // A Router miss is actionable now — no key, cold table, non-default tier — so it must
+    // report like any other provider's instead of being swallowed as structural.
+    expect(TOKEN_BILLED_PROVIDERS.has("ramp_router")).toBe(false);
+  });
+
+  it("parses the real catalog per token", () => {
+    // 68 entries, six rate keys each, strings in USD per 1M tokens (measured 2026-09-07).
+    // claude-haiku-4-5 publishes $1/M in, $5/M out, $0.10/M cached.
+    const ids = ROUTER_CATALOG.data.map((m) => m.id as string);
+    expect(new Set(ids).size).toBe(68);
+    for (const id of ids) expect(ROUTER_TABLE.has(id)).toBe(true);
+    const mp = ROUTER_TABLE.get("claude-haiku-4-5")!;
+    expect(mp.source).toBe("ramp_router");
+    expect(mp.input).toBe(parseScaled("0.000001"));
+    expect(mp.output).toBe(parseScaled("0.000005"));
+    expect(mp.cache_read).toBe(parseScaled("0.0000001"));
+    expect(mp.reasoning).toBeNull();
+  });
+
+  it("a zero cache rate means no separate rate, not free", () => {
+    // Anthropic entries publish cache_write_input "0" because their write price lives in
+    // the _5m/_1h keys; the pro and legacy OpenAI entries publish cache_read_input "0"
+    // because they do not cache. Neither is a $0 rate: stored as null so computeCost
+    // leaves those tokens inside `input` at the input rate.
+    expect(ROUTER_TABLE.get("claude-haiku-4-5")!.cache_write).toBeNull();
+    expect(ROUTER_TABLE.get("gpt-5-pro")!.cache_read).toBeNull();
+    // ...while a genuinely published write rate is kept: gpt-5.6-luna, $0.25/M.
+    expect(ROUTER_TABLE.get("gpt-5.6-luna")!.cache_write).toBe(parseScaled("0.00000025"));
+  });
+
+  it("no catalog rate is lossy at twelve places", () => {
+    // Per-million -> per-token is a division by 1e6 truncated at 12 dp. If Router ever
+    // publishes a rate with more than six significant decimals this fails, which is the
+    // moment to widen SCALE in BOTH repos rather than silently floor a price to 0.
+    for (const m of ROUTER_CATALOG.data) {
+      for (const [key, value] of Object.entries(m.router.pricing as Record<string, string>)) {
+        const perMillion = parseScaled(value)!;
+        expect((perMillion / 1_000_000n) * 1_000_000n, `${m.id}.${key}=${value}`).toBe(perMillion);
+      }
+    }
+  });
+
+  it("bills the published rate even where Router measurably does not", () => {
+    // Dashboard-measured 2026-09-07: Router bills gpt-5.6-luna at 1.1x its own catalog and
+    // gpt-5.6-sol at 0.55x. The SDK deliberately stores the PUBLISHED rate anyway — a factor
+    // in the SDK would be the thing out of sync the day Router corrects its catalog — and
+    // the docs hand the customer the measured factor as a `markup` they can drop that day.
+    expect(ROUTER_TABLE.get("gpt-5.6-luna")!.input).toBe(parseScaled("0.0000002"));
+    expect(ROUTER_TABLE.get("gpt-5.6-sol")!.input).toBe(parseScaled("0.000004"));
+    const gpt54 = ROUTER_CATALOG.data.find((m) => m.id === "gpt-5.4")!;
+    expect(ROUTER_TABLE.get("gpt-5.4")!.input).toBe(parseScaled(gpt54.router.pricing.input)! / 1_000_000n);
+  });
+
+  it("foreign-backend aliases are not indexed", () => {
+    // A Fireworks-owned entry served through Baseten bills Baseten's rate, which the catalog
+    // does not publish. The Baseten spelling is the entry's alias under another path prefix,
+    // and it must MISS rather than price at the Fireworks rate (measured 1.11x to 2.4x off,
+    // 2026-09-07). The entry's own id and Fireworks path still price.
+    expect(ROUTER_TABLE.has("deepseek-ai/DeepSeek-V4-Flash-0731")).toBe(false);
+    expect(ROUTER_TABLE.has("zai-org/GLM-5.2")).toBe(false);
+    expect(ROUTER_TABLE.has("moonshotai/Kimi-K2.7-Code")).toBe(false);
+    expect(ROUTER_TABLE.has("deepseek-v4-flash-0731")).toBe(true);
+    expect(ROUTER_TABLE.has("accounts/fireworks/models/deepseek-v4-flash-0731")).toBe(true);
+    // A Baseten-OWNED entry's own path is its provider_model, not a foreign alias.
+    expect(ROUTER_TABLE.has("thinkingmachines/inkling-small")).toBe(true);
+    expect(lookupRampRouter(ROUTER_TABLE, "deepseek-ai/DeepSeek-V4-Flash-0731")).toBeNull();
+  });
+
+  it("a synthetic entry keeps a same-backend alias and drops a foreign one", () => {
+    const t = parseRampRouter({
+      data: [
+        routerEntry(
+          "m",
+          {},
+          {
+            provider_model: "accounts/fireworks/models/m",
+            aliases: ["accounts/fireworks/models/m-alias", "other-host/M", "plain-synonym"],
+          },
+        ),
+      ],
+    });
+    expect([...t.keys()].sort()).toEqual([
+      "accounts/fireworks/models/m",
+      "accounts/fireworks/models/m-alias",
+      "m",
+      "plain-synonym",
+    ]);
+  });
+
+  it("keys every name a response can report", () => {
+    // Fireworks- and Baseten-served responses report the vendor's own path, which is the
+    // entry's provider_model or an alias, never its id (fixtures 03, a2_baseten).
+    const lightning = ROUTER_TABLE.get("nemotron-lightning-3p5-30b-a3b");
+    expect(ROUTER_TABLE.get("accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b")).toBe(lightning);
+    expect(ROUTER_TABLE.get("thinkingmachines/inkling-small")).toBe(ROUTER_TABLE.get("inkling-small"));
+  });
+
+  it.each([
+    ["gpt-5.4-nano-2026-03-17", "gpt-5.4-nano"],
+    ["claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+    ["o3-2025-04-16", "o3"],
+    ["grok-build-0.1", "grok-build-0.1"],
+    ["accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b", "nemotron-lightning-3p5-30b-a3b"],
+  ])("lookup resolves the served name %s", (served, catalogId) => {
+    // The five shapes Router has actually answered with: OpenAI and Anthropic dated
+    // snapshots (version-strip), an xAI bare id, and a Fireworks vendor path.
+    expect(lookupRampRouter(ROUTER_TABLE, served)).toBe(ROUTER_TABLE.get(catalogId));
+  });
+
+  it("lookup miss returns null", () => {
+    expect(lookupRampRouter(ROUTER_TABLE, "definitely-not-a-model")).toBeNull();
+    expect(lookupRampRouter(new Map(), "gpt-5.4-nano")).toBeNull();
+  });
+
+  it("a shared name with identical rates prices", () => {
+    // The live catalog's one shared name (`…/nemotron-3-ultra-nvfp4`, provider_model of two
+    // entries) carries identical rates on both, so it stays priced.
+    const t = parseRampRouter({
+      data: [routerEntry("a", {}, { aliases: ["shared"] }), routerEntry("b", {}, { aliases: ["shared"] })],
+    });
+    expect(t.get("shared")!.input).toBe(parseScaled("0.000001"));
+  });
+
+  it("a shared name with different rates is unpriced whatever the order", () => {
+    // Guessing between two rates is a mispricing, not a miss. The name is removed AND
+    // pinned, so a third entry cannot re-add it; the entries' own ids still price.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const entries = [
+        routerEntry("a", {}, { aliases: ["shared"] }),
+        routerEntry("b", { input: "3" }, { aliases: ["shared"] }),
+        routerEntry("c", {}, { aliases: ["shared"] }),
+      ];
+      const t = parseRampRouter({ data: entries });
+      expect(t.has("shared")).toBe(false);
+      expect(t.get("a")!.input).toBe(parseScaled("0.000001"));
+      expect(t.get("b")!.input).toBe(parseScaled("0.000003"));
+      expect(t.get("c")!.input).toBe(parseScaled("0.000001"));
+      expect(parseRampRouter({ data: [...entries].reverse() }).has("shared")).toBe(false);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an empty-string rate is a missing field, not a zero", () => {
+    // The shape the committed fixture carried until the capture scrub was fixed: every
+    // input rate read "". It must neither crash nor price input at $0.
+    const t = parseRampRouter({ data: [routerEntry("a", { input: "" })] });
+    expect(t.get("a")!.input).toBeNull();
+    expect(t.get("a")!.output).toBe(parseScaled("0.000002"));
+  });
+
+  it("malformed entries are skipped, not fatal", () => {
+    const t = parseRampRouter({
+      data: [
+        { id: "no-router-block" },
+        { id: "empty-router", router: {} },
+        { id: "unparseable", router: { pricing: { input: "abc", output: null } } },
+        "junk",
+        null,
+        routerEntry("ok", {}),
+      ],
+    });
+    expect([...t.keys()]).toEqual(["ok"]);
+    expect(parseRampRouter(null).size).toBe(0);
+    expect(parseRampRouter({ data: "nope" }).size).toBe(0);
+  });
+
+  it.each(["default", "standard", "Default"])("base-rate tier %s prices", (tier) => {
+    const u = makeCanonicalUsage({
+      model: "m",
+      provider: "ramp_router",
+      api: "ramp_router",
+      extras: { service_tier: tier },
+    });
+    expect(rampRouterUnpricedTier(u)).toBeNull();
+  });
+
+  it.each([
+    ["flex", "flex"], // measured 0.5x — a discount, so the base rate would OVER-bill
+    ["priority", "priority"], // measured 2.0x on two vendors
+    ["turbo", "turbo"], // a tier Router adds later must not silently bill at 1.0x
+    [7, "7"], // a non-string is drift, reported as-is
+  ])("every other tier is a named miss: %s", (tier, expected) => {
+    const u = makeCanonicalUsage({
+      model: "m",
+      provider: "ramp_router",
+      api: "ramp_router",
+      extras: { service_tier: tier },
+    });
+    expect(rampRouterUnpricedTier(u)).toBe(expected);
+  });
+
+  it.each([{}, { service_tier: null }, { service_tier: "" }])(
+    "a missing tier bills at the base rate: %o",
+    (extras) => {
+      // Sweep 2026-09-07: Router omitted the tier on six `incomplete` zero-output responses
+      // and billed all six at standard; flex/priority were always explicit. Absence is standard.
+      const u = makeCanonicalUsage({ model: "m", provider: "ramp_router", api: "ramp_router", extras });
+      expect(rampRouterUnpricedTier(u)).toBeNull();
+    },
+  );
+
+  it("the tier gate ignores every other provider", () => {
+    // OpenAI reports its own `service_tier`; only Router's tiers are unpriced.
+    const u = makeCanonicalUsage({
+      model: "m",
+      provider: "openai",
+      api: "responses",
+      extras: { service_tier: "flex" },
+    });
+    expect(rampRouterUnpricedTier(u)).toBeNull();
+  });
+
+  it("a cache write bills at the catalog write rate (gpt-5.6-luna, dashboard-reconciled)", () => {
+    // The 2026-09-07 dashboard row, default tier: 4493 in / 4490 written / 5 out. At the
+    // PUBLISHED rates: 3 x $0.20/M + 4490 x $0.25/M + 5 x $1.20/M = $0.0011291. Router charged
+    // $0.00124201 — exactly 1.1x — a documented mismatch the SDK does not correct (see the
+    // docs' markup recommendation); the write-rate arithmetic is what this test pins.
+    const usage = makeCanonicalUsage({
+      model: "gpt-5.6-luna",
+      provider: "ramp_router",
+      api: "ramp_router",
+      input: 4493,
+      cache_write: 4490,
+      output: 5,
+    });
+    const b = computeCost(usage, ROUTER_TABLE.get("gpt-5.6-luna")!, ONE);
+    expect(b.base).toBe("0.0011291");
+    expect(b.fields.input.tokens).toBe("3");
+    expect(b.fields.cache_write.tokens).toBe("4490");
+    expect(deoverlappedTokenTotal(usage)).toBe(4498);
+  });
+
+  it("a cache read bills at the catalog read rate (grok-build-0.1, dashboard-reconciled)", () => {
+    // The 2026-09-04 dashboard row: 194 in / 192 cached / 134 out. Router charged
+    // 2 x $1/M + 192 x $0.20/M + 134 x $2/M = $0.0003084, exactly.
+    const usage = makeCanonicalUsage({
+      model: "grok-build-0.1",
+      provider: "ramp_router",
+      api: "ramp_router",
+      input: 194,
+      cache_read: 192,
+      output: 134,
+    });
+    expect(computeCost(usage, ROUTER_TABLE.get("grok-build-0.1")!, ONE).base).toBe("0.0003084");
+  });
+
+  it("provider: cold miss then warm resolves, and warm does not refetch", async () => {
+    const fetcher = new StubFetcher(undefined, undefined, undefined, undefined, ROUTER_TABLE);
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    expect(p.lookup("ramp_router", "gpt-5.4-nano-2026-03-17", "ramp_router")).toBeNull();
+    expect(fetcher.rampRouterCalls).toBe(0);
+    await p.maybeRefresh();
+    expect(fetcher.rampRouterCalls).toBe(1);
+    const mp = p.lookup("ramp_router", "gpt-5.4-nano-2026-03-17", "ramp_router");
+    expect(mp).not.toBeNull();
+    expect(mp!.input).toBe(parseScaled("0.0000002"));
+    await p.maybeRefresh();
+    expect(fetcher.rampRouterCalls).toBe(1);
+  });
+
+  it("provider: only fetched for the ramp_router provider", async () => {
+    const fetcher = new StubFetcher(
+      parseOpenRouter(OPENROUTER_RAW),
+      undefined,
+      undefined,
+      undefined,
+      ROUTER_TABLE,
+    );
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.lookup("anthropic", "claude-opus-4-8", "native");
+    await p.maybeRefresh();
+    expect(fetcher.rampRouterCalls).toBe(0);
+  });
+
+  it("provider: a Router lookup never consults OpenRouter", async () => {
+    // Router serves models literally named `o4-mini` and `claude-haiku-4-5`; a fall-through
+    // to OpenRouter would price them at another company's rate.
+    const fetcher = new StubFetcher(
+      parseOpenRouter(OPENROUTER_RAW),
+      undefined,
+      undefined,
+      undefined,
+      new Map(),
+    );
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.lookup("ramp_router", "claude-opus-4-8", "ramp_router");
+    await p.maybeRefresh();
+    expect(fetcher.openrouterCalls).toBe(0);
+    expect(p.lookup("ramp_router", "claude-opus-4-8", "ramp_router")).toBeNull();
+  });
+
+  it("prime(['ramp_router']) warms the source", async () => {
+    const fetcher = new StubFetcher(undefined, undefined, undefined, undefined, ROUTER_TABLE);
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["ramp_router"]);
+    await p.maybeRefresh();
+    expect(fetcher.rampRouterCalls).toBe(1);
+  });
+
+  it("learnRampRouterApiKey is used on the next fetch", async () => {
+    const fetcher = new StubFetcher(undefined, undefined, undefined, undefined, ROUTER_TABLE);
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.learnRampRouterApiKey("sk-router-learned");
+    p.lookup("ramp_router", "o3", "ramp_router");
+    await p.maybeRefresh();
+    expect(fetcher.lastRampRouterApiKey).toBe("sk-router-learned");
+  });
+
+  it("learnRampRouterApiKey keeps the first key and ignores an empty one", () => {
+    const p = new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 });
+    p.learnRampRouterApiKey("");
+    expect((p as any).rampRouterApiKeyOverride).toBeNull();
+    p.learnRampRouterApiKey("first");
+    p.learnRampRouterApiKey("second");
+    expect((p as any).rampRouterApiKeyOverride).toBe("first");
+  });
+
+  it("fetcher returns empty without credentials — never makes a request", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("must not be called");
+    });
+    try {
+      expect((await new HttpPricingFetcher().fetchRampRouter()).size).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  async function captureFetch(
+    run: (f: HttpPricingFetcher) => Promise<Map<string, ModelPrice>>,
+    f: HttpPricingFetcher,
+  ) {
+    const calls: Array<[string, Record<string, string> | undefined]> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
+      calls.push([url, init?.headers]);
+      return { ok: true, status: 200, json: async () => ROUTER_CATALOG } as unknown as Response;
+    });
+    try {
+      return { calls, table: await run(f) };
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("fetcher accepts a learned key and parses the catalog", async () => {
+    const { calls, table } = await captureFetch(
+      (f) => f.fetchRampRouter("sk-router-learned"),
+      new HttpPricingFetcher(),
+    );
+    expect(calls).toEqual([[RAMP_ROUTER_MODELS_URL, { Authorization: "Bearer sk-router-learned" }]]);
+    expect(table.get("gpt-5.4-nano")!.input).toBe(parseScaled("0.0000002"));
+  });
+
+  it("fetcher: an explicit config key wins over a learned key", async () => {
+    const { calls } = await captureFetch(
+      (f) => f.fetchRampRouter("sk-router-learned"),
+      new HttpPricingFetcher(10_000, undefined, undefined, undefined, "configured-key"),
+    );
+    expect(calls).toEqual([[RAMP_ROUTER_MODELS_URL, { Authorization: "Bearer configured-key" }]]);
+  });
+});
+
+describe("ramp router TTL-split cache writes", () => {
+  const messagesUsage = (counts: Record<string, number>) =>
+    makeCanonicalUsage({
+      model: "claude-haiku-4-5",
+      provider: "ramp_router",
+      api: "ramp_router_messages",
+      ...counts,
+    });
+
+  it("the catalog carries the TTL-split write rates", () => {
+    // haiku publishes cache_write_input_5m $1.25/M and _1h $2/M — 1.25x and 2x its input
+    // rate — while its lump cache_write_input is "0" (null). OpenAI's luna is the mirror
+    // image: a lump rate and no split.
+    const haiku = ROUTER_TABLE.get("claude-haiku-4-5")!;
+    expect(haiku.cache_write).toBeNull();
+    expect(haiku.cache_write_5m).toBe(parseScaled("0.00000125"));
+    expect(haiku.cache_write_1h).toBe(parseScaled("0.000002"));
+    const luna = ROUTER_TABLE.get("gpt-5.6-luna")!;
+    expect(luna.cache_write).toBe(parseScaled("0.00000025"));
+    expect(luna.cache_write_5m).toBeNull();
+    expect(luna.cache_write_1h).toBeNull();
+  });
+
+  it("bills each TTL part at its own rate (dashboard-reconciled)", () => {
+    // Router's dashboard, 2026-09-04, `/v1/messages`, haiku: 16 in + 20,113 written (5m) +
+    // 5 out charged $0.02518225 — exactly 16 x $1/M + 20113 x $1.25/M + 5 x $5/M.
+    const usage = messagesUsage({ input: 16, output: 5, cache_write: 20113, cache_write_5m: 20113 });
+    const b = computeCost(usage, ROUTER_TABLE.get("claude-haiku-4-5")!, ONE);
+    expect(b.base).toBe("0.02518225");
+    expect(Object.keys(b.fields).sort()).toEqual(["cache_write_5m", "input", "output"]);
+    expect(b.fields.cache_write_5m.tokens).toBe("20113");
+    // The token total counts the write ONCE (the split is a breakdown, not an addition).
+    expect(deoverlappedTokenTotal(usage)).toBe(16 + 5 + 20113);
+  });
+
+  it("both TTLs plus a lump remainder", () => {
+    const price: ModelPrice = {
+      source: "ramp_router",
+      input: parseScaled("0.000001"),
+      output: null,
+      cache_read: null,
+      cache_write: parseScaled("0.0000011"),
+      reasoning: null,
+      cache_write_5m: parseScaled("0.00000125"),
+      cache_write_1h: parseScaled("0.000002"),
+    };
+    const usage = messagesUsage({ input: 10, cache_write: 1100, cache_write_5m: 600, cache_write_1h: 400 });
+    const b = computeCost(usage, price, ONE);
+    expect(b.fields.cache_write_5m.tokens).toBe("600");
+    expect(b.fields.cache_write_1h.tokens).toBe("400");
+    expect(b.fields.cache_write.tokens).toBe("100");
+    // 10 x 1e-6 + 600 x 1.25e-6 + 400 x 2e-6 + 100 x 1.1e-6
+    expect(b.base).toBe("0.00167");
+  });
+
+  it("never bills more split tokens than the lump reports", () => {
+    const usage = messagesUsage({ input: 10, cache_write: 100, cache_write_5m: 150, cache_write_1h: 80 });
+    const b = computeCost(usage, ROUTER_TABLE.get("claude-haiku-4-5")!, ONE);
+    expect(b.fields.cache_write_5m.tokens).toBe("100");
+    expect(b.fields.cache_write_1h).toBeUndefined();
+    expect(b.fields.cache_write).toBeUndefined();
+  });
+
+  it("is inert without split rates — OpenRouter's Anthropic listing is unchanged", () => {
+    // OpenRouter publishes one `input_cache_write` for Anthropic. The split counts are
+    // reported by native Anthropic too, and must change nothing there: the lump bills at the
+    // lump rate exactly as before this code existed.
+    const price: ModelPrice = {
+      source: "openrouter",
+      input: parseScaled("0.000001"),
+      output: null,
+      cache_read: null,
+      cache_write: parseScaled("0.00000125"),
+      reasoning: null,
+    };
+    const usage = makeCanonicalUsage({
+      model: "claude-haiku-4-5",
+      provider: "anthropic",
+      api: "native",
+      input: 16,
+      cache_write: 20113,
+      cache_write_5m: 20113,
+    });
+    const b = computeCost(usage, price, ONE);
+    expect(Object.keys(b.fields).sort()).toEqual(["cache_write", "input"]);
+    expect(b.fields.cache_write.tokens).toBe("20113");
+    expect(b.base).toBe("0.02515725");
   });
 });

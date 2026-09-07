@@ -5,17 +5,23 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { LagoSDK } from "../../../src/index.js";
+import { extractAnthropicNative, RAMP_ROUTER_MESSAGES_API } from "../../../src/adapters/anthropic_native.js";
 import { extractOpenAINative, RAMP_ROUTER_PROVIDER } from "../../../src/adapters/openai_native.js";
+import { clientPointsAtRampRouter, isRampRouterBaseUrl } from "../../../src/wrappers/ramp_router.js";
 import { providerHintFor } from "../../../src/wrappers/openai.js";
 import type { LagoEvent } from "../../../src/lago_client.js";
+import { PricingUnavailableError } from "../../../src/exceptions.js";
 import {
-  HttpPricingFetcher,
+  lookupRampRouter,
   ModelPrice,
   PricingProvider,
   parseOpenRouter,
+  parseRampRouter,
+  parseScaled,
   TOKEN_BILLED_PROVIDERS,
 } from "../../../src/pricing.js";
-import { KNOWN_PROVIDERS, tokenSemantics } from "../../../src/token_semantics.js";
+import { OfflinePricingFetcher } from "../../support/offline_pricing.js";
+import { KNOWN_PROVIDERS, OPENAI_SHAPED_APIS, tokenSemantics } from "../../../src/token_semantics.js";
 
 const ROUTER_BASE_URL = "https://api.router.com/v1";
 
@@ -404,68 +410,105 @@ describe("Ramp Router — failures and malformed payloads never bill", () => {
   });
 });
 
-// ------------------------------------------------------------------
-// Price mode. Every Router call currently takes a clean pricing MISS and falls
-// back to token events, because no vendor can be assigned to it safely yet.
+// ----------------------------------------------------------------------
+// Price mode. A Router call prices against Router's OWN catalog — the rate the
+// gateway bills, reconciled exact against a live account's dashboard export —
+// never against OpenRouter's listing for the "same" model.
 //
-// A real price table is loaded for these tests, and the same model is billed
-// both directly and through Router. Without that contrast the tests would pass
-// on an empty table, proving nothing: everything misses when nothing is priced.
-// ------------------------------------------------------------------
-const PRICED_MODEL = "gpt-5.4-mini";
-// Built through the real parser from a real-shaped OpenRouter payload, not from a
-// hand-written key. Hand-writing one was wrong on the first try — `norm()` rewrites "."
-// to "-", so `openai\ngpt-5.4-mini` never matched `openai\ngpt-5-4-mini` — and a test
-// whose table silently fails to load proves nothing about a miss.
-//
-// $0.75/M input and $4.50/M output are Router's own published base rates for this model.
+// The Router table is built through the real parser from the REAL captured
+// catalog, and an OpenRouter table listing the same model at a DIFFERENT rate
+// is loaded beside it. Without that contrast a test could pass by pricing from
+// the wrong table, and a table that silently failed to load would make every
+// assertion below vacuous — so the control test prices the same model directly.
+// ----------------------------------------------------------------------
+const CATALOG_FIXTURE = path.join(
+  __dirname,
+  "..",
+  "adapters",
+  "fixtures",
+  "ramp_router",
+  "01_real_models_catalog.json",
+);
+const ROUTER_TABLE = parseRampRouter(JSON.parse(fs.readFileSync(CATALOG_FIXTURE, "utf8"))._body);
+const PRICED_MODEL = "gpt-5.4-nano"; // Router's catalog: $0.20/M input, $1.25/M output, $0.02/M cached
+const SERVED_MODEL = `${PRICED_MODEL}-2026-03-17`; // what Router actually answers with (fixture 02)
+// OpenRouter deliberately lists it at a rate that is NOT Router's, so a cost event priced
+// from the wrong table shows up in the numbers, not only in `price_source`.
 const OPENROUTER_TABLE = parseOpenRouter({
-  data: [
-    {
-      id: `openai/${PRICED_MODEL}`,
-      pricing: { prompt: "0.00000075", completion: "0.0000045" },
-    },
-  ],
+  data: [{ id: `openai/${PRICED_MODEL}`, pricing: { prompt: "0.000001", completion: "0.000001" } }],
 });
 
-class StubFetcher extends HttpPricingFetcher {
+class StubFetcher extends OfflinePricingFetcher {
+  rampRouterKeys: Array<string | null | undefined> = [];
+  constructor(private readonly routerTable: Map<string, ModelPrice> = ROUTER_TABLE) {
+    super();
+  }
   async fetchOpenRouter() {
     return OPENROUTER_TABLE;
   }
-  async fetchBedrock() {
-    return new Map<string, ModelPrice>();
-  }
-  async fetchCloudflareWorkersAi() {
-    return new Map<string, ModelPrice>();
-  }
-  async fetchMistralAliases() {
-    return new Map<string, string>();
+  async fetchRampRouter(apiKey?: string | null) {
+    this.rampRouterKeys.push(apiKey);
+    return this.routerTable;
   }
 }
 
-async function pricedSdk() {
+async function pricedSdk(
+  opts: { routerTable?: Map<string, ModelPrice>; onError?: (err: unknown, where: string) => void } = {},
+) {
   const received: LagoEvent[] = [];
-  const provider = new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 });
+  const provider = new PricingProvider({ fetcher: new StubFetcher(opts.routerTable), ttlMs: 3_600_000 });
   const sdk = new LagoSDK({
     apiKey: "x",
     defaultSubscriptionId: "sub_test",
-    config: { pricingMode: "price", pricingProvider: provider },
+    config: {
+      pricingMode: "price",
+      pricingProvider: provider,
+      ...(opts.onError ? { onError: opts.onError } : {}),
+    },
   });
   sdk._setSender(async (b) => {
     received.push(...b);
   });
-  // The table has to be warm before the call, or the miss under test is just a cold
-  // cache. Poll rather than sleep: prime() runs on the queue's own loop.
-  for (let i = 0; i < 200; i++) {
-    if (provider.lookup("openai", PRICED_MODEL, "responses") !== null) break;
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  // Both tables have to be warm before the call, or a miss under test is just a cold
+  // cache. `maybeRefresh` is the queue loop's own warm-up, awaited directly.
+  provider.prime(["ramp_router"]);
+  await provider.maybeRefresh();
   return { sdk, received, provider };
 }
 
-describe("Ramp Router — price mode misses honestly", () => {
-  it("the same model DOES price when called directly — the table is real", async () => {
-    // The control. If this fails, every "misses" assertion below is vacuous.
+/** A Router response carrying its top-level `service_tier`, as every captured one does. */
+function tiered(model: string, tier: string | null = "default", usage: Record<string, unknown> = {}) {
+  const body = routerResponse(model, usage);
+  if (tier !== null) body.service_tier = tier;
+  return body;
+}
+
+function costByType(received: LagoEvent[]): Record<string, LagoEvent> {
+  return Object.fromEntries(
+    received.filter((e) => e.code === "llm_cost").map((e) => [String(e.properties.token_type), e]),
+  );
+}
+
+function sumValues(events: Record<string, LagoEvent>): bigint {
+  return Object.values(events).reduce((acc, e) => acc + parseScaled(e.properties.value)!, 0n);
+}
+
+const LUNA_COLD_WRITE = {
+  input_tokens: 4493,
+  output_tokens: 5,
+  total_tokens: 4498,
+  input_tokens_details: { cache_write_tokens: 4490, cached_tokens: 0 },
+};
+const LUNA_WARM_READ = {
+  input_tokens: 4493,
+  output_tokens: 5,
+  total_tokens: 4498,
+  input_tokens_details: { cache_write_tokens: 0, cached_tokens: 4490 },
+};
+
+describe("Ramp Router — price mode bills Router's own catalog", () => {
+  it("the same model priced directly comes from OpenRouter — the control", async () => {
+    // If this fails, every Router assertion below proves nothing about which table won.
     const { sdk, received, provider } = await pricedSdk();
     expect(provider.lookup("openai", PRICED_MODEL, "responses")).not.toBeNull();
     const client = sdk.wrap(
@@ -475,51 +518,187 @@ describe("Ramp Router — price mode misses honestly", () => {
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
 
-    const codes = received.map((e) => e.code);
-    expect(codes).toContain("llm_cost");
-    expect(codes).not.toContain("llm_input_tokens");
+    const costs = costByType(received);
+    expect(Object.keys(costs).length).toBeGreaterThan(0);
+    for (const e of Object.values(costs)) expect(e.properties.price_source).toBe("openrouter");
+    expect(costs.input.properties.unit_price).toBe("0.000001");
+    expect(received.map((e) => e.code)).not.toContain("llm_input_tokens");
   });
 
-  it("the identical model through Router misses and falls back to token events", async () => {
-    // Same table, same model, same usage — only the base URL differs. The miss is caused
-    // by the Router provider vocabulary, which is the decision under test: Router bills
-    // $0 for a BYOK-served request and a non-default tier at a rate its catalog says
-    // "may differ", so a list-price lookup can be flatly wrong.
+  it("the identical model through Router prices from Router's own catalog", async () => {
+    // Same usage, same model family — only the base URL differs — and the money comes from
+    // Router's table: $0.20/M input, not OpenRouter's $1/M.
     const { sdk, received } = await pricedSdk();
-    const client = sdk.wrap(
-      new FakeRouterClient(ROUTER_BASE_URL, () => routerResponse(`openai:${PRICED_MODEL}`)),
-    );
+    const client = sdk.wrap(new FakeRouterClient(ROUTER_BASE_URL, () => tiered(SERVED_MODEL)));
     await client.responses.create({ model: PRICED_MODEL, input: "ping" });
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
 
-    const map = byCode(received);
-    expect(map.llm_cost).toBeUndefined();
-    // Not a silent drop. The usage is billed, exactly, as tokens.
-    expect(map.llm_input_tokens).toBe(11);
-    expect(map.llm_output_tokens).toBe(3);
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["input", "output"]);
+    for (const e of Object.values(costs)) {
+      expect(e.properties.price_source).toBe("ramp_router");
+      expect(e.properties.provider).toBe(RAMP_ROUTER_PROVIDER);
+      // Billed under the served snapshot, the same row a direct call to it reports.
+      expect(e.properties.model).toBe(SERVED_MODEL);
+    }
+    expect(costs.input.properties.unit_price).toBe("0.0000002");
+    expect(costs.input.properties.value).toBe("0.0000022"); // 11 tokens
+    expect(costs.output.properties.value).toBe("0.00000375"); // 3 tokens x $1.25/M
+    expect(received.map((e) => e.code)).not.toContain("llm_input_tokens");
   });
 
-  it("a flex-tier call is never billed at the base rate", async () => {
-    // supported-models: "Service tiers, long contexts, caching, and other features may
-    // use different rates." Billing flex at the standard rate over-bills.
+  it.each(["flex", "priority", "turbo"])(
+    "a %s tier is a named miss, never a multiplied rate",
+    async (tier) => {
+      // flex measured 0.5x, priority 2.0x, and a tier Router adds later is unknown. None of
+      // them bill at the catalog rate, and the SDK applies no factor of its own: token
+      // events, plus an onError that says WHICH tier, since the same model priced fine a
+      // moment ago. Decided 2026-09-07.
+      const errors: Array<[unknown, string]> = [];
+      const { sdk, received } = await pricedSdk({ onError: (err, where) => errors.push([err, where]) });
+      const client = sdk.wrap(new FakeRouterClient(ROUTER_BASE_URL, () => tiered(SERVED_MODEL, tier)));
+      await client.responses.create({ model: "x", input: "ping" });
+      expect(await sdk.flush(2000)).toBe(true);
+      await sdk.shutdown(1000);
+
+      const map = byCode(received);
+      expect(map.llm_cost).toBeUndefined();
+      // Not a silent drop. The usage is billed, exactly, as tokens.
+      expect(map.llm_input_tokens).toBe(11);
+      expect(map.llm_output_tokens).toBe(3);
+      const misses = errors.filter(([err]) => err instanceof PricingUnavailableError);
+      expect(misses).toHaveLength(1);
+      const [err, where] = misses[0] as [PricingUnavailableError, string];
+      expect(where).toBe("pricing");
+      expect(err.detail).toContain(tier);
+      expect(String(err)).toContain(tier);
+    },
+  );
+
+  it("a Router response reporting no tier bills at the base rate", async () => {
+    // Sweep 2026-09-07: Router omitted `service_tier` on six `incomplete` zero-output
+    // responses (both surfaces) and billed every one at standard, while flex and priority
+    // were always reported explicitly. Absence means standard; only a reported non-base
+    // tier is a miss.
+    const errors: unknown[] = [];
+    const { sdk, received } = await pricedSdk({ onError: (err) => errors.push(err) });
+    const client = sdk.wrap(new FakeRouterClient(ROUTER_BASE_URL, () => tiered(SERVED_MODEL, null)));
+    await client.responses.create({ model: "x", input: "ping" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code)).toContain("llm_cost");
+    expect(errors.some((e) => e instanceof PricingUnavailableError)).toBe(false);
+  });
+
+  it("an OpenAI-served cache write bills at the catalog write rate", async () => {
+    // Reconciled against the dashboard on 2026-09-07 (gpt-5.6-luna, default tier): at the
+    // published rates 3 x $0.20/M + 4490 x $0.25/M + 5 x $1.20/M = $0.0011291; Router charged
+    // exactly 1.1x that, a documented per-model mismatch the SDK does not correct. What this
+    // pins is the write arithmetic: the count sits INSIDE input_tokens, so it is moved out
+    // before pricing — never billed at the input rate AND the write rate.
     const { sdk, received } = await pricedSdk();
     const client = sdk.wrap(
-      new FakeRouterClient(ROUTER_BASE_URL, () => routerResponse(`openai:${PRICED_MODEL}:flex`)),
+      new FakeRouterClient(ROUTER_BASE_URL, () => tiered("gpt-5.6-luna", "default", LUNA_COLD_WRITE)),
     );
     await client.responses.create({ model: "x", input: "ping" });
     expect(await sdk.flush(2000)).toBe(true);
     await sdk.shutdown(1000);
-    expect(received.map((e) => e.code)).not.toContain("llm_cost");
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["cache_write", "input", "output"]);
+    expect(costs.input.properties.unit).toBe("3");
+    expect(costs.cache_write.properties.unit).toBe("4490");
+    expect(costs.cache_write.properties.unit_price).toBe("0.00000025");
+    expect(sumValues(costs)).toBe(parseScaled("0.0011291"));
+  });
+
+  it("the warm repeat bills the cached block at the cache-read rate", async () => {
+    // Same prompt a second later: 4490 cached at $0.02/M: $0.0000964 at the published rates
+    // (Router charged 1.1x that — the documented luna mismatch).
+    const { sdk, received } = await pricedSdk();
+    const client = sdk.wrap(
+      new FakeRouterClient(ROUTER_BASE_URL, () => tiered("gpt-5.6-luna", "default", LUNA_WARM_READ)),
+    );
+    await client.responses.create({ model: "x", input: "ping" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["cache_read", "input", "output"]);
+    expect(costs.cache_read.properties.unit).toBe("4490");
+    expect(sumValues(costs)).toBe(parseScaled("0.0000964"));
+  });
+
+  it("the cache-write count is mapped for Router and stays in extras for OpenAI", () => {
+    // Same wire shape, two measured billing conventions: Router bills the write at its
+    // catalog rate (mapped, not drift); OpenAI-native was metered at the plain input rate
+    // (unmapped, surfaced in extras — see MAPPED_DETAIL_FIELDS).
+    const body = tiered("gpt-5.6-luna", "default", LUNA_COLD_WRITE);
+    const viaRouter = extractOpenAINative(body, "", RAMP_ROUTER_PROVIDER);
+    expect(viaRouter.cache_write).toBe(4490);
+    expect(viaRouter.extras).not.toHaveProperty("input_tokens_details.cache_write_tokens");
+    const direct = extractOpenAINative(body);
+    expect(direct.cache_write).toBe(0);
+    expect(direct.extras["input_tokens_details.cache_write_tokens"]).toBe(4490);
+  });
+
+  it("a streamed Router call carries the served tier and prices", async () => {
+    // The terminal `response.completed` event carries `service_tier` (fixture 04). The
+    // stream wrapper used to forward usage and model only, so every streamed Router call
+    // reached price mode tier-less — and a missing tier is a miss.
+    const { sdk, received } = await pricedSdk();
+    const client = sdk.wrap(
+      new FakeRouterClient(ROUTER_BASE_URL, () => {
+        const events = [
+          { type: "response.created", response: { model: SERVED_MODEL, service_tier: "default" } },
+          { type: "response.output_text.delta", delta: "po" },
+          { type: "response.completed", response: tiered(SERVED_MODEL) },
+        ];
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      }),
+    );
+    const stream = (await client.responses.create({
+      model: "x",
+      input: "ping",
+      stream: true,
+    })) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["input", "output"]);
+    expect(costs.input.properties.price_source).toBe("ramp_router");
   });
 
   it("a pricing miss never reaches the caller as an exception", async () => {
     const { sdk } = await pricedSdk();
-    const client = sdk.wrap(
-      new FakeRouterClient(ROUTER_BASE_URL, () => routerResponse(`openai:${PRICED_MODEL}`)),
-    );
+    const client = sdk.wrap(new FakeRouterClient(ROUTER_BASE_URL, () => tiered(SERVED_MODEL, "flex")));
     await expect(client.responses.create({ model: "x", input: "ping" })).resolves.toBeTruthy();
     await sdk.shutdown(1000);
+  });
+
+  it("a cold or empty Router table is a reported miss, not a silent token fallback", async () => {
+    // Router used to sit in TOKEN_BILLED_PROVIDERS, which swallowed the miss on purpose
+    // because nothing could fix it. Now a miss is actionable — no Router key learned, table
+    // still cold, catalog missing the model — so it must reach onError like any other.
+    expect(TOKEN_BILLED_PROVIDERS.has(RAMP_ROUTER_PROVIDER)).toBe(false);
+
+    const errors: unknown[] = [];
+    const { sdk, received } = await pricedSdk({ routerTable: new Map(), onError: (err) => errors.push(err) });
+    const client = sdk.wrap(new FakeRouterClient(ROUTER_BASE_URL, () => tiered(SERVED_MODEL)));
+    await client.responses.create({ model: "x", input: "ping" });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
+    const misses = errors.filter((e) => e instanceof PricingUnavailableError) as PricingUnavailableError[];
+    expect(misses).toHaveLength(1);
+    expect(misses[0].detail).toBeUndefined();
   });
 });
 
@@ -546,39 +725,11 @@ describe("Ramp Router — concurrency", () => {
 });
 
 // ------------------------------------------------------------------
-// The two recorded decisions behind "ramp_router", pinned so neither can be
-// reverted silently. The generic roster tests cannot see them: the hint comes
-// from the wrapper's HOST arm, not from PROVIDER_BY_BASE_URL_PATH, so nothing
-// else in the suite fails if either set entry disappears (verified by
-// reverting each — 835 tests stayed green).
+// The recorded token-convention decision behind "ramp_router", pinned so it
+// cannot be reverted silently. The generic roster tests cannot see it: the hint
+// comes from the wrapper's HOST arm, not from PROVIDER_BY_BASE_URL_PATH.
 // ------------------------------------------------------------------
 describe("Ramp Router — recorded billing decisions", () => {
-  it("ramp_router is token-billed: a price-mode call emits token events with NO error report", async () => {
-    // Router is structurally unpriceable today (BYOK requests bill $0, tiers have
-    // unpublished rates, overlap semantics unmeasured), so a price miss is permanent —
-    // and a permanent miss must not cry wolf on the error hook per call. Same decision
-    // as Databricks and Snowflake.
-    expect(TOKEN_BILLED_PROVIDERS.has(RAMP_ROUTER_PROVIDER)).toBe(true);
-
-    const errors: unknown[] = [];
-    const provider = new PricingProvider({ fetcher: new StubFetcher(), ttlMs: 3_600_000 });
-    const { sdk, received } = newSdk("sub_test", {
-      config: {
-        pricingMode: "price",
-        pricingProvider: provider,
-        onError: (err: unknown) => errors.push(err),
-      },
-    });
-    const client = sdk.wrap(
-      new FakeRouterClient(ROUTER_BASE_URL, () => routerResponse("openai:gpt-5.4-mini")),
-    );
-    await client.responses.create({ model: "x", input: "ping" });
-    expect(await sdk.flush(2000)).toBe(true);
-    await sdk.shutdown(1000);
-    expect(received.map((e) => e.code).sort()).toEqual(["llm_input_tokens", "llm_output_tokens"]);
-    expect(errors).toHaveLength(0);
-  });
-
   it("ramp_router's token convention is a recorded measurement: OpenAI-shaped on every axis", () => {
     // Measured live 2026-08-28, on an Anthropic-served model — the case that would
     // diverge if anything did: a warm cache_control call reported the cached block
@@ -641,12 +792,21 @@ describe("Ramp Router — the totals guard reads the stamped api", () => {
 // ----------------------------------------------------------------------
 const CAPTURES = path.join(__dirname, "..", "adapters", "fixtures", "ramp_router");
 
-/** Every captured 200 that carries usage, buffered or streamed. */
-function capturedBodies(): Array<[string, Record<string, any>]> {
+/**
+ * Every captured 200 that carries usage, buffered or streamed, on ONE surface.
+ *
+ * Router has two: `/v1/responses` (OpenAI-shaped, fixtures 01-10) and `/v1/messages`
+ * (Anthropic-shaped, fixtures 11-15, named `_messages_`). They report `service_tier` in
+ * different places and go through different adapters, so a test must say which it means.
+ */
+function capturedBodies(
+  surface: "responses" | "messages" = "responses",
+): Array<[string, Record<string, any>]> {
   if (!fs.existsSync(CAPTURES)) return [];
   const out: Array<[string, Record<string, any>]> = [];
   for (const name of fs.readdirSync(CAPTURES).sort()) {
     if (!name.endsWith(".json")) continue;
+    if (name.includes("_messages_") !== (surface === "messages")) continue;
     const blob = JSON.parse(fs.readFileSync(path.join(CAPTURES, name), "utf8"));
     let body = blob._body;
     if (!(body && typeof body === "object" && body.usage)) {
@@ -684,5 +844,275 @@ describe.skipIf(CAPTURED.length === 0)("ramp router captured responses", () => {
     expect(u.model).toBe(body.model);
     expect(u.model).not.toContain(":");
     expect(u.provider).toBe(RAMP_ROUTER_PROVIDER);
+  });
+});
+
+describe.skipIf(CAPTURED.length === 0)("ramp router captured responses resolve in the real catalog", () => {
+  it.each(CAPTURED)("%s resolves to exactly one catalog entry", (_name, body) => {
+    // The served name is what price mode looks up, and it is never the catalog id: a
+    // dated snapshot for OpenAI and Anthropic, the vendor's own path for Fireworks. Every
+    // response Router has actually sent must land on a catalog entry.
+    const u = extractOpenAINative(body, "", RAMP_ROUTER_PROVIDER);
+    expect(lookupRampRouter(ROUTER_TABLE, u.model)).not.toBeNull();
+  });
+});
+
+// ----------------------------------------------------------------------
+// Router's SECOND surface: `POST /v1/messages`, reached with an Anthropic client.
+// Same host, same catalog, same key — but Anthropic's schema and Anthropic's
+// ADDITIVE convention for every vendor, and the one place an Anthropic-served
+// cache WRITE is reported. Detection is the shared host helper; the wrapper
+// threads a provider hint into the Anthropic adapter, which stamps a distinct
+// `api` so the token semantics cannot be confused with the Responses surface.
+// ----------------------------------------------------------------------
+/** A Router `/v1/messages` response, in the shape fixture 11 actually carries: Anthropic's
+ * schema, `service_tier` INSIDE usage. */
+function messagesResponse(model: string, usage: Record<string, unknown> = {}): Record<string, any> {
+  return {
+    id: "msg_test",
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: "pong" }],
+    usage: {
+      input_tokens: 16,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+      service_tier: "standard",
+      ...usage,
+    },
+  };
+}
+
+class FakeRouterAnthropicMessages {
+  constructor(private readonly reply: (args: Record<string, unknown>) => unknown) {}
+  async create(args: Record<string, unknown>) {
+    expect("lago" in (args || {})).toBe(false);
+    return this.reply(args);
+  }
+}
+
+class FakeRouterAnthropicClient {
+  messages: FakeRouterAnthropicMessages;
+  apiKey = "sk-router-from-client";
+  constructor(
+    public baseURL: string,
+    reply: (args: Record<string, unknown>) => unknown,
+  ) {
+    this.messages = new FakeRouterAnthropicMessages(reply);
+  }
+}
+// The detector keys on the constructor name; Router's Messages surface is reached with an Anthropic client.
+Object.defineProperty(FakeRouterAnthropicClient, "name", { value: "Anthropic" });
+
+const ANTHROPIC_ROUTER_BASE_URL = "https://api.router.com";
+const HAIKU_SERVED = "claude-haiku-4-5-20251001"; // what Router answers with (fixture 11)
+
+// Fixture 12 / 13, verbatim: a 7,481-token cache_control prefix on claude-haiku-4-5.
+const MESSAGES_COLD_WRITE = {
+  input_tokens: 15,
+  output_tokens: 5,
+  cache_creation_input_tokens: 7481,
+  cache_creation: { ephemeral_5m_input_tokens: 7481, ephemeral_1h_input_tokens: 0 },
+};
+const MESSAGES_WARM_READ = { input_tokens: 15, output_tokens: 6, cache_read_input_tokens: 7481 };
+
+describe("Ramp Router — the /v1/messages surface", () => {
+  it.each([
+    ["https://api.router.com", true],
+    ["https://api.router.com/v1", true],
+    ["https://api-eu.router.com", true],
+    ["https://api.anthropic.com", false],
+    ["https://evil.example.com/api.router.com", false],
+    ["https://evilrouter.com", false],
+    ["/v1", false],
+    [null, false],
+    [42, false],
+  ])("the shared host helper answers %s -> %s for both wrappers", (baseURL, expected) => {
+    expect(isRampRouterBaseUrl(baseURL)).toBe(expected);
+    expect(clientPointsAtRampRouter({ baseURL })).toBe(expected);
+  });
+
+  it("the OpenAI wrapper and the shared helper cannot disagree", () => {
+    for (const url of [
+      "https://api.router.com/v1",
+      "https://api-eu.router.com/v1",
+      "https://api.openai.com/v1",
+    ]) {
+      expect(providerHintFor({ baseURL: url }) === RAMP_ROUTER_PROVIDER).toBe(isRampRouterBaseUrl(url));
+    }
+  });
+
+  it("an Anthropic client pointed at Router bills as Router on the Messages surface", async () => {
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient(ANTHROPIC_ROUTER_BASE_URL, () => messagesResponse(HAIKU_SERVED)),
+    );
+    await client.messages.create({ model: "claude-haiku-4-5", max_tokens: 16, messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    expect(byCode(received)).toEqual({ llm_input_tokens: 16, llm_output_tokens: 5 });
+    for (const e of received) {
+      expect(e.properties.provider).toBe(RAMP_ROUTER_PROVIDER);
+      expect(e.properties.api).toBe(RAMP_ROUTER_MESSAGES_API);
+      expect(e.properties.model).toBe(HAIKU_SERVED);
+    }
+  });
+
+  it("an Anthropic client pointed at Anthropic is untouched", async () => {
+    const { sdk, received } = newSdk();
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient("https://api.anthropic.com", () => messagesResponse(HAIKU_SERVED)),
+    );
+    await client.messages.create({ model: "claude-haiku-4-5", max_tokens: 16, messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(new Set(received.map((e) => `${e.properties.provider}/${e.properties.api}`))).toEqual(
+      new Set(["anthropic/native"]),
+    );
+  });
+
+  it("the Messages surface keeps Anthropic's additive convention for every vendor", () => {
+    // Measured: haiku `input_tokens: 16` beside `cache_read_input_tokens: 20113` (2026-09-04,
+    // reconciled exactly); an xAI model `input_tokens: 65` beside `cache_read_input_tokens:
+    // 128` with thinking inside output (2026-09-07). The Responses stamp is in
+    // OPENAI_SHAPED_APIS; this one must never be.
+    expect(OPENAI_SHAPED_APIS.has(RAMP_ROUTER_MESSAGES_API)).toBe(false);
+    expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_MESSAGES_API)).toEqual([false, false, false]);
+    expect(tokenSemantics(RAMP_ROUTER_PROVIDER, RAMP_ROUTER_PROVIDER)).toEqual([true, true, true]);
+  });
+
+  it("the adapter stamps Router only when the wrapper says so", () => {
+    const body = messagesResponse(HAIKU_SERVED);
+    const plain = extractAnthropicNative(body);
+    expect([plain.provider, plain.api]).toEqual(["anthropic", "native"]);
+    const hinted = extractAnthropicNative(body, "", RAMP_ROUTER_PROVIDER);
+    expect([hinted.provider, hinted.api]).toEqual([RAMP_ROUTER_PROVIDER, RAMP_ROUTER_MESSAGES_API]);
+    // The tier rides inside usage on this surface and lands in extras with no special code.
+    expect(hinted.extras.service_tier).toBe("standard");
+  });
+
+  it("an Anthropic cache write on the Messages surface bills at the TTL write rate", async () => {
+    // The gap the Responses surface cannot close. Router publishes cache_write_input_5m
+    // ($1.25/M on haiku) and the Messages surface reports the written count with its TTL, so
+    // the write bills at its own rate: 15 x $1/M + 7481 x $1.25/M + 5 x $5/M = $0.00939125.
+    // The lump `cache_write` line is consumed entirely by the split — never billed twice.
+    const { sdk, received } = await pricedSdk();
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient(ANTHROPIC_ROUTER_BASE_URL, () =>
+        messagesResponse(HAIKU_SERVED, MESSAGES_COLD_WRITE),
+      ),
+    );
+    await client.messages.create({ model: "x", max_tokens: 16, messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["cache_write_5m", "input", "output"]);
+    expect(costs.input.properties.unit).toBe("15"); // additive: NOT reduced by the write
+    expect(costs.cache_write_5m.properties.unit).toBe("7481");
+    expect(costs.cache_write_5m.properties.unit_price).toBe("0.00000125");
+    for (const e of Object.values(costs)) expect(e.properties.api).toBe(RAMP_ROUTER_MESSAGES_API);
+    expect(sumValues(costs)).toBe(parseScaled("0.00939125"));
+  });
+
+  it("the warm repeat on the Messages surface bills the read beside input", async () => {
+    // Additive: 15 input tokens stay 15; the 7,481 cached bill at $0.10/M. $0.0007931.
+    const { sdk, received } = await pricedSdk();
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient(ANTHROPIC_ROUTER_BASE_URL, () =>
+        messagesResponse(HAIKU_SERVED, MESSAGES_WARM_READ),
+      ),
+    );
+    await client.messages.create({ model: "x", max_tokens: 16, messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["cache_read", "input", "output"]);
+    expect(costs.input.properties.unit).toBe("15");
+    expect(costs.cache_read.properties.unit).toBe("7481");
+    expect(sumValues(costs)).toBe(parseScaled("0.0007931"));
+  });
+
+  it.each([
+    ["standard", true],
+    ["default", true],
+    ["priority", false],
+  ])("the tier gate reads the Messages surface's in-usage tier: %s -> priced %s", async (tier, priced) => {
+    const errors: unknown[] = [];
+    const { sdk, received } = await pricedSdk({ onError: (err) => errors.push(err) });
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient(ANTHROPIC_ROUTER_BASE_URL, () =>
+        messagesResponse(HAIKU_SERVED, { service_tier: tier }),
+      ),
+    );
+    await client.messages.create({ model: "x", max_tokens: 16, messages: [] });
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+    expect(received.map((e) => e.code).includes("llm_cost")).toBe(priced);
+    expect(errors.some((e) => e instanceof PricingUnavailableError && String(e).includes(tier))).toBe(
+      !priced,
+    );
+  });
+
+  it("a streamed Messages call carries the tier through the merge and prices", async () => {
+    // Fixture 14: `service_tier` sits inside `message_start.message.usage` AND
+    // `message_delta.usage`; the wrapper's merge keeps it, so the adapter's drift sweep lands
+    // it in extras and the tier gate passes.
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          model: HAIKU_SERVED,
+          usage: { input_tokens: 16, output_tokens: 4, cache_read_input_tokens: 0, service_tier: "standard" },
+        },
+      },
+      { type: "content_block_delta" },
+      { type: "message_delta", usage: { output_tokens: 5, service_tier: "standard" } },
+    ];
+    const { sdk, received } = await pricedSdk();
+    const client = sdk.wrap(
+      new FakeRouterAnthropicClient(ANTHROPIC_ROUTER_BASE_URL, () =>
+        (async function* () {
+          for (const e of events) yield e;
+        })(),
+      ),
+    );
+    const stream = (await client.messages.create({
+      model: "x",
+      max_tokens: 16,
+      messages: [],
+      stream: true,
+    })) as AsyncIterable<unknown>;
+    for await (const _ of stream) {
+      /* drain */
+    }
+    expect(await sdk.flush(2000)).toBe(true);
+    await sdk.shutdown(1000);
+
+    const costs = costByType(received);
+    expect(Object.keys(costs).sort()).toEqual(["input", "output"]);
+    expect(costs.input.properties.unit).toBe("16");
+    expect(costs.output.properties.unit).toBe("5");
+    expect(costs.input.properties.api).toBe(RAMP_ROUTER_MESSAGES_API);
+  });
+});
+
+const CAPTURED_MESSAGES = capturedBodies("messages");
+
+describe.skipIf(CAPTURED_MESSAGES.length === 0)("ramp router captured /v1/messages responses", () => {
+  it.each(CAPTURED_MESSAGES)("%s stamps Router and resolves in the catalog", (_name, body) => {
+    const u = extractAnthropicNative(body, "", RAMP_ROUTER_PROVIDER);
+    expect([u.provider, u.api]).toEqual([RAMP_ROUTER_PROVIDER, RAMP_ROUTER_MESSAGES_API]);
+    expect(u.model).toBe(body.model);
+    // The tier is INSIDE usage on this surface — the OpenAI-served model included.
+    expect(u.extras.service_tier).toBe(body.usage.service_tier);
+    expect(lookupRampRouter(ROUTER_TABLE, u.model)).not.toBeNull();
+    // Additive: the lump write equals the TTL split (Anthropic's contract, every capture).
+    expect(u.cache_write).toBe(u.cache_write_5m + u.cache_write_1h);
   });
 });

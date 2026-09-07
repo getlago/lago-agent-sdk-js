@@ -10,9 +10,35 @@
  *   - `cache_write_5m`/`_1h` are a breakdown OF `cache_write`, not additions to it.
  *
  * Unrecognized usage fields land in `extras` — see the drift test.
+ *
+ * Ramp Router's `/v1/messages` surface answers in this exact shape for EVERY vendor it
+ * fronts, so the same extractor serves it — with a `providerHint` from the wrapper, since
+ * nothing in the body says Router was in the path (see RAMP_ROUTER_MESSAGES_API).
  */
 import { CanonicalUsage, makeCanonicalUsage } from "../canonical.js";
 import { resolveModel } from "./_common.js";
+import { RAMP_ROUTER_PROVIDER } from "./openai_native.js";
+
+/**
+ * `api` stamped on a Router call that arrived through `/v1/messages`.
+ *
+ * Distinct from the Responses surface's stamp ("ramp_router", which sits in
+ * OPENAI_SHAPED_APIS) because the two surfaces report the SAME vendor's numbers under
+ * DIFFERENT conventions. Measured 2026-09-04 and 2026-09-07 against a live account:
+ * `/v1/messages` keeps Anthropic's additive shape for every vendor — haiku reports
+ * `input_tokens: 16` beside `cache_read_input_tokens: 20113`; an xAI model reports
+ * `input_tokens: 65` beside `cache_read_input_tokens: 128` and `thinking_tokens: 200`
+ * INSIDE `output_tokens: 201` — while `/v1/responses` folds the cached block inside
+ * `input_tokens`. Token semantics key on the surface, so this stamp must stay OUT of
+ * OPENAI_SHAPED_APIS: the provider-keyed sets do not name "ramp_router", which leaves the
+ * all-additive default, the measured answer here. Putting the Responses stamp on this
+ * surface would subtract a cached block that was never inside `input`.
+ *
+ * The write count Router's Responses surface cannot report for Anthropic models IS
+ * reported here (`cache_creation_input_tokens`, with the 5m/1h split), and reconciled
+ * exactly against the dashboard — the reason this surface is worth detecting at all.
+ */
+export const RAMP_ROUTER_MESSAGES_API = "ramp_router_messages";
 
 const KNOWN_USAGE_FIELDS = new Set<string>([
   "input_tokens",
@@ -35,9 +61,25 @@ function safeInt(v: unknown): number {
 /**
  * Translate an Anthropic native response (`Message` object, dict, or a
  * synthetic `{usage: {...}}` blob from the streaming wrapper) → CanonicalUsage.
+ *
+ * `providerHint` is the wrapper's word that the client was pointed at a gateway; only the
+ * wrapper can know, because the body never says. Today the one value it takes is
+ * RAMP_ROUTER_PROVIDER, which stamps the call as Router traffic on the Messages surface.
+ * The served tier needs no special handling: Router puts `service_tier` INSIDE `usage` on
+ * this surface (buffered, and on both `message_start` and `message_delta` when streamed —
+ * measured), so the drift sweep below already lands it in `extras.service_tier`, where the
+ * price-mode tier gate reads it.
  */
-export function extractAnthropicNative(response: unknown, modelId: string = ""): CanonicalUsage {
+export function extractAnthropicNative(
+  response: unknown,
+  modelId: string = "",
+  providerHint: string = "",
+): CanonicalUsage {
   const resp: Record<string, unknown> = isObject(response) ? response : {};
+  const [provider, api] =
+    providerHint === RAMP_ROUTER_PROVIDER
+      ? [RAMP_ROUTER_PROVIDER, RAMP_ROUTER_MESSAGES_API]
+      : ["anthropic", "native"];
   const usage = isObject(resp.usage) ? resp.usage : {};
   const cacheCreation = isObject(usage.cache_creation) ? usage.cache_creation : {};
   const content = Array.isArray(resp.content) ? resp.content : [];
@@ -60,8 +102,8 @@ export function extractAnthropicNative(response: unknown, modelId: string = ""):
     cache_write_1h: safeInt(cacheCreation.ephemeral_1h_input_tokens),
     tool_calls: toolCalls,
     model: resolveModel(resp.model, modelId),
-    provider: "anthropic",
-    api: "native",
+    provider,
+    api,
     extras,
   });
 }
