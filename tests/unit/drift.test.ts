@@ -6,6 +6,7 @@ import {
   extractBedrockConverse,
   extractBedrockInvoke,
   extractOpenAINative,
+  extractWorkersAINative,
 } from "../../src/adapters/index.js";
 import { nonzeroNumeric } from "../../src/canonical.js";
 import { extractDatabricksLog } from "../../src/gateway/adapters/index.js";
@@ -268,5 +269,54 @@ describe("Drift detection — Databricks gateway, inside `token_details`", () =>
     });
     expect(u.reasoning).toBe(9);
     expect(u.extras["token_details.output_audio_tokens"]).toBe("42");
+  });
+});
+
+describe("Drift detection — Workers AI `/ai/run`", () => {
+  // The model-in-body route, two usage vocabularies on one endpoint.
+  it("unknown usage key reaches extras", () => {
+    const resp = {
+      result: {
+        model: "@cf/meta/llama-3.2-3b-instruct-v2",
+        usage: {
+          prompt_tokens: 41,
+          completion_tokens: 34,
+          total_tokens: 75,
+          neurons: 1.22,
+          future_counter: 9,
+          prompt_tokens_details: { cached_tokens: 0, audio_tokens: 3 },
+        },
+      },
+      success: true,
+    };
+    const u = extractWorkersAINative(resp, "@cf/meta/llama-3.2-3b-instruct");
+    expect([u.input, u.output]).toEqual([41, 34]);
+    expect(u.extras.usage).toEqual({ future_counter: 9, prompt_tokens_details: { audio_tokens: 3 } });
+    expect(u.extras.neurons).toBe(1.22); // Cloudflare's billing unit is kept, never counted as tokens
+  });
+
+  it("mapped keys do not pollute extras", () => {
+    const resp = {
+      result: {
+        usage: {
+          prompt_tokens: 1,
+          completion_tokens: 2,
+          total_tokens: 3,
+          prompt_tokens_details: { cached_tokens: 1 },
+        },
+      },
+    };
+    const u = extractWorkersAINative(resp, "@cf/x/y");
+    expect("usage" in u.extras).toBe(false);
+    expect(u.cache_read).toBe(1);
+  });
+
+  it("the Jev vocabulary is known, not drift", () => {
+    const u = extractWorkersAINative(
+      { result: { answers: {}, usage: { input_tokens: 5, output_tokens: 7 } } },
+      "typesafe/jev",
+    );
+    expect([u.input, u.output]).toEqual([5, 7]);
+    expect(u.extras).toEqual({});
   });
 });

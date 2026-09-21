@@ -37,6 +37,24 @@ export const AWS_PRICING_HOST = "https://pricing.us-east-1.amazonaws.com";
 export const AWS_BEDROCK_REGION_INDEX = `${AWS_PRICING_HOST}/offers/v1.0/aws/AmazonBedrock/current/region_index.json`;
 export const cloudflareModelsUrl = (accountId: string): string =>
   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
+// AI Gateway's own price list — every provider the gateway fronts, including the partner
+// models Workers AI serves under a bare `vendor/model` id (`typesafe/jev`), which the
+// `/ai/models/search` catalog above does not list at all. Measured 2026-09-21: 2,839 rows,
+// `per_page` capped at 100, `search=` filters by model id; the `typesafe/jev` row is
+// `token_pricing: {input_tokens: 0.042, input_cached_tokens: 0, output_tokens: 0}` (USD per
+// 1M) and 446 x 0.042e-6 is exactly the `cost` the gateway stamped on that call's log entry.
+const cloudflareGatewayCostsUrl = (accountId: string) =>
+  `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai-gateway/costs`;
+// `token_pricing` keys on an `ai-gateway/costs` row → ModelPrice fields (USD per 1M tokens).
+// The sibling `cost_in` / `cost_out` per-token fields are NOT used: on the same row they are
+// frequently 0 where `token_pricing` is not (typesafe/jev, every Fireworks entry), and the
+// gateway's own `cost` on a log entry reconciles against `token_pricing`, not against them.
+const CF_COSTS_FIELD_MAP: Record<string, PricedField> = {
+  input_tokens: "input",
+  output_tokens: "output",
+  input_cached_tokens: "cache_read",
+  input_cache_creation_tokens: "cache_write",
+};
 export const MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models";
 export const RAMP_ROUTER_MODELS_URL = "https://api.router.com/v1/models";
 
@@ -641,6 +659,49 @@ export function lookupCloudflareWorkersAi(table: Map<string, ModelPrice>, model:
   return null;
 }
 
+/**
+ * One `ai-gateway/costs?search=<model>` response → the price of exactly `model`, or null.
+ *
+ * Only rows whose `model` equals the requested id and whose `cost_type` is `tokens` count.
+ * The same id can appear under several providers at DIFFERENT rates (`stealth/union-alpha`
+ * is listed by openrouter, unbiased and stealth), so when more than one row matches, the
+ * row whose `provider` is the id's own namespace (`typesafe/jev` → `typesafe`) wins; failing
+ * that, rows that all agree are one price and rows that disagree are a refused lookup — the
+ * honest miss, same rule as Ramp Router's foreign-backend aliases. A published 0 is kept as
+ * a real $0 rate (Jev's output and cached input are free), not turned into "no rate": the
+ * gateway bills the row literally, and so must we.
+ */
+export function parseCloudflareGatewayCost(rows: unknown, model: string): ModelPrice | null {
+  if (!Array.isArray(rows)) return null;
+  const matches = rows.filter(
+    (r): r is Record<string, unknown> =>
+      isObj(r) && r.model === model && r.cost_type === "tokens" && isObj(r.token_pricing),
+  );
+  if (matches.length === 0) return null;
+  const namespace = model.includes("/") ? model.split("/", 1)[0] : null;
+  const own = namespace ? matches.filter((r) => r.provider === namespace) : [];
+  const candidates = own.length ? own : matches;
+  const fields = (row: Record<string, unknown>): Partial<Record<PricedField, bigint>> => {
+    const out: Partial<Record<PricedField, bigint>> = {};
+    const tp = row.token_pricing as Record<string, unknown>;
+    for (const [key, field] of Object.entries(CF_COSTS_FIELD_MAP)) {
+      if (!(key in tp)) continue;
+      const perMillion = parseScaled(tp[key]);
+      if (perMillion === null) continue;
+      out[field] = perMillion / 1_000_000n; // per-million -> per-token, truncated
+    }
+    return out;
+  };
+  const same = (a: Partial<Record<PricedField, bigint>>, b: Partial<Record<PricedField, bigint>>) =>
+    PRICED_FIELDS.every((f) => a[f] === b[f]);
+  const first = fields(candidates[0]);
+  if (candidates.slice(1).some((r) => !same(fields(r), first))) return null;
+  if (Object.keys(first).length === 0) return null;
+  const mp = emptyPrice("cloudflare_gateway_costs");
+  for (const f of PRICED_FIELDS) if (first[f] !== undefined) mp[f] = first[f]!;
+  return mp;
+}
+
 // ----------------------------------------------------------------------
 // Ramp Router parsing + matching
 //
@@ -1064,6 +1125,7 @@ export interface PricingFetcher {
   fetchOpenRouter(): Promise<OpenRouterTable>;
   fetchBedrock(region: string): Promise<Map<string, ModelPrice>>;
   fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>>;
+  fetchCloudflareGatewayCost(model: string): Promise<ModelPrice | null>;
   fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>>;
   fetchRampRouter(apiKey?: string | null): Promise<Map<string, ModelPrice>>;
 }
@@ -1157,6 +1219,23 @@ export class HttpPricingFetcher implements PricingFetcher {
     return parseCloudflareWorkersAi(models);
   }
 
+  /**
+   * The gateway's own rate for one model id, or null when it lists none.
+   *
+   * One request per model, on demand — the full table is 2,839 rows across every provider,
+   * and the only ids that reach this path are partner models the Workers AI catalog omits, a
+   * handful per account. Same credentials as the catalog fetch.
+   */
+  async fetchCloudflareGatewayCost(model: string): Promise<ModelPrice | null> {
+    if (!this.cloudflareAccountId || !this.cloudflareApiToken) return null;
+    const url = `${cloudflareGatewayCostsUrl(this.cloudflareAccountId)}?search=${encodeURIComponent(model)}&per_page=100`;
+    const body = (await this.getJson(url, { Authorization: `Bearer ${this.cloudflareApiToken}` })) as Record<
+      string,
+      unknown
+    >;
+    return parseCloudflareGatewayCost(body.result, model);
+  }
+
   async fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>> {
     // An explicitly configured key always wins over one learned from a
     // wrapped client — a deliberate config value shouldn't be silently
@@ -1199,6 +1278,14 @@ export class PricingProvider {
   private cloudflareWorkersAi: Map<string, ModelPrice> | null = null;
   private cloudflareFetched = 0;
   private cloudflareStale = false;
+  // Partner models on Workers AI (`typesafe/jev`), priced from AI Gateway's own cost table
+  // one model at a time. Reactive like Bedrock: a miss in `lookup()` queues the id here,
+  // `maybeRefresh()` fetches it on the next tick, and every later call hits. A null value is
+  // a remembered "the gateway lists no rate" — kept for the TTL so an unpriced id does not
+  // cost one HTTP request per flush tick.
+  private cfGatewayCosts = new Map<string, ModelPrice | null>();
+  private cfGatewayCostsFetched = new Map<string, number>();
+  private cfGatewayPending = new Set<string>();
   private mistralAliases: Map<string, string> | null = null;
   private mistralFetched = 0;
   private mistralStale = false;
@@ -1265,7 +1352,7 @@ export class PricingProvider {
    * cold-start cost. Unknown provider names are silently ignored rather
    * than throwing, since this is a hint, not a contract.
    */
-  prime(providers: string[] = []): void {
+  prime(providers: string[] = [], opts: { workersAiModels?: string[] } = {}): void {
     // Gated on "is this table actually cold?", NOT unconditional. `wrap()` and
     // `warmPricing()` both reach here and a server can run either per request, so
     // flagging an in-TTL table stale means re-downloading the ~400-model OpenRouter
@@ -1274,6 +1361,17 @@ export class PricingProvider {
     // "Cold" is the same test `lookup()` uses, so priming and looking up cannot
     // disagree about what needs fetching.
     if (this.isCold(this.openrouter, this.openrouterFetched)) this.openrouterStale = true;
+    // Partner models on Workers AI are priced one row at a time from the gateway's cost
+    // table, and the SDK only learns an id when a call for it arrives — so the first call to
+    // each such model in a process is a cold miss. Naming the ids here (via
+    // `warmPricing(providers, { workersAiModels })`) fetches their rows up front, the way
+    // `providers: ["workers-ai"]` fetches the catalog, so even the first call prices. Same
+    // "only if cold" gate as everything else in this method.
+    for (const m of opts.workersAiModels ?? []) {
+      if (!m || m.startsWith("@") || m.startsWith(WORKERS_AI_COMPAT_PREFIX)) continue;
+      const fetchedAt = this.cfGatewayCostsFetched.get(m);
+      if (fetchedAt === undefined || Date.now() - fetchedAt >= this.ttlMs) this.cfGatewayPending.add(m);
+    }
     for (const p of providers) {
       const key = (p || "").toLowerCase();
       if (key === "workers-ai") {
@@ -1336,7 +1434,18 @@ export class PricingProvider {
         const table = this.cloudflareWorkersAi;
         const fresh = table !== null && Date.now() - this.cloudflareFetched < this.ttlMs;
         if (!fresh) this.cloudflareStale = true;
-        return table !== null ? lookupCloudflareWorkersAi(table, model) : null;
+        const hit = table !== null ? lookupCloudflareWorkersAi(table, model) : null;
+        if (hit !== null || model.startsWith("@") || model.startsWith(WORKERS_AI_COMPAT_PREFIX)) return hit;
+        // A bare `vendor/model` id the catalog does not list: a partner model. Its rate lives
+        // in the gateway's cost table — fetched per id, in the background.
+        const fetchedAt = this.cfGatewayCostsFetched.get(model);
+        if (fetchedAt === undefined || Date.now() - fetchedAt >= this.ttlMs) {
+          // Cold or past the TTL: queue a (re)fetch for the next tick. A row we already hold
+          // keeps serving meanwhile — stale-while-revalidate, the same as the catalog table —
+          // so a TTL expiry never bills a call as tokens. Only a never-fetched id misses.
+          this.cfGatewayPending.add(model);
+        }
+        return this.cfGatewayCosts.get(model) ?? null;
       }
       let resolvedModel = model;
       const isMistral = (provider || "").toLowerCase() === "mistral";
@@ -1372,7 +1481,8 @@ export class PricingProvider {
       this.bedrockStale.size === 0 &&
       !this.cloudflareStale &&
       !this.mistralStale &&
-      !this.rampRouterStale
+      !this.rampRouterStale &&
+      this.cfGatewayPending.size === 0
     ) {
       return;
     }
@@ -1430,6 +1540,17 @@ export class PricingProvider {
           this.bedrock.set(region, table);
           this.bedrockFetched.set(region, Date.now());
           this.bedrockStale.delete(region);
+        }),
+      );
+    }
+
+    for (const model of [...this.cfGatewayPending]) {
+      jobs.push(
+        this.refreshSource(`cf_costs:${model}`, "pricing.fetchCloudflareGatewayCost", async () => {
+          const price = await this.fetcher.fetchCloudflareGatewayCost(model);
+          this.cfGatewayCosts.set(model, price);
+          this.cfGatewayCostsFetched.set(model, Date.now());
+          this.cfGatewayPending.delete(model);
         }),
       );
     }

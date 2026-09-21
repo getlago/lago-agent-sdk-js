@@ -13,6 +13,7 @@ import {
   computePrecomputedCost,
   deoverlappedTokenTotal,
   HttpPricingFetcher,
+  parseCloudflareGatewayCost,
   moneyStrToCents,
   lookupBedrock,
   lookupCloudflareWorkersAi,
@@ -65,6 +66,12 @@ class StubFetcher {
   async fetchCloudflareWorkersAi(): Promise<Map<string, ModelPrice>> {
     this.cloudflareWorkersAiCalls++;
     return this.cloudflareWorkersAi;
+  }
+  cloudflareGatewayCostCalls: string[] = [];
+  cloudflareGatewayCosts = new Map<string, ModelPrice | null>();
+  async fetchCloudflareGatewayCost(model: string): Promise<ModelPrice | null> {
+    this.cloudflareGatewayCostCalls.push(model);
+    return this.cloudflareGatewayCosts.get(model) ?? null;
   }
   async fetchMistralAliases(apiKey?: string | null): Promise<Map<string, string>> {
     this.mistralAliasesCalls++;
@@ -2502,5 +2509,251 @@ describe("ramp router TTL-split cache writes", () => {
     expect(Object.keys(b.fields).sort()).toEqual(["cache_write", "input"]);
     expect(b.fields.cache_write.tokens).toBe("20113");
     expect(b.base).toBe("0.02515725");
+  });
+});
+
+// ----------------------------------------------------------------------
+// Partner models on Workers AI — priced from AI Gateway's own cost table
+// ----------------------------------------------------------------------
+// The real `ai-gateway/costs?search=jev` row, captured 2026-09-21. `cost_in`/`cost_out` are 0
+// on it while `token_pricing` is not — the gateway's log `cost` (446 x 0.042e-6) proves which
+// one it bills by.
+const CF_COSTS_JEV_ROW = {
+  id: "a5a44d54-d13a-405e-8dba-6911dc681300",
+  provider: "typesafe",
+  model: "typesafe/jev",
+  model_rule: "equals",
+  cost_type: "tokens",
+  cost_in: 0,
+  cost_out: 0,
+  token_pricing: { input_tokens: 0.042, input_cached_tokens: 0, output_tokens: 0 },
+};
+
+describe("Workers AI partner models — AI Gateway cost table", () => {
+  it("parses token_pricing per million and keeps published zeros", () => {
+    const price = parseCloudflareGatewayCost([CF_COSTS_JEV_ROW], "typesafe/jev");
+    expect(price).not.toBeNull();
+    expect(price!.source).toBe("cloudflare_gateway_costs");
+    expect(price!.input).toBe(42_000n); // 0.000000042 * 1e12
+    expect(price!.output).toBe(0n); // free output is a real $0 rate, not "no rate"
+    expect(price!.cache_read).toBe(0n);
+    expect(price!.cache_write).toBeNull();
+  });
+
+  it("ignores other models and non-token rows", () => {
+    const rows = [
+      { ...CF_COSTS_JEV_ROW, model: "typesafe/jev-mini" },
+      { ...CF_COSTS_JEV_ROW, cost_type: "per_request" },
+      { ...CF_COSTS_JEV_ROW, token_pricing: null },
+    ];
+    expect(parseCloudflareGatewayCost(rows, "typesafe/jev")).toBeNull();
+    expect(parseCloudflareGatewayCost("not a list", "typesafe/jev")).toBeNull();
+    expect(parseCloudflareGatewayCost([], "typesafe/jev")).toBeNull();
+  });
+
+  it("prefers the id's own namespace when providers disagree", () => {
+    // `stealth/union-alpha` is listed by three providers at different rates; the id's own
+    // vendor is the one Workers AI serves it through.
+    const rows = [
+      {
+        provider: "openrouter",
+        model: "stealth/union-alpha",
+        cost_type: "tokens",
+        token_pricing: { input_tokens: 1, output_tokens: 2 },
+      },
+      {
+        provider: "stealth",
+        model: "stealth/union-alpha",
+        cost_type: "tokens",
+        token_pricing: { input_tokens: 3, output_tokens: 4 },
+      },
+    ];
+    const price = parseCloudflareGatewayCost(rows, "stealth/union-alpha");
+    expect(price!.input).toBe(3_000_000n);
+    expect(price!.output).toBe(4_000_000n);
+  });
+
+  it("refuses disagreeing rows without an own-namespace match", () => {
+    const rows = [
+      {
+        provider: "openrouter",
+        model: "x/y",
+        cost_type: "tokens",
+        token_pricing: { input_tokens: 1, output_tokens: 2 },
+      },
+      {
+        provider: "groq",
+        model: "x/y",
+        cost_type: "tokens",
+        token_pricing: { input_tokens: 5, output_tokens: 2 },
+      },
+    ];
+    expect(parseCloudflareGatewayCost(rows, "x/y")).toBeNull();
+    expect(parseCloudflareGatewayCost([rows[0], { ...rows[0], provider: "groq" }], "x/y")).not.toBeNull();
+  });
+
+  it("is reactive: miss, then hit, never refetched within the TTL", async () => {
+    const llama: ModelPrice = {
+      source: "cloudflare_workers_ai",
+      input: 50_000n,
+      output: 300_000n,
+      cache_read: null,
+      cache_write: null,
+      reasoning: null,
+    };
+    const fetcher = new StubFetcher(
+      undefined,
+      undefined,
+      new Map([["@cf/meta/llama-3.2-3b-instruct", llama]]),
+    );
+    fetcher.cloudflareGatewayCosts.set(
+      "typesafe/jev",
+      parseCloudflareGatewayCost([CF_COSTS_JEV_ROW], "typesafe/jev"),
+    );
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai"]);
+    await p.maybeRefresh();
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    // 1st lookup: catalog has no partner ids -> miss, id queued; nothing fetched on the hot path.
+    expect(p.lookup("workers-ai", "typesafe/jev", "workers_ai_run")).toBeNull();
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual([]);
+    await p.maybeRefresh();
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+    const hit = p.lookup("workers-ai", "typesafe/jev", "workers_ai_run");
+    expect(hit!.input).toBe(42_000n);
+    expect(hit!.output).toBe(0n);
+    // Warm: neither the catalog nor the cost row is fetched again.
+    await p.maybeRefresh();
+    p.lookup("workers-ai", "typesafe/jev", "workers_ai_run");
+    await p.maybeRefresh();
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+    expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+    // A catalog model never takes the partner path.
+    expect(p.lookup("workers-ai", "@cf/meta/llama-3.2-3b-instruct", "workers_ai_run")).not.toBeNull();
+    expect(p.lookup("workers-ai", "@cf/nobody/unlisted", "workers_ai_run")).toBeNull();
+    await p.maybeRefresh();
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+  });
+
+  it("remembers an id the gateway does not price as a miss for the TTL", async () => {
+    // One HTTP request per unpriced id per TTL — not one per flush tick.
+    const fetcher = new StubFetcher();
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
+    p.prime(["workers-ai"]);
+    await p.maybeRefresh();
+    expect(p.lookup("workers-ai", "acme/unknown", "workers_ai_run")).toBeNull();
+    await p.maybeRefresh();
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["acme/unknown"]);
+    for (let i = 0; i < 3; i++) {
+      expect(p.lookup("workers-ai", "acme/unknown", "workers_ai_run")).toBeNull();
+      await p.maybeRefresh();
+    }
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["acme/unknown"]);
+  });
+
+  it("reports and backs off a failed cost fetch", async () => {
+    const errors: string[] = [];
+    class Boom extends StubFetcher {
+      async fetchCloudflareGatewayCost(model: string): Promise<ModelPrice | null> {
+        this.cloudflareGatewayCostCalls.push(model);
+        throw new Error("HTTP 500");
+      }
+    }
+    const fetcher = new Boom();
+    const p = new PricingProvider({ fetcher, ttlMs: 3_600_000, onError: (_e, w) => errors.push(w) });
+    p.prime(["workers-ai"]);
+    await p.maybeRefresh();
+    p.lookup("workers-ai", "typesafe/jev", "workers_ai_run");
+    await p.maybeRefresh();
+    await p.maybeRefresh(); // inside the 1s backoff — no second attempt
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+    expect(errors).toEqual(["pricing.fetchCloudflareGatewayCost"]);
+  });
+
+  it("HttpPricingFetcher queries costs by model and parses the real row", async () => {
+    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: { headers?: Record<string, string> }) => {
+      seen.push({ url, headers: init?.headers ?? {} });
+      return new Response(JSON.stringify({ success: true, result: [CF_COSTS_JEV_ROW] }), { status: 200 });
+    });
+    try {
+      const f = new HttpPricingFetcher(10_000, "acct", "tok");
+      const price = await f.fetchCloudflareGatewayCost("typesafe/jev");
+      expect(price!.input).toBe(42_000n);
+      expect(seen[0].url).toBe(
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai-gateway/costs?search=typesafe%2Fjev&per_page=100",
+      );
+      expect(seen[0].headers.Authorization).toBe("Bearer tok");
+      expect(await new HttpPricingFetcher().fetchCloudflareGatewayCost("typesafe/jev")).toBeNull(); // no credentials -> no request
+      expect(seen.length).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Jev end to end matches the gateway's own log cost", () => {
+    // 446 in / 73 out at the gateway's rate = 0.000018732 USD — the `cost` Cloudflare itself
+    // stamped on the live log entry (2026-09-21).
+    const price = parseCloudflareGatewayCost([CF_COSTS_JEV_ROW], "typesafe/jev")!;
+    const usage = makeCanonicalUsage({
+      model: "typesafe/jev",
+      provider: "workers-ai",
+      api: "workers_ai_run",
+      input: 446,
+      output: 73,
+    });
+    const b = computeCost(usage, price, parseScaled("1")!);
+    expect(b.total).toBe("0.000018732");
+    expect(b.totalCents).toBe("0.0018732");
+  });
+});
+
+describe("Workers AI partner models — warm-up and TTL", () => {
+  it("keeps serving a row past the TTL while it refetches", async () => {
+    // Stale-while-revalidate, same as the catalog table: a TTL expiry must never bill a call
+    // as tokens. Only a never-fetched id misses.
+    const fetcher = new StubFetcher();
+    fetcher.cloudflareGatewayCosts.set(
+      "typesafe/jev",
+      parseCloudflareGatewayCost([CF_COSTS_JEV_ROW], "typesafe/jev"),
+    );
+    const p = new PricingProvider({ fetcher, ttlMs: 50 });
+    p.prime(["workers-ai"]);
+    await p.maybeRefresh();
+    expect(p.lookup("workers-ai", "typesafe/jev", "workers_ai_run")).toBeNull(); // cold: the one honest miss
+    await p.maybeRefresh();
+    expect(p.lookup("workers-ai", "typesafe/jev", "workers_ai_run")).not.toBeNull();
+    await new Promise((r) => setTimeout(r, 80)); // past the TTL
+    const staleHit = p.lookup("workers-ai", "typesafe/jev", "workers_ai_run");
+    expect(staleHit!.input).toBe(42_000n); // still served
+    await p.maybeRefresh(); // ... and refetched in the background
+    expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev", "typesafe/jev"]);
+  });
+
+  it("warmPricing by partner model id prices the very first call", async () => {
+    const fetcher = new StubFetcher();
+    fetcher.cloudflareGatewayCosts.set(
+      "typesafe/jev",
+      parseCloudflareGatewayCost([CF_COSTS_JEV_ROW], "typesafe/jev"),
+    );
+    const sdk = new LagoSDK({
+      apiKey: "k",
+      defaultSubscriptionId: "sub",
+      config: { pricingMode: "price", pricingProvider: new PricingProvider({ fetcher }) },
+    });
+    try {
+      await sdk.warmPricing(["workers-ai"], {
+        workersAiModels: ["typesafe/jev", "@cf/meta/llama-3.2-3b-instruct"],
+      });
+      // The catalog id is ignored here (it is in the catalog); only the partner id was fetched.
+      expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+      expect(fetcher.cloudflareWorkersAiCalls).toBe(1);
+      const hit = (sdk as any).pricing.lookup("workers-ai", "typesafe/jev", "workers_ai_run");
+      expect(hit.input).toBe(42_000n);
+      await sdk.warmPricing(["workers-ai"], { workersAiModels: ["typesafe/jev"] });
+      expect(fetcher.cloudflareGatewayCostCalls).toEqual(["typesafe/jev"]);
+    } finally {
+      await sdk.shutdown(1000);
+    }
   });
 });

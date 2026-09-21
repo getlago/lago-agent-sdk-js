@@ -2,6 +2,9 @@
 export { LagoSDK } from "./sdk.js";
 export type { LagoSDKOptions, WrapOptions } from "./sdk.js";
 
+export { WorkersAI, WorkersAIError } from "./workers_ai.js";
+export type { WorkersAIOptions, WorkersAIRunOptions } from "./workers_ai.js";
+
 export type { CanonicalUsage } from "./canonical.js";
 export { makeCanonicalUsage, NUMERIC_FIELDS, nonzeroNumeric } from "./canonical.js";
 
@@ -16,7 +19,13 @@ export {
   UnknownClientError,
 } from "./exceptions.js";
 
-export { TOKEN_BILLED_PROVIDERS, HttpPricingFetcher, PricingProvider, computeCost } from "./pricing.js";
+export {
+  TOKEN_BILLED_PROVIDERS,
+  HttpPricingFetcher,
+  PricingProvider,
+  computeCost,
+  parseCloudflareGatewayCost,
+} from "./pricing.js";
 export type { CostBreakdown, ModelPrice, PricingFetcher } from "./pricing.js";
 
 export {
@@ -25,6 +34,7 @@ export {
   extractBedrockInvoke,
   pickInvokeAdapter,
   extractMistralNative,
+  extractWorkersAINative,
 } from "./adapters/index.js";
 export type { InvokeFamily } from "./adapters/index.js";
 

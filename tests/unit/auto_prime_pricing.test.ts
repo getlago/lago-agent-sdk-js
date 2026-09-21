@@ -125,6 +125,9 @@ describe("wrap()-triggered auto-prime pricing", () => {
         cloudflareCalls++;
         return new Map<string, ModelPrice>();
       }
+      async fetchCloudflareGatewayCost(_model: string): Promise<ModelPrice | null> {
+        return null;
+      }
     }
     const fetcher = new StubFetcher();
     const provider = new PricingProvider({ fetcher, ttlMs: 3_600_000 });
@@ -145,6 +148,9 @@ describe("wrap()-triggered auto-prime pricing", () => {
       async fetchCloudflareWorkersAi() {
         cloudflareCalls++;
         return new Map<string, ModelPrice>();
+      }
+      async fetchCloudflareGatewayCost(_model: string): Promise<ModelPrice | null> {
+        return null;
       }
     }
     const fetcher = new StubFetcher();

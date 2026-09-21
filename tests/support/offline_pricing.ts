@@ -25,6 +25,10 @@ export class OfflinePricingFetcher implements PricingFetcher {
     return new Map<string, ModelPrice>();
   }
 
+  async fetchCloudflareGatewayCost(_model: string): Promise<ModelPrice | null> {
+    return null;
+  }
+
   async fetchMistralAliases(_apiKey?: string | null): Promise<Map<string, string>> {
     return new Map<string, string>();
   }
