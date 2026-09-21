@@ -37,6 +37,13 @@ for (const entry of await fetchGatewayLogs()) {
   const usage = extractCloudflareLog(entry);
   if (usage.extras.cached) continue; // gateway served it from cache — the provider was never called
   const sub = resolveSubscription(entry) ?? "sub_default"; // from the call's cf-aig-metadata, if set
+  if (usage.extras.byok) {
+    // Served with the customer's own provider key (BYOK): Cloudflare charged nothing and the
+    // partner bills them directly, yet `cost` still carries Cloudflare's list price. Bill the
+    // tokens, never that number.
+    sdk.emit(usage, { subscription: sub, mode: "tokens", eventId: `cf_${entry.id}` });
+    continue;
+  }
   // Pass `cost` through as-is. Coercing an absent cost to 0 bills a $0.00 event instead
   // of falling back to token counts, which is the one outcome that loses revenue silently.
   sdk.emit(usage, { subscription: sub, mode: "price", usdCost: entry.cost, eventId: `cf_${entry.id}` });
@@ -75,7 +82,10 @@ const out = await ai.run(
 (out.result as any).result.answers.department.choice; // "billing"
 
 // a catalog model: same client, same billing
-await ai.run("@cf/meta/llama-3.2-3b-instruct", { messages: [{ role: "user", content: "Hello" }], max_tokens: 50 });
+await ai.run("@cf/meta/llama-3.2-3b-instruct", {
+  messages: [{ role: "user", content: "Hello" }],
+  max_tokens: 50,
+});
 await sdk.flush();
 ```
 
