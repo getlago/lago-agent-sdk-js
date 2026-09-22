@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { CanonicalUsage, NUMERIC_FIELDS, nonzeroNumeric } from "./canonical.js";
 import { LagoConfig, PricingMode, makeConfig } from "./config.js";
 import { detectClientKind } from "./detector.js";
+import { WorkersAI, type WorkersAIOptions } from "./workers_ai.js";
 import { PricingUnavailableError, UnknownClientError } from "./exceptions.js";
 import { LagoClient, LagoEvent } from "./lago_client.js";
 import {
@@ -357,9 +358,15 @@ export class LagoSDK {
    *
    * Resolves once the fetch was ATTEMPTED, not once it succeeded: a failure reports
    * through `onError` and leaves the table cold, same as a lazy miss.
+   *
+   * `opts.workersAiModels`: partner models on Workers AI (`typesafe/jev` — any id without
+   * the `@cf/` prefix) are priced from the gateway's cost table one row per id, and the SDK
+   * only learns an id when a call for it arrives, so the first call to each in a process
+   * bills tokens. Name the ids you are about to call here to fetch their rows now, so even
+   * that first call prices — the client's `run()` for them then has a warm row from the start.
    */
-  async warmPricing(providers: string[] = []): Promise<void> {
-    this.pricing.prime(providers);
+  async warmPricing(providers: string[] = [], opts: { workersAiModels?: string[] } = {}): Promise<void> {
+    this.pricing.prime(providers, opts);
     await this.pricing.maybeRefresh();
   }
 
@@ -398,6 +405,25 @@ export class LagoSDK {
     throw new UnknownClientError(
       `Client kind '${kind}' is not yet supported. Implemented: 'bedrock', 'mistral', 'anthropic', 'openai', 'gemini'.`,
     );
+  }
+
+  /**
+   * Build an instrumented Workers AI client — the one provider with no client to wrap.
+   *
+   * Reaches every Workers AI model: `@cf/...` ids through the gateway host's path route,
+   * partner models (`typesafe/jev`) through the unified `/ai/run` path with the gateway named
+   * in `cf-aig-gateway-id`, the one route where the gateway's BYOK partner key is consulted.
+   * With a gateway, cache hits are skipped and each `@cf/` call carries a `cf_log_id`
+   * dimension for reconciliation against the Logs API. See `workers_ai.ts`.
+   */
+  workersAI(accountId: string, apiToken: string, opts: WorkersAIOptions = {}): WorkersAI {
+    if (this.config.pricingMode === "price") {
+      // Same warm-up wrap() gives an OpenAI client pointed at the gateway: prime the Workers
+      // AI catalog now, in memory only, so the first call is not a cold miss.
+      this.pricing.prime(["workers-ai"]);
+      this.queue.wake();
+    }
+    return new WorkersAI(this, accountId, apiToken, opts);
   }
 
   /**

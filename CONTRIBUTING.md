@@ -51,6 +51,25 @@ npm run build
 5. Update `sdk.ts::wrap()` to dispatch to the new wrapper.
 6. Add unit tests against the captured fixtures.
 
+## Adding a first-party client
+
+Some models have no client library to wrap — Cloudflare Workers AI is the case that forced this:
+the official `cloudflare` package cannot address any Workers AI model, and partner models such as
+`typesafe/jev` are not chat-shaped, so the OpenAI-compatible route cannot carry them either. For
+these the SDK ships its own minimal client (`src/workers_ai.ts`, built by
+`sdk.workersAI()`). The rules are the wrappers' rules, applied to code we own:
+
+1. Capture real fixtures exactly as for a provider — successful responses only, one file per
+   shape, with a capture script alongside them.
+2. Keep the adapter a pure function in `adapters/`; the client only does HTTP and calls `emit()`.
+3. Raise the provider's own error before any instrumentation, so a failed call bills nothing and
+   reaches the caller unchanged. Wrap everything after the response in the same catch-all the
+   wrappers use — instrumentation never breaks the customer's call.
+4. Write down, in the module comment, every routing decision that was *measured* rather than
+   chosen (which route logs the model, which header the gateway honours, what a cache hit looks
+   like). A first-party client has no upstream to blame for its choices.
+5. Mirror it in the Python repo in the same PR pair, tests and fixtures included.
+
 ## Adding a gateway
 
 `gateway/` is a **second front door** into the same kernel, separate from the provider-native

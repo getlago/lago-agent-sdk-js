@@ -462,7 +462,7 @@ describe("Cloudflare gateway log adapter — usage_metadata drift", () => {
         input_cached_tokens: 4,
       },
     });
-    expect(u.extras).toEqual({ cached: false, step: 0, log_id: "log_3" });
+    expect(u.extras).toEqual({ cached: false, step: 0, log_id: "log_3", byok: null });
     expect("usage_metadata" in u.extras).toBe(false);
   });
 
@@ -515,5 +515,15 @@ describe("Cloudflare gateway log adapter — usage_metadata drift", () => {
         ).toBe(true);
       }
     }
+  });
+});
+
+describe("byok key source", () => {
+  it("reaches extras on every entry", () => {
+    // A row served under BYOK still carries Cloudflare's list-price `cost` although it
+    // charged nothing (measured 2026-09-21, `typesafe/jev`: 446 in x $0.042/M = 1.8732e-05
+    // with byok="default"). The poller needs the field to not bill that.
+    expect(extractCloudflareLog({ id: "x", byok: "default" } as any).extras.byok).toBe("default");
+    expect(extractCloudflareLog({ id: "x" } as any).extras.byok).toBeNull();
   });
 });

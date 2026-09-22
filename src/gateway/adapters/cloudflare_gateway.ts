@@ -172,6 +172,12 @@ export function extractCloudflareLog(entry: Record<string, unknown>): CanonicalU
       cached: entry.cached,
       step: entry.step,
       log_id: entry.id,
+      // Which key paid: undefined/null (Cloudflare credits / the customer's own header key) or
+      // the BYOK alias (`"default"`). Measured 2026-09-21 on a `typesafe/jev` row served under
+      // BYOK: Cloudflare still fills `cost` with its list price (446 in × $0.042/M) although
+      // it charged nothing — the partner bills the customer directly. A backfill that bills
+      // `cost` for such a row double-charges; this is the field that lets it not.
+      byok: entry.byok ?? null,
       // Drift sweep — the same contract `drift.test.ts` pins for the native adapters,
       // and for the same reason: a counter this adapter does not map must not vanish
       // without an error or an onError. `extras` used to be exactly the three keys
