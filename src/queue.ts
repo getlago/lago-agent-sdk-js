@@ -16,6 +16,7 @@
 
 import type { LagoEvent } from "./lago_client.js";
 import { LagoApiError } from "./exceptions.js";
+import { warn } from "./warn.js";
 
 type Sender = (batch: LagoEvent[]) => Promise<void>;
 
@@ -564,20 +565,4 @@ export class EventQueue {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-/** `console.warn` that cannot itself break the send/retry loop.
- *
- * The queue logged directly, on paths with no `try` around them — `sendIndividually`,
- * the drain's failure branch, the exit drain. A `console` that throws is not exotic: a
- * structured-logger shim can, and a test runner's console throws by design once the test
- * that owns it has finished ("Cannot log after tests are done"). Any of those turned a
- * retryable network blip into a rejected background loop, which is what used to take the
- * host process down with it. */
-function warn(...args: unknown[]): void {
-  try {
-    console.warn(...args);
-  } catch {
-    /* a logger that fails must not cost billing */
-  }
 }
