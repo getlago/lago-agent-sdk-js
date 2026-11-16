@@ -23,6 +23,7 @@ import {
 import { RAMP_ROUTER_PROVIDER } from "./adapters/openai_native.js";
 import { SNOWFLAKE_EVENT_ID_PREFIX } from "./gateway/adapters/snowflake_cortex.js";
 import { EventQueue } from "./queue.js";
+import { warn } from "./warn.js";
 import { wrapAnthropicClient } from "./wrappers/anthropic.js";
 import { wrapBedrockClient } from "./wrappers/bedrock.js";
 import { wrapGeminiClient } from "./wrappers/gemini.js";
@@ -700,7 +701,9 @@ export class LagoSDK {
     // never set one used to get literally nothing for a dropped event here while the
     // Python port logged a warning for the same one — the two repos reported 0 lines
     // vs 1 for an identical billing gap. Mirrors `_report_error`'s `logger.warning`.
-    console.warn(`[lago] ${where} failed: ${err instanceof Error ? err.message : String(err)}`);
+    // `warn` rather than a bare `console.warn`: the wrappers call this from their own
+    // catch, and a logger that throws must not reject the call the provider answered.
+    warn(`[lago] ${where} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   /**

@@ -18,6 +18,10 @@ All notable changes to this project will be documented here. Format follows [Kee
 - **Minimum supported Node is now 20.** `engines.node` moves from `>=18.17` to `>=20.0.0`. The `>=18.17` floor was inherited from undici 6 and no longer reflected reality: the optional peers `@aws-sdk/client-bedrock-runtime` and `@google/genai` both already require Node 20, and the dev toolchain (eslint 10, vite) declares Node 18 incompatible. Node 18 reached end of life in April 2025. The compiled `dist` itself uses only ES2022, `fetch`, `AbortSignal.timeout`, `node:crypto` and `node:async_hooks`, so nothing in the shipped code changes; this drops a support claim that was no longer being tested. The CI matrix moves from `[18, 20, 22]` to `[20, 22, 24]`.
 - **vitest 3.2.6 -> 4.1.11**, closing GHSA-82fw-gwwq-j7x9 (path traversal / arbitrary file read via the `@vitest/mocker` redirect mock, affected range `>=2.1.0 <4.1.11`). Dev-only; nothing in `dist` is affected.
 
+### Fixed
+
+- **A throwing `console.warn` no longer rejects the customer's call.** `LagoSDK.reportError` guarded `onError` and then logged with a bare `console.warn`. Since the wrappers' catch blocks all report through it, a logger that throws (a structured-logger shim, or a test runner's "Cannot log after tests are done") on top of any reported failure — a drifted provider response, for instance — rejected a call the provider had already answered. The throw-proof `warn()` that already guards the queue now lives in `src/warn.ts`, and `reportError` logs through it.
+
 ## [0.3.1] - 2026-09-07
 
 ### Added
